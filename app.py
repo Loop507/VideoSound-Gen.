@@ -8,8 +8,8 @@ import shutil
 from typing import Tuple, Optional
 import soundfile as sf
 from scipy.signal import butter, lfilter
-import librosa # Importa librosa
-import librosa.display # Per eventuali visualizzazioni future se necessarie
+import librosa
+import librosa.display
 
 # Costanti globali (puoi modificarle)
 MAX_DURATION = 300  # Durata massima del video in secondi
@@ -87,7 +87,6 @@ def analyze_video_frames(video_path: str) -> Tuple[Optional[np.ndarray], Optiona
         brightness_data.append(brightness)
 
         # 2. Dettaglio/Contrasto: Varianza dei pixel (o deviazione standard)
-        # Una varianza più alta indica più variazione di pixel, quindi più dettaglio/contrasto
         detail = np.std(gray_frame) / 255.0 # Normalizza tra 0 e 1
         detail_data.append(detail)
 
@@ -104,106 +103,139 @@ class AudioGenerator:
     def __init__(self, sample_rate: int, fps: int):
         self.sample_rate = sample_rate
         self.fps = fps
-        self.samples_per_frame = self.sample_rate // self.fps # Quanti campioni audio per ogni frame video
+        self.samples_per_frame = self.sample_rate // self.fps 
 
-    def generate_base_waveform(self, duration_samples: int) -> np.ndarray:
-        """Genera un'onda a dente di sega (sawtooth) come base, ricca di armoniche."""
+    def generate_subtractive_waveform(self, duration_samples: int) -> np.ndarray:
+        """Genera un'onda a dente di sega (sawtooth) come base per la sintesi sottrattiva."""
         base_freq = 220.0 
         t = np.linspace(0, duration_samples / self.sample_rate, duration_samples, endpoint=False)
         waveform = 2 * (t * base_freq - np.floor(t * base_freq + 0.5))
         return waveform.astype(np.float32)
 
-    def apply_filter_dynamic(self, base_audio: np.ndarray, brightness_data: np.ndarray, detail_data: np.ndarray, 
-                             min_cutoff: float, max_cutoff: float, min_res: float, max_res: float,
-                             min_pitch_shift_semitones: float, max_pitch_shift_semitones: float,
-                             min_time_stretch_rate: float, max_time_stretch_rate: float) -> np.ndarray:
+    def generate_fm_waveform(self, duration_samples: int,
+                             brightness_data: np.ndarray, detail_data: np.ndarray,
+                             min_carrier_freq: float, max_carrier_freq: float,
+                             min_modulator_freq: float, max_modulator_freq: float,
+                             min_mod_index: float, max_mod_index: float) -> np.ndarray:
         """
-        Applica un filtro passa-basso dinamico, pitch shifting e time stretching all'audio di base, 
-        modulato dai dati visivi.
+        Genera un'onda FM modulata dai dati visivi.
+        luminosità -> carrier freq
+        dettaglio -> modulator freq e/o modulation index
         """
-        st.info("🎶 Inizializzazione della generazione audio sperimentale...")
+        st.info("🎵 Inizializzazione della generazione audio sperimentale (Sintesi FM)...")
+        generated_audio = np.zeros(duration_samples, dtype=np.float32)
         
-        # Inizialmente, l'audio filtrato sarà la base per gli effetti successivi
-        filtered_audio = np.zeros_like(base_audio)
-        
-        filter_order = 4
-        zi = np.zeros(filter_order) 
+        t_overall = np.linspace(0, duration_samples / self.sample_rate, duration_samples, endpoint=False)
 
         num_frames = len(brightness_data)
         
-        # Pre-processamento per gli effetti pitch/time (se si applicano per frame)
-        # useremo segmenti di audio filtrato per applicare questi effetti
-        
+        progress_bar = st.progress(0, text="🎵 Generazione Sintesi FM...")
         status_text = st.empty()
-        
-        # --- Fase 1: Filtro Dinamico (come prima) ---
-        progress_bar_filter = st.progress(0, text="🎶 Applicazione Filtro Dinamico...")
+
         for i in range(num_frames):
             frame_start_sample = i * self.samples_per_frame
-            frame_end_sample = min((i + 1) * self.samples_per_frame, len(base_audio))
+            frame_end_sample = min((i + 1) * self.samples_per_frame, duration_samples)
             
-            audio_segment = base_audio[frame_start_sample:frame_end_sample]
-            if audio_segment.size == 0: continue 
+            if frame_start_sample >= frame_end_sample:
+                continue
 
             current_brightness = brightness_data[i]
             current_detail = detail_data[i]
-            
-            cutoff_freq = min_cutoff + current_brightness * (max_cutoff - min_cutoff)
-            resonance_q = min_res + current_detail * (max_res - min_res) 
 
-            nyquist = 0.5 * self.sample_rate
-            normal_cutoff = cutoff_freq / nyquist
-            normal_cutoff = np.clip(normal_cutoff, 0.001, 0.999) 
+            # Mappatura dei parametri FM ai dati visivi
+            carrier_freq = min_carrier_freq + current_brightness * (max_carrier_freq - min_carrier_freq)
+            modulator_freq = min_modulator_freq + current_detail * (max_modulator_freq - min_modulator_freq)
+            mod_index = min_mod_index + current_detail * (max_mod_index - min_mod_index) # Oppure usa brightness per l'indice
 
-            b, a = butter(filter_order, normal_cutoff, btype='lowpass', analog=False, output='ba')
-            filtered_segment, zi = lfilter(b, a, audio_segment, zi=zi)
+            # Genera il segmento audio FM per il frame corrente
+            t_segment = t_overall[frame_start_sample:frame_end_sample]
             
-            filtered_audio[frame_start_sample:frame_end_sample] = filtered_segment
-            progress_bar_filter.progress((i + 1) / num_frames)
-            status_text.text(f"🎶 Filtro Dinamico Frame {i + 1}/{num_frames} | Cutoff: {int(cutoff_freq)} Hz | Q: {resonance_q:.2f}")
+            # Calcolo dell'onda modulante (sinusoidale)
+            modulator_wave = np.sin(2 * np.pi * modulator_freq * t_segment)
+            
+            # Calcolo dell'onda portante (sinusoidale) modulata
+            # FM Synthesis: Carrier_Amplitude * sin(2*pi*Carrier_Freq*t + Modulation_Index * sin(2*pi*Modulator_Freq*t))
+            fm_segment = np.sin(2 * np.pi * carrier_freq * t_segment + mod_index * modulator_wave)
+            
+            generated_audio[frame_start_sample:frame_end_sample] = fm_segment
+            
+            progress_bar.progress((i + 1) / num_frames)
+            status_text.text(f"🎵 Sintesi FM Frame {i + 1}/{num_frames} | Fc: {int(carrier_freq)} Hz | Fm: {int(modulator_freq)} Hz | I: {mod_index:.2f}")
+        
+        return generated_audio
+
+    def process_audio_segments(self, base_audio: np.ndarray, brightness_data: np.ndarray, detail_data: np.ndarray, 
+                             min_cutoff: float, max_cutoff: float, min_res: float, max_res: float,
+                             min_pitch_shift_semitones: float, max_pitch_shift_semitones: float,
+                             min_time_stretch_rate: float, max_time_stretch_rate: float,
+                             apply_filter: bool = True) -> np.ndarray: # Aggiungi un flag per il filtro
+        """
+        Applica (opzionalmente) un filtro passa-basso dinamico, pitch shifting e time stretching 
+        all'audio di base, modulato dai dati visivi.
+        """
+        st.info("🔊 Applicazione Effetti Audio dinamici (Filtro, Pitch, Time Stretch)...")
+        
+        # Copia dell'audio di base per le modifiche
+        processed_audio = base_audio.copy()
+        
+        filter_order = 4
+        
+        num_frames = len(brightness_data)
+        
+        status_text = st.empty()
+        
+        # --- Fase 1: Filtro Dinamico (se abilitato) ---
+        if apply_filter:
+            progress_bar_filter = st.progress(0, text="🎶 Applicazione Filtro Dinamico...")
+            # Inizializza lo stato del filtro per una transizione più fluida
+            zi = np.zeros(filter_order) 
+            for i in range(num_frames):
+                frame_start_sample = i * self.samples_per_frame
+                frame_end_sample = min((i + 1) * self.samples_per_frame, len(processed_audio))
+                
+                audio_segment = processed_audio[frame_start_sample:frame_end_sample]
+                if audio_segment.size == 0: continue 
+
+                current_brightness = brightness_data[i]
+                current_detail = detail_data[i]
+                
+                cutoff_freq = min_cutoff + current_brightness * (max_cutoff - min_cutoff)
+                resonance_q = min_res + current_detail * (max_res - min_res) 
+
+                nyquist = 0.5 * self.sample_rate
+                normal_cutoff = cutoff_freq / nyquist
+                normal_cutoff = np.clip(normal_cutoff, 0.001, 0.999) 
+
+                b, a = butter(filter_order, normal_cutoff, btype='lowpass', analog=False, output='ba')
+                filtered_segment, zi = lfilter(b, a, audio_segment, zi=zi)
+                
+                processed_audio[frame_start_sample:frame_end_sample] = filtered_segment
+                progress_bar_filter.progress((i + 1) / num_frames)
+                status_text.text(f"🎶 Filtro Dinamico Frame {i + 1}/{num_frames} | Cutoff: {int(cutoff_freq)} Hz | Q: {resonance_q:.2f}")
 
         # --- Fase 2: Pitch Shifting e Time Stretching ---
         st.info("🔊 Applicazione Pitch Shifting e Time Stretching...")
-        final_audio = np.zeros_like(filtered_audio) # Useremo questo array per l'output finale
+        
+        # Assicurati che l'audio sia float32 per librosa
+        processed_audio = processed_audio.astype(np.float32)
+
+        output_segments = []
         
         progress_bar_effects = st.progress(0, text="🔊 Applicazione Effetti Audio...")
         
-        # Processa l'audio in blocchi per gli effetti di pitch/time.
-        # È più efficiente applicare questi effetti su blocchi piuttosto che campione per campione.
-        # Scegli una dimensione del blocco, ad esempio 2048 campioni o l'equivalente di un frame.
-        
-        # Qui potremmo affrontare una scelta progettuale:
-        # 1. Applicare pitch/time stretch a ogni segmento *originale* prima del filtro,
-        #    e poi unire. (più complesso con le durate che cambiano)
-        # 2. Applicare pitch/time stretch all'audio *filtrato*. (più semplice)
-        # 3. Applicare gli effetti in modo globale con valori medi, o per segmenti più grandi.
-        
-        # Per questa implementazione iniziale, applicheremo gli effetti in modo "per frame"
-        # sull'audio già filtrato, gestendo il time stretching ri-campionando l'audio.
-
-        # Pitch shift e time stretch con librosa richiedono audio float32
-        filtered_audio = filtered_audio.astype(np.float32)
-
-        # Inizializza l'audio finale con una dimensione stimata per il time stretch
-        # La dimensione finale può variare leggermente, quindi gestiremo l'append
-        output_segments = []
-        
         for i in range(num_frames):
             frame_start_sample = i * self.samples_per_frame
-            frame_end_sample = min((i + 1) * self.samples_per_frame, len(filtered_audio))
+            frame_end_sample = min((i + 1) * self.samples_per_frame, len(processed_audio))
             
-            audio_segment = filtered_audio[frame_start_sample:frame_end_sample]
+            audio_segment = processed_audio[frame_start_sample:frame_end_sample]
             if audio_segment.size == 0: continue
 
             current_brightness = brightness_data[i]
             current_detail = detail_data[i]
 
-            # Mappa il dettaglio al pitch shift (es. più dettaglio = pitch più alto)
             pitch_shift_semitones = min_pitch_shift_semitones + current_detail * (max_pitch_shift_semitones - min_pitch_shift_semitones)
-            # Mappa la luminosità al time stretch rate (es. più luminosità = più veloce)
-            # Un rate di 1.0 significa velocità normale. >1.0 è più veloce, <1.0 è più lento.
             time_stretch_rate = min_time_stretch_rate + current_brightness * (max_time_stretch_rate - min_time_stretch_rate)
-            time_stretch_rate = np.clip(time_stretch_rate, 0.5, 2.0) # Limita per evitare eccessi
+            time_stretch_rate = np.clip(time_stretch_rate, 0.1, 5.0) # Estendi leggermente il clip range
 
             # Applica Pitch Shifting
             pitched_segment = librosa.effects.pitch_shift(
@@ -213,22 +245,6 @@ class AudioGenerator:
             )
             
             # Applica Time Stretching
-            # librosa.effects.time_stretch richiede un DGT (Discrete Group Transform) che è un po' più complesso.
-            # Un approccio più semplice (ma che può suonare meno bene per variazioni estreme)
-            # è ri-campionare per il time stretch, ma librosa time_stretch è più robusto.
-            # Per time_stretch, usiamo un 'hop_length' che influenza la granularità.
-            # Per una gestione più semplice e robusta del time stretch con librosa, spesso si usa
-            # librosa.stft per l'analisi e poi istft per la sintesi dopo la trasformazione.
-            # Tuttavia, librosa.effects.time_stretch è un'interfaccia più semplice.
-            
-            # Per un time stretch che mantenga la stessa lunghezza di output del segmento originale,
-            # ma con il contenuto "stretchato", dobbiamo calcolare il target_length.
-            # `librosa.effects.time_stretch` cambia la durata. Per mantenere una durata costante
-            # del *segmento di output*, si può fare un `resample` dopo, ma è più complesso.
-            # Alternativa: usiamo il rate e lasciamo che la durata cambi, poi ri-campioniamo l'intero array finale.
-
-            # Per la modularità, useremo time_stretch che modifica la durata del segmento.
-            # Successivamente, dovremo ricampionare l'intero audio per farlo combaciare con la durata del video.
             stretched_segment = librosa.effects.time_stretch(y=pitched_segment, rate=time_stretch_rate)
             
             output_segments.append(stretched_segment)
@@ -236,11 +252,8 @@ class AudioGenerator:
             progress_bar_effects.progress((i + 1) / num_frames)
             status_text.text(f"🔊 Effetti Audio Frame {i + 1}/{num_frames} | Pitch: {pitch_shift_semitones:.1f} semitoni | Stretch: {time_stretch_rate:.2f}")
 
-        # Unisci tutti i segmenti processati
         combined_audio = np.concatenate(output_segments)
 
-        # Ricampiona l'audio combinato alla durata esatta del video (se necessario)
-        # Questo è cruciale perché time_stretch modifica la lunghezza.
         target_total_samples = int(num_frames * self.samples_per_frame)
         if len(combined_audio) != target_total_samples:
             st.info(f"🔄 Ricampionamento audio per adattarsi alla durata video (da {len(combined_audio)} a {target_total_samples} campioni)...")
@@ -248,7 +261,6 @@ class AudioGenerator:
         else:
             final_audio = combined_audio
 
-        # Normalizza l'audio finale per evitare clipping
         if np.max(np.abs(final_audio)) > 0:
             final_audio = final_audio / np.max(np.abs(final_audio)) * 0.9 
             
@@ -260,7 +272,7 @@ def main():
     st.title("🎬 VideoSound Gen - Sperimentale")
     st.markdown("###### by Loop507") 
     st.markdown("### Genera musica sperimentale da un video muto")
-    st.markdown("Carica un video e osserva come le sue proprietà visive creano un paesaggio sonoro dinamico attraverso la sintesi sottrattiva.")
+    st.markdown("Carica un video e osserva come le sue proprietà visive creano un paesaggio sonoro dinamico.")
 
     uploaded_file = st.file_uploader("🎞️ Carica un file video (.mp4, .mov, ecc.)", type=["mp4", "mov", "avi", "mkv"])
     
@@ -287,19 +299,43 @@ def main():
         st.markdown("---")
         st.subheader("🎶 Configurazione Sintesi Audio Sperimentale")
 
-        # Slider per il controllo dei range di mappatura (opzionale per l'utente)
-        st.sidebar.header("Parametri Sintesi Sottrattiva")
-        min_cutoff_user = st.sidebar.slider("Min Frequenza Taglio (Hz)", 20, 5000, 100)
-        max_cutoff_user = st.sidebar.slider("Max Frequenza Taglio (Hz)", 1000, 20000, 8000)
-        min_resonance_user = st.sidebar.slider("Min Risonanza (Q)", 0.1, 5.0, 0.5) 
-        max_resonance_user = st.sidebar.slider("Max Risonanza (Q)", 1.0, 30.0, 10.0) 
+        # --- Scelta del Tipo di Sintesi ---
+        synthesis_type = st.radio(
+            "Seleziona il tipo di sintesi:",
+            ("Sintesi Sottrattiva", "Sintesi FM")
+        )
 
-        # --- Nuovi Slider per Pitch Shifting / Time Stretching ---
+        # Parametri Condizionali per la Sintesi Sottrattiva
+        if synthesis_type == "Sintesi Sottrattiva":
+            st.sidebar.header("Parametri Sintesi Sottrattiva")
+            min_cutoff_user = st.sidebar.slider("Min Frequenza Taglio (Hz)", 20, 5000, 100)
+            max_cutoff_user = st.sidebar.slider("Max Frequenza Taglio (Hz)", 1000, 20000, 8000)
+            min_resonance_user = st.sidebar.slider("Min Risonanza (Q)", 0.1, 5.0, 0.5) 
+            max_resonance_user = st.sidebar.slider("Max Risonanza (Q)", 1.0, 30.0, 10.0) 
+            apply_filter = True # Il filtro è intrinseco alla sintesi sottrattiva
+            # Imposta valori di default per FM se non usata
+            min_carrier_freq_user, max_carrier_freq_user = 0, 0
+            min_modulator_freq_user, max_modulator_freq_user = 0, 0
+            min_mod_index_user, max_mod_index_user = 0, 0
+        else: # Sintesi FM
+            st.sidebar.header("Parametri Sintesi FM")
+            st.sidebar.markdown("*(Luminosità controlla Freq Carrier, Dettaglio controlla Freq Modulator e Indice)*")
+            min_carrier_freq_user = st.sidebar.slider("Min Frequenza Carrier (Hz)", 20, 1000, 100)
+            max_carrier_freq_user = st.sidebar.slider("Max Frequenza Carrier (Hz)", 500, 5000, 1000)
+            min_modulator_freq_user = st.sidebar.slider("Min Frequenza Modulator (Hz)", 1, 500, 5)
+            max_modulator_freq_user = st.sidebar.slider("Max Frequenza Modulator (Hz)", 10, 2000, 100)
+            min_mod_index_user = st.sidebar.slider("Min Indice di Modulazione", 0.1, 10.0, 0.5, 0.1)
+            max_mod_index_user = st.sidebar.slider("Max Indice di Modulazione", 1.0, 50.0, 5.0, 0.1)
+            apply_filter = False # Il filtro passa-basso non è tipico per FM se non come post-process
+
+            # Imposta valori di default per filtro sottrattivo se non usato
+            min_cutoff_user, max_cutoff_user = 0, 0
+            min_resonance_user, max_resonance_user = 0, 0
+
         st.sidebar.header("Parametri Pitch/Time Stretching")
         st.sidebar.markdown("*(Luminosità controlla il Time Stretching, Dettaglio il Pitch Shifting)*")
         min_pitch_shift_semitones = st.sidebar.slider("Min Pitch Shift (semitoni)", -24.0, 24.0, -12.0, 0.5)
         max_pitch_shift_semitones = st.sidebar.slider("Max Pitch Shift (semitoni)", -24.0, 24.0, 12.0, 0.5)
-        # Rate: 1.0 = normale, <1.0 = più lento, >1.0 = più veloce
         min_time_stretch_rate = st.sidebar.slider("Min Time Stretch Rate", 0.1, 2.0, 0.8, 0.1) 
         max_time_stretch_rate = st.sidebar.slider("Max Time Stretch Rate", 0.5, 5.0, 1.5, 0.1) 
 
@@ -307,13 +343,11 @@ def main():
         st.markdown("---")
         st.subheader("⬇️ Opzioni di Download")
         
-        # Selezione della risoluzione di output
         output_resolution_choice = st.selectbox(
             "Seleziona la risoluzione di output del video:",
             list(FORMAT_RESOLUTIONS.keys())
         )
         
-        # Scegli cosa scaricare
         download_option = st.radio(
             "Cosa vuoi scaricare?",
             ("Video con Audio", "Solo Audio")
@@ -332,11 +366,31 @@ def main():
             audio_gen = AudioGenerator(AUDIO_SAMPLE_RATE, int(fps)) 
             
             total_samples = int(video_duration * AUDIO_SAMPLE_RATE)
-            base_waveform = audio_gen.generate_base_waveform(total_samples)
+            
+            # --- Generazione dell'audio base in base al tipo di sintesi scelto ---
+            base_audio_waveform = None
+            if synthesis_type == "Sintesi Sottrattiva":
+                base_audio_waveform = audio_gen.generate_subtractive_waveform(total_samples)
+                st.success("✅ Onda base per Sintesi Sottrattiva generata!")
+            elif synthesis_type == "Sintesi FM":
+                base_audio_waveform = audio_gen.generate_fm_waveform(
+                    total_samples,
+                    brightness_data, 
+                    detail_data,
+                    min_carrier_freq_user, max_carrier_freq_user,
+                    min_modulator_freq_user, max_modulator_freq_user,
+                    min_mod_index_user, max_mod_index_user
+                )
+                st.success("✅ Onda base per Sintesi FM generata!")
 
-            with st.spinner("🎧 Generazione audio sperimentale e applicazione filtri dinamici..."):
-                generated_audio = audio_gen.apply_filter_dynamic(
-                    base_waveform, 
+            if base_audio_waveform is None or base_audio_waveform.size == 0:
+                st.error("❌ Errore nella generazione dell'onda audio base.")
+                return
+
+            # --- Processamento degli effetti dinamici (filtro, pitch, time stretch) ---
+            with st.spinner("🎧 Applicazione effetti dinamici all'audio generato..."):
+                generated_audio = audio_gen.process_audio_segments(
+                    base_audio_waveform, 
                     brightness_data, 
                     detail_data,
                     min_cutoff=min_cutoff_user, 
@@ -346,16 +400,17 @@ def main():
                     min_pitch_shift_semitones=min_pitch_shift_semitones,
                     max_pitch_shift_semitones=max_pitch_shift_semitones,
                     min_time_stretch_rate=min_time_stretch_rate,
-                    max_time_stretch_rate=max_time_stretch_rate
+                    max_time_stretch_rate=max_time_stretch_rate,
+                    apply_filter=apply_filter # Passa il flag per applicare il filtro solo se Sottrattiva
                 )
             
             if generated_audio is None or generated_audio.size == 0:
-                st.error("❌ Errore nella generazione dell'audio.")
+                st.error("❌ Errore nel processamento degli effetti audio.")
                 return
 
             try:
                 sf.write(audio_output_path, generated_audio, AUDIO_SAMPLE_RATE)
-                st.success(f"✅ Audio sperimentale generato e salvato in '{audio_output_path}'")
+                st.success(f"✅ Audio sperimentale processato e salvato in '{audio_output_path}'")
             except Exception as e:
                 st.error(f"❌ Errore nel salvataggio dell'audio WAV: {str(e)}")
                 return
