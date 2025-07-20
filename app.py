@@ -282,14 +282,12 @@ class AudioGenerator:
     def process_audio_segments(self, base_audio: np.ndarray, brightness_data: np.ndarray, detail_data: np.ndarray, 
                              min_cutoff: float, max_cutoff: float, min_res: float, max_res: float,
                              min_pitch_shift_semitones: float, max_pitch_shift_semitones: float,
-                             min_time_stretch_rate: float, max_time_stretch_rate: float,
-                             apply_filter: bool = True) -> np.ndarray:
+                             max_time_stretch_rate: float, min_time_stretch_rate: float,
+                             apply_filter: bool = True, apply_pitch_stretch: bool = True) -> np.ndarray:
         """
         Applica (opzionalmente) un filtro passa-basso dinamico, pitch shifting e time stretching 
         all'audio di base, modulato dai dati visivi.
         """
-        st.info("🔊 Applicazione Effetti Audio dinamici (Filtro, Pitch, Time Stretch)...")
-        
         processed_audio = base_audio.copy()
         
         filter_order = 4
@@ -298,6 +296,7 @@ class AudioGenerator:
         
         # --- Fase 1: Filtro Dinamico (per sintesi sottrattiva) ---
         if apply_filter:
+            st.info("🎶 Applicazione Filtro Dinamico...")
             progress_bar_filter = st.progress(0, text="🎶 Applicazione Filtro Dinamico...")
             zi = np.zeros(filter_order) 
             for i in range(num_frames):
@@ -326,55 +325,57 @@ class AudioGenerator:
                 status_text.text(f"🎶 Filtro Dinamico Frame {i + 1}/{num_frames} | Cutoff: {int(cutoff_freq)} Hz | Q: {resonance_q:.2f}")
 
         # --- Fase 2: Pitch Shifting e Time Stretching ---
-        st.info("🔊 Applicazione Pitch Shifting e Time Stretching...")
+        if apply_pitch_stretch:
+            st.info("🔊 Applicazione Pitch Shifting e Time Stretching...")
+            
+            processed_audio = processed_audio.astype(np.float32)
+
+            output_segments = []
+            
+            progress_bar_effects = st.progress(0, text="🔊 Applicazione Effetti Audio...")
+            
+            for i in range(num_frames):
+                frame_start_sample = i * self.samples_per_frame
+                frame_end_sample = min((i + 1) * self.samples_per_frame, len(processed_audio))
+                
+                audio_segment = processed_audio[frame_start_sample:frame_end_sample]
+                if audio_segment.size == 0: continue
+
+                current_brightness = brightness_data[i]
+                current_detail = detail_data[i]
+
+                # Mappatura: Pitch Shift -> Dettaglio, Time Stretch -> Luminosità
+                pitch_shift_semitones = min_pitch_shift_semitones + current_detail * (max_pitch_shift_semitones - min_pitch_shift_semitones)
+                time_stretch_rate = min_time_stretch_rate + current_brightness * (max_time_stretch_rate - min_time_stretch_rate)
+                time_stretch_rate = np.clip(time_stretch_rate, 0.1, 5.0) 
+
+                pitched_segment = librosa.effects.pitch_shift(
+                    y=audio_segment, 
+                    sr=self.sample_rate, 
+                    n_steps=pitch_shift_semitones
+                )
+                
+                stretched_segment = librosa.effects.time_stretch(y=pitched_segment, rate=time_stretch_rate)
+                
+                output_segments.append(stretched_segment)
+
+                progress_bar_effects.progress((i + 1) / num_frames)
+                status_text.text(f"🔊 Effetti Audio Frame {i + 1}/{num_frames} | Pitch: {pitch_shift_semitones:.1f} semitoni | Stretch: {time_stretch_rate:.2f}")
+
+            combined_audio = np.concatenate(output_segments)
+
+            target_total_samples = int(num_frames * self.samples_per_frame)
+            if len(combined_audio) != target_total_samples:
+                st.info(f"🔄 Ricampionamento audio per adattarsi alla durata video (da {len(combined_audio)} a {target_total_samples} campioni)...")
+                final_audio = librosa.resample(y=combined_audio, orig_sr=self.sample_rate, target_sr=self.sample_rate, res_type='kaiser_best', scale=False, fix=True, to_mono=True, axis=-1, length=target_total_samples)
+            else:
+                final_audio = combined_audio
+            processed_audio = final_audio
         
-        processed_audio = processed_audio.astype(np.float32)
-
-        output_segments = []
-        
-        progress_bar_effects = st.progress(0, text="🔊 Applicazione Effetti Audio...")
-        
-        for i in range(num_frames):
-            frame_start_sample = i * self.samples_per_frame
-            frame_end_sample = min((i + 1) * self.samples_per_frame, len(processed_audio))
+        if np.max(np.abs(processed_audio)) > 0:
+            processed_audio = processed_audio / np.max(np.abs(processed_audio)) * 0.9 
             
-            audio_segment = processed_audio[frame_start_sample:frame_end_sample]
-            if audio_segment.size == 0: continue
-
-            current_brightness = brightness_data[i]
-            current_detail = detail_data[i]
-
-            # Mappatura: Pitch Shift -> Dettaglio, Time Stretch -> Luminosità
-            pitch_shift_semitones = min_pitch_shift_semitones + current_detail * (max_pitch_shift_semitones - min_pitch_shift_semitones)
-            time_stretch_rate = min_time_stretch_rate + current_brightness * (max_time_stretch_rate - min_time_stretch_rate)
-            time_stretch_rate = np.clip(time_stretch_rate, 0.1, 5.0) 
-
-            pitched_segment = librosa.effects.pitch_shift(
-                y=audio_segment, 
-                sr=self.sample_rate, 
-                n_steps=pitch_shift_semitones
-            )
-            
-            stretched_segment = librosa.effects.time_stretch(y=pitched_segment, rate=time_stretch_rate)
-            
-            output_segments.append(stretched_segment)
-
-            progress_bar_effects.progress((i + 1) / num_frames)
-            status_text.text(f"🔊 Effetti Audio Frame {i + 1}/{num_frames} | Pitch: {pitch_shift_semitones:.1f} semitoni | Stretch: {time_stretch_rate:.2f}")
-
-        combined_audio = np.concatenate(output_segments)
-
-        target_total_samples = int(num_frames * self.samples_per_frame)
-        if len(combined_audio) != target_total_samples:
-            st.info(f"🔄 Ricampionamento audio per adattarsi alla durata video (da {len(combined_audio)} a {target_total_samples} campioni)...")
-            final_audio = librosa.resample(y=combined_audio, orig_sr=self.sample_rate, target_sr=self.sample_rate, res_type='kaiser_best', scale=False, fix=True, to_mono=True, axis=-1, length=target_total_samples)
-        else:
-            final_audio = combined_audio
-
-        if np.max(np.abs(final_audio)) > 0:
-            final_audio = final_audio / np.max(np.abs(final_audio)) * 0.9 
-            
-        return final_audio.astype(np.float32)
+        return processed_audio.astype(np.float32)
 
 
 def main():
@@ -417,17 +418,21 @@ def main():
         min_mod_index_user, max_mod_index_user = 0, 0
         min_noise_amp_user, max_noise_amp_user = 0, 0
         glitch_threshold_user, glitch_duration_frames_user, glitch_intensity_user = 0, 0, 0
+        min_pitch_shift_semitones, max_pitch_shift_semitones = 0, 0
+        min_time_stretch_rate, max_time_stretch_rate = 0, 0
 
-        # --- Sezione Sintesi Sottrattiva (sempre attiva come base) ---
+
+        # --- Sezione Sintesi Sottrattiva (con checkbox di abilitazione) ---
         st.sidebar.header("Generazione Suono Base")
+        enable_subtractive_synthesis = st.sidebar.checkbox("🔊 **Abilita Sintesi Sottrattiva (Suono Base)**", value=True)
         with st.sidebar.expander("Sintesi Sottrattiva (Filtro Passa-Basso)", expanded=True): 
             st.markdown("**Controlli:**")
             st.markdown("- **Frequenza di Taglio:** controllata dalla **Luminosità** del video.")
             st.markdown("- **Risonanza:** controllata dal **Dettaglio/Contrasto** del video.")
-            min_cutoff_user = st.slider("Min Frequenza Taglio (Hz)", 20, 5000, 100, key="sub_min_cutoff")
-            max_cutoff_user = st.slider("Max Frequenza Taglio (Hz)", 1000, 20000, 8000, key="sub_max_cutoff")
-            min_resonance_user = st.slider("Min Risonanza (Q)", 0.1, 5.0, 0.5, key="sub_min_res") 
-            max_resonance_user = st.slider("Max Risonanza (Q)", 1.0, 30.0, 10.0, key="sub_max_res") 
+            min_cutoff_user = st.slider("Min Frequenza Taglio (Hz)", 20, 5000, 100, key="sub_min_cutoff", disabled=not enable_subtractive_synthesis)
+            max_cutoff_user = st.slider("Max Frequenza Taglio (Hz)", 1000, 20000, 8000, key="sub_max_cutoff", disabled=not enable_subtractive_synthesis)
+            min_resonance_user = st.slider("Min Risonanza (Q)", 0.1, 5.0, 0.5, key="sub_min_res", disabled=not enable_subtractive_synthesis) 
+            max_resonance_user = st.slider("Max Risonanza (Q)", 1.0, 30.0, 10.0, key="sub_max_res", disabled=not enable_subtractive_synthesis) 
         
         # --- Sezione Sintesi FM (attivabile con checkbox) ---
         st.sidebar.markdown("---")
@@ -469,16 +474,17 @@ def main():
                 glitch_duration_frames_user = st.slider("Durata Glitch (frames)", 1, 10, 2, key="glitch_duration_frames")
                 glitch_intensity_user = st.slider("Intensità Glitch", 0.1, 2.0, 1.0, 0.1, key="glitch_intensity")
 
-        # --- Sezione Pitch/Time Stretching (sempre attiva) ---
+        # --- Sezione Pitch/Time Stretching (con checkbox di abilitazione) ---
         st.sidebar.markdown("---")
+        enable_pitch_time_stretch = st.sidebar.checkbox("🎶 **Abilita Pitch Shifting / Time Stretching**", value=True)
         with st.sidebar.expander("Pitch Shifting / Time Stretching", expanded=True): 
             st.markdown("**Controlli:**")
             st.markdown("- **Time Stretch Rate:** controllato dalla **Luminosità** del video.")
             st.markdown("- **Pitch Shift:** controllato dal **Dettaglio/Contrasto** del video.")
-            min_pitch_shift_semitones = st.slider("Min Pitch Shift (semitoni)", -24.0, 24.0, -12.0, 0.5, key="pitch_min")
-            max_pitch_shift_semitones = st.slider("Max Pitch Shift (semitoni)", -24.0, 24.0, 12.0, 0.5, key="pitch_max")
-            min_time_stretch_rate = st.slider("Min Time Stretch Rate", 0.1, 2.0, 0.8, 0.1, key="stretch_min") 
-            max_time_stretch_rate = st.slider("Max Time Stretch Rate", 0.5, 5.0, 1.5, 0.1, key="stretch_max") 
+            min_pitch_shift_semitones = st.slider("Min Pitch Shift (semitoni)", -24.0, 24.0, -12.0, 0.5, key="pitch_min", disabled=not enable_pitch_time_stretch)
+            max_pitch_shift_semitones = st.slider("Max Pitch Shift (semitoni)", -24.0, 24.0, 12.0, 0.5, key="pitch_max", disabled=not enable_pitch_time_stretch)
+            min_time_stretch_rate = st.slider("Min Time Stretch Rate", 0.1, 2.0, 0.8, 0.1, key="stretch_min", disabled=not enable_pitch_time_stretch) 
+            max_time_stretch_rate = st.slider("Max Time Stretch Rate", 0.5, 5.0, 1.5, 0.1, key="stretch_max", disabled=not enable_pitch_time_stretch) 
 
 
         st.markdown("---")
@@ -509,9 +515,14 @@ def main():
             total_samples = int(video_duration * AUDIO_SAMPLE_RATE)
             
             # --- Generazione dell'audio base (Sintesi Sottrattiva) ---
-            st.info("🎵 Generazione dell'onda base (Sintesi Sottrattiva)...")
-            primary_audio_waveform = audio_gen.generate_subtractive_waveform(total_samples)
-            
+            primary_audio_waveform = np.zeros(total_samples, dtype=np.float32) # Inizializza a zero
+            if enable_subtractive_synthesis:
+                st.info("🎵 Generazione dell'onda base (Sintesi Sottrattiva)...")
+                primary_audio_waveform = audio_gen.generate_subtractive_waveform(total_samples)
+            else:
+                st.info("🎵 Sintesi Sottrattiva disabilitata. Partendo da audio silenzioso.")
+
+
             # --- Aggiungi lo strato FM se abilitato ---
             if enable_fm_synthesis:
                 fm_layer = audio_gen.generate_fm_layer(
@@ -561,7 +572,8 @@ def main():
                     max_pitch_shift_semitones=max_pitch_shift_semitones,
                     min_time_stretch_rate=min_time_stretch_rate,
                     max_time_stretch_rate=max_time_stretch_rate,
-                    apply_filter=True 
+                    apply_filter=enable_subtractive_synthesis, # Applica filtro solo se sintesi sottrattiva è abilitata
+                    apply_pitch_stretch=enable_pitch_time_stretch # Applica pitch/stretch solo se abilitato
                 )
             
             if generated_audio is None or generated_audio.size == 0:
