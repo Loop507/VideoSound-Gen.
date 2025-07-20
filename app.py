@@ -173,9 +173,6 @@ class AudioGenerator:
 
         num_frames = len(brightness_data)
         
-        # progress_bar = st.progress(0, text="🎵 Generazione Strato FM...") # Remove, pass from main
-        # status_text = st.empty() # Remove, pass from main
-
         for i in range(num_frames):
             frame_start_sample = i * self.samples_per_frame
             frame_end_sample = min((i + 1) * self.samples_per_frame, duration_samples)
@@ -227,9 +224,6 @@ class AudioGenerator:
         
         num_frames = len(brightness_data)
         
-        # progress_bar = st.progress(0, text="🎵 Generazione Strato Granulare...") # Remove, pass from main
-        # status_text = st.empty() # Remove, pass from main
-
         for i in range(num_frames):
             frame_start_sample = i * self.samples_per_frame
             frame_end_sample = min((i + 1) * self.samples_per_frame, duration_samples)
@@ -302,9 +296,6 @@ class AudioGenerator:
         noise_layer = np.zeros_like(base_audio, dtype=np.float32)
         num_frames = len(detail_data)
         
-        # progress_bar = st.progress(0, text="🔊 Aggiunta Strato Rumore (Noise)...") # Remove, pass from main
-        # status_text = st.empty() # Remove, pass from main
-
         for i in range(num_frames):
             frame_start_sample = i * self.samples_per_frame
             frame_end_sample = min((i + 1) * self.samples_per_frame, len(base_audio))
@@ -338,9 +329,6 @@ class AudioGenerator:
         glitched_audio = base_audio.copy()
         num_frames = len(variation_movement_data)
         
-        # progress_bar = st.progress(0, text="🔊 Applicazione Effetti Glitch...") # Remove, pass from main
-        # status_text = st.empty() # Remove, pass from main
-
         for i in range(num_frames):
             current_var_movement = variation_movement_data[i]
             
@@ -399,9 +387,6 @@ class AudioGenerator:
         max_delay_samples = int(max_delay_time * self.sample_rate)
         delay_buffer = np.zeros(max_delay_samples, dtype=np.float32)
         
-        # progress_bar = st.progress(0, text="🔊 Applicazione Effetto Delay...") # Remove, pass from main
-        # status_text = st.empty() # Remove, pass from main
-
         for i in range(num_frames):
             frame_start_sample = i * self.samples_per_frame
             frame_end_sample = min((i + 1) * self.samples_per_frame, len(audio))
@@ -460,9 +445,6 @@ class AudioGenerator:
         
         # Inizializza un array per l'output riverberato
         output_reverb = np.zeros_like(audio)
-
-        # progress_bar = st.progress(0, text="🔊 Applicazione Effetto Riverbero...") # Remove, pass from main
-        # status_text = st.empty() # Remove, pass from main
 
         # Parametri base per una simulazione semplificata di riverbero
         # Un vero riverbero richiede algoritmi complessi (es. Schroeder, FDN)
@@ -535,7 +517,7 @@ class AudioGenerator:
     def apply_dynamic_filter(self, audio: np.ndarray, 
                              brightness_data: np.ndarray, detail_data: np.ndarray, 
                              min_cutoff: float, max_cutoff: float, min_res: float, max_res: float,
-                             filter_type: str = "lowpass", progress_bar, status_text) -> np.ndarray:
+                             progress_bar, status_text, filter_type: str = "lowpass") -> np.ndarray:
         """
         Applica un filtro dinamico (Passa-Basso, Passa-Banda, Passa-Alto) all'audio.
         """
@@ -545,7 +527,6 @@ class AudioGenerator:
         filter_order = 4 # Ordine del filtro (bilanciamento tra steepness e performance)
         num_frames = len(brightness_data)
         
-        # progress_bar_filter = st.progress(0, text=f"🎶 Applicazione Filtro Dinamico ({filter_type})...") # Remove, pass from main
         zi_channels = [np.zeros(filter_order) for _ in range(audio.shape[1] if audio.ndim > 1 else 1)] # Per gestire stereo
 
         for i in range(num_frames):
@@ -611,8 +592,6 @@ class AudioGenerator:
         output_segments = []
         num_frames = len(brightness_data)
         
-        # progress_bar_effects = st.progress(0, text="🔊 Applicazione Effetti Audio...") # Remove, pass from main
-        
         for i in range(num_frames):
             frame_start_sample = i * self.samples_per_frame
             frame_end_sample = min((i + 1) * self.samples_per_frame, len(audio_mono))
@@ -653,7 +632,7 @@ class AudioGenerator:
         return final_audio.astype(np.float32)
 
     def apply_modulation_effect(self, audio: np.ndarray, variation_movement_data: np.ndarray, detail_data: np.ndarray,
-                                effect_type: str = "none", intensity: float = 0.5, rate: float = 0.1, progress_bar, status_text) -> np.ndarray:
+                                progress_bar, status_text, effect_type: str = "none", intensity: float = 0.5, rate: float = 0.1) -> np.ndarray:
         """
         Applica effetti di modulazione (Chorus, Flanger, Phaser) all'audio.
         Questi sono placeholder e necessitano di un'implementazione più robusta con librerie dedicate
@@ -667,9 +646,6 @@ class AudioGenerator:
         
         num_frames = len(variation_movement_data)
         
-        # progress_bar = st.progress(0, text=f"🔊 Applicazione Effetto {effect_type.capitalize()}...") # Remove, pass from main
-        # status_text = st.empty() # Remove, pass from main
-
         for i in range(num_frames):
             frame_start_sample = i * self.samples_per_frame
             frame_end_sample = min((i + 1) * self.samples_per_frame, len(modulated_audio))
@@ -733,9 +709,6 @@ class AudioGenerator:
         num_frames = len(horizontal_center_data)
         stereo_audio = np.zeros((audio.shape[0], 2), dtype=np.float32)
         
-        # progress_bar = st.progress(0, text="🔊 Applicazione Panoramica Stereo...") # Remove, pass from main
-        # status_text = st.empty() # Remove, pass from main
-
         for i in range(num_frames):
             frame_start_sample = i * self.samples_per_frame
             frame_end_sample = min((i + 1) * self.samples_per_frame, len(audio))
@@ -1086,7 +1059,9 @@ def main():
                         max_cutoff=max_cutoff_adv,
                         min_res=min_resonance_adv,
                         max_res=max_resonance_adv,
-                        filter_type=filter_type_user, audio_progress_bar, audio_status_text
+                        progress_bar=audio_progress_bar, # Passed correctly now
+                        status_text=audio_status_text,   # Passed correctly now
+                        filter_type=filter_type_user
                     )
                     st.success("✅ Filtri avanzati applicati!")
 
@@ -1095,9 +1070,11 @@ def main():
                         processed_audio,
                         variation_movement_data,
                         detail_data,
+                        progress_bar=audio_progress_bar, # Passed correctly now
+                        status_text=audio_status_text,   # Passed correctly now
                         effect_type=modulation_effect_type,
                         intensity=modulation_intensity,
-                        rate=modulation_rate, audio_progress_bar, audio_status_text
+                        rate=modulation_rate
                     )
                     st.success(f"✅ Effetto di Modulazione '{modulation_effect_type}' applicato!")
 
