@@ -37,31 +37,31 @@ def validate_video_file(uploaded_file) -> bool:
         return False
     return True
 
-def analyze_video_frames(video_path: str) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray], Optional[int], Optional[int], Optional[float], Optional[float]]:
+def analyze_video_frames(video_path: str) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray], Optional[int], Optional[int], Optional[float], Optional[float]]:
     """
     Carica il video, estrae i frame e analizza luminosità, dettaglio/contrasto e movimento.
-    Restituisce array di luminosità, dettaglio e movimento per frame, e info sul video.
+    Restituisce array di luminosità, dettaglio, movimento e variazione di movimento per frame, e info sul video.
     """
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         st.error("❌ Impossibile aprire il file video.")
-        return None, None, None, None, None, None, None
+        return None, None, None, None, None, None, None, None
 
     fps = cap.get(cv2.CAP_PROP_FPS)
     if fps == 0:
         st.error("❌ Impossibile leggere il framerate del video.")
         cap.release()
-        return None, None, None, None, None, None, None
+        return None, None, None, None, None, None, None, None
 
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_HEIGHT)) # Usato CAP_PROP_HEIGHT invece di CAP_PROP_FRAME_HEIGHT per consistenza
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) # Usato CAP_PROP_HEIGHT invece di CAP_PROP_FRAME_HEIGHT per consistenza
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     video_duration = total_frames / fps if fps > 0 else 0
 
     if video_duration < MIN_DURATION:
         st.error(f"❌ Il video deve essere lungo almeno {MIN_DURATION} secondi. Durata attuale: {video_duration:.2f}s")
         cap.release()
-        return None, None, None, None, None, None, None
+        return None, None, None, None, None, None, None, None
     
     if video_duration > MAX_DURATION:
         st.warning(f"⚠️ Video troppo lungo ({video_duration:.1f}s). Verranno analizzati solo i primi {MAX_DURATION} secondi.")
@@ -71,8 +71,10 @@ def analyze_video_frames(video_path: str) -> Tuple[Optional[np.ndarray], Optiona
     brightness_data = []
     detail_data = [] 
     movement_data = [] 
+    variation_movement_data = [] # Nuovo array per la variazione del movimento
     
     prev_gray_frame = None 
+    prev_movement = 0.0 # Per calcolare la variazione del movimento
 
     progress_bar = st.progress(0)
     status_text = st.empty()
@@ -93,28 +95,37 @@ def analyze_video_frames(video_path: str) -> Tuple[Optional[np.ndarray], Optiona
         detail_data.append(detail)
 
         # 3. Movimento: Differenza assoluta media tra frame consecutivi
+        current_movement = 0.0
         if prev_gray_frame is not None:
-            frame_diff = np.sum(cv2.absdiff(gray_frame, prev_gray_frame)) / (gray_frame.size * 255.0)
-            movement_data.append(frame_diff)
+            current_movement = np.sum(cv2.absdiff(gray_frame, prev_gray_frame)) / (gray_frame.size * 255.0)
+            movement_data.append(current_movement)
         else:
             movement_data.append(0.0) # Primo frame non ha movimento rispetto a un precedente
         
+        # 4. Variazione del Movimento: Differenza assoluta tra il movimento corrente e il precedente
+        variation_movement = abs(current_movement - prev_movement)
+        variation_movement_data.append(variation_movement)
+        
         prev_gray_frame = gray_frame
+        prev_movement = current_movement # Aggiorna il movimento precedente per il prossimo calcolo
 
         progress_bar.progress((i + 1) / total_frames)
-        status_text.text(f"📊 Analisi Frame {i + 1}/{total_frames} | Lum: {brightness:.2f} | Det: {detail:.2f} | Mov: {movement_data[-1]:.2f}")
+        status_text.text(f"📊 Analisi Frame {i + 1}/{total_frames} | Lum: {brightness:.2f} | Det: {detail:.2f} | Mov: {movement_data[-1]:.2f} | VarMov: {variation_movement_data[-1]:.2f}")
 
     cap.release()
     st.success("✅ Analisi video completata!")
     
-    # Assicurati che movement_data abbia la stessa lunghezza degli altri array
-    if len(movement_data) < len(brightness_data):
-        while len(movement_data) < len(brightness_data):
-            # Se ci sono meno dati di movimento, replichiamo l'ultimo valore valido
-            # o aggiungiamo 0 se non ci sono dati di movimento
+    # Assicurati che movement_data e variation_movement_data abbiano la stessa lunghezza degli altri array
+    max_len = len(brightness_data)
+    if len(movement_data) < max_len:
+        while len(movement_data) < max_len:
             movement_data.append(movement_data[-1] if len(movement_data) > 0 else 0.0)
+    if len(variation_movement_data) < max_len:
+        while len(variation_movement_data) < max_len:
+            variation_movement_data.append(variation_movement_data[-1] if len(variation_movement_data) > 0 else 0.0)
 
-    return np.array(brightness_data), np.array(detail_data), np.array(movement_data), width, height, fps, video_duration
+
+    return np.array(brightness_data), np.array(detail_data), np.array(movement_data), np.array(variation_movement_data), width, height, fps, video_duration
 
 class AudioGenerator:
     def __init__(self, sample_rate: int, fps: int):
@@ -130,7 +141,7 @@ class AudioGenerator:
         return waveform.astype(np.float32)
 
     def generate_fm_layer(self, duration_samples: int,
-                             brightness_data: np.ndarray, detail_data: np.ndarray, movement_data: np.ndarray, 
+                             brightness_data: np.ndarray, movement_data: np.ndarray, 
                              min_carrier_freq: float, max_carrier_freq: float,
                              min_modulator_freq: float, max_modulator_freq: float,
                              min_mod_index: float, max_mod_index: float) -> np.ndarray:
@@ -155,7 +166,6 @@ class AudioGenerator:
                 continue
 
             current_brightness = brightness_data[i]
-            # current_detail = detail_data[i] # Non usato direttamente qui per FM
             current_movement = movement_data[i] 
 
             # Mappatura dei parametri FM ai dati visivi
@@ -179,6 +189,95 @@ class AudioGenerator:
             status_text.text(f"🎵 Strato FM Frame {i + 1}/{num_frames} | Fc: {int(carrier_freq)} Hz | Fm: {int(modulator_freq)} Hz | I: {mod_index:.2f}")
         
         return fm_audio_layer
+
+    def add_noise_layer(self, base_audio: np.ndarray, detail_data: np.ndarray, 
+                        min_noise_amp: float, max_noise_amp: float) -> np.ndarray:
+        """
+        Aggiunge un layer di rumore bianco all'audio di base, modulato dal dettaglio/contrasto.
+        """
+        st.info("🔊 Aggiunta Strato Rumore (Noise)...")
+        noise_layer = np.zeros_like(base_audio, dtype=np.float32)
+        num_frames = len(detail_data)
+        
+        progress_bar = st.progress(0, text="🔊 Aggiunta Strato Rumore (Noise)...")
+        status_text = st.empty()
+
+        for i in range(num_frames):
+            frame_start_sample = i * self.samples_per_frame
+            frame_end_sample = min((i + 1) * self.samples_per_frame, len(base_audio))
+            
+            if frame_start_sample >= frame_end_sample:
+                continue
+
+            current_detail = detail_data[i]
+            
+            # Mappatura: Ampiezza Rumore -> Dettaglio/Contrasto
+            noise_amplitude = min_noise_amp + current_detail * (max_noise_amp - min_noise_amp)
+            
+            segment_length = frame_end_sample - frame_start_sample
+            noise_segment = np.random.randn(segment_length).astype(np.float32) * noise_amplitude
+            
+            noise_layer[frame_start_sample:frame_end_sample] = noise_segment
+            
+            progress_bar.progress((i + 1) / num_frames)
+            status_text.text(f"🔊 Rumore Frame {i + 1}/{num_frames} | Amp: {noise_amplitude:.3f}")
+
+        # Mescola il rumore con l'audio base
+        combined_audio = base_audio + noise_layer
+        return combined_audio
+
+    def apply_glitch_effect(self, base_audio: np.ndarray, variation_movement_data: np.ndarray,
+                            glitch_threshold: float, glitch_duration_frames: int, glitch_intensity: float) -> np.ndarray:
+        """
+        Applica effetti glitch (ripetizioni/salti) all'audio basati sulla variazione del movimento.
+        """
+        st.info("🔊 Applicazione Effetti Glitch...")
+        glitched_audio = base_audio.copy()
+        num_frames = len(variation_movement_data)
+        
+        progress_bar = st.progress(0, text="🔊 Applicazione Effetti Glitch...")
+        status_text = st.empty()
+
+        for i in range(num_frames):
+            current_var_movement = variation_movement_data[i]
+            
+            if current_var_movement > glitch_threshold:
+                # Determina l'intensità del glitch in base alla variazione del movimento
+                # Maggiore la variazione, maggiore la probabilità/intensità del glitch
+                glitch_factor = (current_var_movement - glitch_threshold) / (np.max(variation_movement_data) - glitch_threshold + 1e-6)
+                glitch_factor = np.clip(glitch_factor, 0, 1) * glitch_intensity
+                
+                if np.random.rand() < glitch_factor: # Probabilità di innescare il glitch
+                    start_frame = i
+                    end_frame = min(i + glitch_duration_frames, num_frames -1)
+                    
+                    if start_frame >= end_frame: continue
+
+                    # Calcola il segmento audio da glitchare
+                    glitch_start_sample = start_frame * self.samples_per_frame
+                    glitch_end_sample = min(end_frame * self.samples_per_frame, len(glitched_audio))
+                    
+                    if glitch_start_sample >= glitch_end_sample: continue
+
+                    segment_to_glitch = glitched_audio[glitch_start_sample:glitch_end_sample]
+                    
+                    # Esempio di glitch: ripetizione di un piccolo segmento
+                    if segment_to_glitch.size > 0:
+                        repeat_len = min(int(self.samples_per_frame * 0.1), segment_to_glitch.size) # Ripete il 10% del frame
+                        if repeat_len > 0:
+                            repeated_segment = np.tile(segment_to_glitch[:repeat_len], int(glitch_duration_frames * 0.5)) # Ripete per una frazione della durata
+                            
+                            # Sostituisci il segmento glitchato con la ripetizione (o un pezzo di essa)
+                            replace_len = min(len(repeated_segment), glitch_end_sample - glitch_start_sample)
+                            glitched_audio[glitch_start_sample : glitch_start_sample + replace_len] = repeated_segment[:replace_len]
+                            
+                            # Avanza l'indice per evitare glitch sovrapposti immediatamente
+                            i += glitch_duration_frames 
+            
+            progress_bar.progress((i + 1) / num_frames)
+            status_text.text(f"🔊 Glitch Frame {i + 1}/{num_frames} | VarMov: {current_var_movement:.2f}")
+        
+        return glitched_audio
 
     def process_audio_segments(self, base_audio: np.ndarray, brightness_data: np.ndarray, detail_data: np.ndarray, 
                              min_cutoff: float, max_cutoff: float, min_res: float, max_res: float,
@@ -282,7 +381,7 @@ def main():
     st.set_page_config(page_title="🎵 VideoSound Gen - Sperimentale", layout="centered")
     st.title("🎬 VideoSound Gen - Sperimentale")
     st.markdown("###### by Loop507") 
-    st.markdown("### Genera musica sperimentale da un video") # Titolo aggiornato
+    st.markdown("### Genera musica sperimentale da un video") 
     st.markdown("Carica un video e osserva come le sue proprietà visive creano un paesaggio sonoro dinamico.")
 
     uploaded_file = st.file_uploader("🎞️ Carica un file video (.mp4, .mov, ecc.)", type=["mp4", "mov", "avi", "mkv"])
@@ -299,8 +398,8 @@ def main():
             f.write(uploaded_file.read())
         st.success("🎥 Video caricato correttamente!")
 
-        with st.spinner("📊 Analisi frame video (luminosità, dettaglio, movimento) in corso..."):
-            brightness_data, detail_data, movement_data, width, height, fps, video_duration = analyze_video_frames(video_input_path)
+        with st.spinner("📊 Analisi frame video (luminosità, dettaglio, movimento, variazione movimento) in corso..."):
+            brightness_data, detail_data, movement_data, variation_movement_data, width, height, fps, video_duration = analyze_video_frames(video_input_path)
         
         if brightness_data is None: 
             return
@@ -316,7 +415,9 @@ def main():
         min_carrier_freq_user, max_carrier_freq_user = 0, 0
         min_modulator_freq_user, max_modulator_freq_user = 0, 0
         min_mod_index_user, max_mod_index_user = 0, 0
-        
+        min_noise_amp_user, max_noise_amp_user = 0, 0
+        glitch_threshold_user, glitch_duration_frames_user, glitch_intensity_user = 0, 0, 0
+
         # --- Sezione Sintesi Sottrattiva (sempre attiva come base) ---
         st.sidebar.header("Generazione Suono Base")
         with st.sidebar.expander("Sintesi Sottrattiva (Filtro Passa-Basso)", expanded=True): 
@@ -345,6 +446,29 @@ def main():
                 min_mod_index_user = st.slider("Min Indice di Modulazione", 0.1, 10.0, 0.5, 0.1, key="fm_min_index")
                 max_mod_index_user = st.slider("Max Indice di Modulazione", 1.0, 50.0, 5.0, 0.1, key="fm_max_index")
         
+        # --- Sezione Noise (attivabile con checkbox) ---
+        st.sidebar.markdown("---")
+        enable_noise_effect = st.sidebar.checkbox("🔇 Abilita Rumore (Noise)", value=False)
+
+        if enable_noise_effect:
+            with st.sidebar.expander("Parametri Rumore (Noise)", expanded=True):
+                st.markdown("**Controllo:**")
+                st.markdown("- **Intensità (Volume):** controllata dal **Dettaglio/Contrasto** del video.")
+                min_noise_amp_user = st.slider("Min Ampiezza Rumore", 0.0, 0.5, 0.01, 0.01, key="noise_min_amp")
+                max_noise_amp_user = st.slider("Max Ampiezza Rumore", 0.1, 1.0, 0.2, 0.01, key="noise_max_amp")
+
+        # --- Sezione Glitch (attivabile con checkbox) ---
+        st.sidebar.markdown("---")
+        enable_glitch_effect = st.sidebar.checkbox("👾 Abilita Glitch Audio", value=False)
+
+        if enable_glitch_effect:
+            with st.sidebar.expander("Parametri Glitch Audio", expanded=True):
+                st.markdown("**Controllo:**")
+                st.markdown("- **Frequenza/Intensità:** innescata dai **Picchi di Movimento** del video.")
+                glitch_threshold_user = st.slider("Soglia Variazione Movimento per Glitch", 0.0, 0.5, 0.05, 0.01, key="glitch_threshold")
+                glitch_duration_frames_user = st.slider("Durata Glitch (frames)", 1, 10, 2, key="glitch_duration_frames")
+                glitch_intensity_user = st.slider("Intensità Glitch", 0.1, 2.0, 1.0, 0.1, key="glitch_intensity")
+
         # --- Sezione Pitch/Time Stretching (sempre attiva) ---
         st.sidebar.markdown("---")
         with st.sidebar.expander("Pitch Shifting / Time Stretching", expanded=True): 
@@ -393,7 +517,6 @@ def main():
                 fm_layer = audio_gen.generate_fm_layer(
                     total_samples,
                     brightness_data, 
-                    detail_data,
                     movement_data, 
                     min_carrier_freq_user, max_carrier_freq_user,
                     min_modulator_freq_user, max_modulator_freq_user,
@@ -402,6 +525,27 @@ def main():
                 # Mescola lo strato FM con l'audio sottrattivo
                 primary_audio_waveform = (primary_audio_waveform * 0.7 + fm_layer * 0.3) 
                 st.success("✅ Strato FM combinato con l'audio base!")
+
+            # --- Aggiungi il layer di Rumore se abilitato ---
+            if enable_noise_effect:
+                primary_audio_waveform = audio_gen.add_noise_layer(
+                    primary_audio_waveform, 
+                    detail_data,
+                    min_noise_amp_user, 
+                    max_noise_amp_user
+                )
+                st.success("✅ Strato Rumore aggiunto!")
+
+            # --- Applica effetti Glitch se abilitati ---
+            if enable_glitch_effect:
+                primary_audio_waveform = audio_gen.apply_glitch_effect(
+                    primary_audio_waveform, 
+                    variation_movement_data,
+                    glitch_threshold_user, 
+                    glitch_duration_frames_user,
+                    glitch_intensity_user
+                )
+                st.success("✅ Effetti Glitch applicati!")
 
             # --- Processamento degli effetti dinamici (filtro, pitch, time stretch) ---
             with st.spinner("🎧 Applicazione effetti dinamici all'audio generato..."):
