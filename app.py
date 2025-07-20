@@ -37,21 +37,21 @@ def validate_video_file(uploaded_file) -> bool:
         return False
     return True
 
-def analyze_video_frames(video_path: str) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[int], Optional[int], Optional[float], Optional[float]]:
+def analyze_video_frames(video_path: str) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray], Optional[int], Optional[int], Optional[float], Optional[float]]:
     """
-    Carica il video, estrae i frame e analizza luminosità e dettaglio/contrasto.
-    Restituisce array di luminosità e dettaglio per frame, e info sul video.
+    Carica il video, estrae i frame e analizza luminosità, dettaglio/contrasto e movimento.
+    Restituisce array di luminosità, dettaglio e movimento per frame, e info sul video.
     """
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         st.error("❌ Impossibile aprire il file video.")
-        return None, None, None, None, None, None
+        return None, None, None, None, None, None, None
 
     fps = cap.get(cv2.CAP_PROP_FPS)
     if fps == 0:
         st.error("❌ Impossibile leggere il framerate del video.")
         cap.release()
-        return None, None, None, None, None, None
+        return None, None, None, None, None, None, None
 
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -61,7 +61,7 @@ def analyze_video_frames(video_path: str) -> Tuple[Optional[np.ndarray], Optiona
     if video_duration < MIN_DURATION:
         st.error(f"❌ Il video deve essere lungo almeno {MIN_DURATION} secondi. Durata attuale: {video_duration:.2f}s")
         cap.release()
-        return None, None, None, None, None, None
+        return None, None, None, None, None, None, None
     
     if video_duration > MAX_DURATION:
         st.warning(f"⚠️ Video troppo lungo ({video_duration:.1f}s). Verranno analizzati solo i primi {MAX_DURATION} secondi.")
@@ -69,7 +69,10 @@ def analyze_video_frames(video_path: str) -> Tuple[Optional[np.ndarray], Optiona
         video_duration = MAX_DURATION
 
     brightness_data = []
-    detail_data = [] # Useremo la varianza dei pixel per una stima del dettaglio/contrasto
+    detail_data = [] 
+    movement_data = [] # Nuovo: per il movimento
+    
+    prev_gray_frame = None # Per il calcolo del movimento
 
     progress_bar = st.progress(0)
     status_text = st.empty()
@@ -79,26 +82,51 @@ def analyze_video_frames(video_path: str) -> Tuple[Optional[np.ndarray], Optiona
         if not ret:
             break
 
-        # Converti il frame in scala di grigi per l'analisi
         gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
         # 1. Luminosità Media: Media dei pixel
         brightness = np.mean(gray_frame) / 255.0 # Normalizza tra 0 e 1
         brightness_data.append(brightness)
 
-        # 2. Dettaglio/Contrasto: Varianza dei pixel (o deviazione standard)
+        # 2. Dettaglio/Contrasto: Varianza dei pixel
         detail = np.std(gray_frame) / 255.0 # Normalizza tra 0 e 1
         detail_data.append(detail)
 
+        # 3. Movimento: Differenza assoluta media tra frame consecutivi
+        if prev_gray_frame is not None:
+            # Calcola la differenza assoluta e normalizza per la dimensione del frame e il max pixel value (255)
+            frame_diff = np.sum(cv2.absdiff(gray_frame, prev_gray_frame)) / (gray_frame.size * 255.0)
+            movement_data.append(frame_diff)
+        else:
+            movement_data.append(0.0) # Primo frame non ha movimento rispetto a un precedente
+        
+        prev_gray_frame = gray_frame
+
         progress_bar.progress((i + 1) / total_frames)
-        status_text.text(f"📊 Analisi Frame {i + 1}/{total_frames} | Luminosità: {brightness:.2f} | Dettaglio: {detail:.2f}")
+        status_text.text(f"📊 Analisi Frame {i + 1}/{total_frames} | Lum: {brightness:.2f} | Det: {detail:.2f} | Mov: {movement_data[-1]:.2f}")
 
     cap.release()
     st.success("✅ Analisi video completata!")
     
-    return np.array(brightness_data), np.array(detail_data), width, height, fps, video_duration
+    # Assicurati che movement_data abbia la stessa lunghezza degli altri array
+    # Se il video ha solo 1 frame, movement_data sarà [0.0], quindi andrà bene
+    if len(movement_data) < len(brightness_data):
+        # Questo può accadere se il loop si interrompe prima o se c'è solo un frame
+        # Per semplicità, replichiamo l'ultimo valore o aggiungiamo zeri
+        # Per video di un solo frame, movement_data sarà [0.0] e gli altri [valore_frame1], quindi deve avere la stessa lunghezza
+        if len(brightness_data) == 1 and len(movement_data) == 1:
+            pass # Già allineato
+        elif len(brightness_data) > 0:
+            # Replicare l'ultimo valore per i frame mancanti (dovrebbe essere solo l'ultimo se si rompe il loop)
+            # In un caso normale, length(movement_data) = length(brightness_data) - 1, quindi aggiungiamo 1
+            if len(movement_data) == len(brightness_data) - 1:
+                movement_data.append(movement_data[-1]) # Aggiungi l'ultimo valore
+            else: # Caso più complesso, riempi con zeri o media
+                while len(movement_data) < len(brightness_data):
+                    movement_data.append(0.0) # Riempi con zeri
 
-# Modifiche alla classe AudioGenerator
+    return np.array(brightness_data), np.array(detail_data), np.array(movement_data), width, height, fps, video_duration
+
 class AudioGenerator:
     def __init__(self, sample_rate: int, fps: int):
         self.sample_rate = sample_rate
@@ -113,14 +141,12 @@ class AudioGenerator:
         return waveform.astype(np.float32)
 
     def generate_fm_layer(self, duration_samples: int,
-                             brightness_data: np.ndarray, detail_data: np.ndarray,
+                             brightness_data: np.ndarray, detail_data: np.ndarray, movement_data: np.ndarray, # Aggiunto movement_data
                              min_carrier_freq: float, max_carrier_freq: float,
                              min_modulator_freq: float, max_modulator_freq: float,
                              min_mod_index: float, max_mod_index: float) -> np.ndarray:
         """
-        Genera un'onda FM modulata dai dati visivi come strato aggiuntivo.
-        luminosità -> carrier freq
-        dettaglio -> modulator freq e/o modulation index
+        Genera un'onda FM modulata dai dati visivi (luminosità per carrier, movimento per modulator e index) come strato aggiuntivo.
         """
         st.info("🎵 Generazione Strato FM...")
         fm_audio_layer = np.zeros(duration_samples, dtype=np.float32)
@@ -140,12 +166,18 @@ class AudioGenerator:
                 continue
 
             current_brightness = brightness_data[i]
-            current_detail = detail_data[i]
+            current_detail = detail_data[i] # Mantenuto per completezza, ma non usato direttamente in FM qui
+            current_movement = movement_data[i] # NUOVO
 
             # Mappatura dei parametri FM ai dati visivi
+            # Carrier Frequency -> Luminosità (come prima)
             carrier_freq = min_carrier_freq + current_brightness * (max_carrier_freq - min_carrier_freq)
-            modulator_freq = min_modulator_freq + current_detail * (max_modulator_freq - min_modulator_freq)
-            mod_index = min_mod_index + current_detail * (max_mod_index - min_mod_index) 
+            
+            # Modulator Frequency -> Movimento (NUOVO)
+            modulator_freq = min_modulator_freq + current_movement * (max_modulator_freq - min_modulator_freq)
+            
+            # Modulation Index -> Movimento (NUOVO)
+            mod_index = min_mod_index + current_movement * (max_mod_index - min_mod_index) 
 
             t_segment = t_overall[frame_start_sample:frame_end_sample]
             
@@ -190,6 +222,7 @@ class AudioGenerator:
                 current_brightness = brightness_data[i]
                 current_detail = detail_data[i]
                 
+                # Mappatura: Frequenza di Taglio -> Luminosità, Risonanza -> Dettaglio
                 cutoff_freq = min_cutoff + current_brightness * (max_cutoff - min_cutoff)
                 resonance_q = min_res + current_detail * (max_res - min_res) 
 
@@ -223,6 +256,7 @@ class AudioGenerator:
             current_brightness = brightness_data[i]
             current_detail = detail_data[i]
 
+            # Mappatura: Pitch Shift -> Dettaglio, Time Stretch -> Luminosità
             pitch_shift_semitones = min_pitch_shift_semitones + current_detail * (max_pitch_shift_semitones - min_pitch_shift_semitones)
             time_stretch_rate = min_time_stretch_rate + current_brightness * (max_time_stretch_rate - min_time_stretch_rate)
             time_stretch_rate = np.clip(time_stretch_rate, 0.1, 5.0) 
@@ -276,8 +310,8 @@ def main():
             f.write(uploaded_file.read())
         st.success("🎥 Video caricato correttamente!")
 
-        with st.spinner("📊 Analisi frame video (luminosità, dettaglio) in corso..."):
-            brightness_data, detail_data, width, height, fps, video_duration = analyze_video_frames(video_input_path)
+        with st.spinner("📊 Analisi frame video (luminosità, dettaglio, movimento) in corso..."):
+            brightness_data, detail_data, movement_data, width, height, fps, video_duration = analyze_video_frames(video_input_path)
         
         if brightness_data is None: 
             return
@@ -296,8 +330,10 @@ def main():
         
         # --- Sezione Sintesi Sottrattiva (sempre attiva come base) ---
         st.sidebar.header("Generazione Suono Base")
-        with st.sidebar.expander("Sintesi Sottrattiva (Filtro Passa-Basso)"):
-            st.markdown("*(La luminosità controlla la frequenza di taglio, il dettaglio la risonanza)*")
+        with st.sidebar.expander("Sintesi Sottrattiva (Filtro Passa-Basso)", expanded=True): # Espandi di default
+            st.markdown("**Controlli:**")
+            st.markdown("- **Frequenza di Taglio:** controllata dalla **Luminosità** del video.")
+            st.markdown("- **Risonanza:** controllata dal **Dettaglio/Contrasto** del video.")
             min_cutoff_user = st.slider("Min Frequenza Taglio (Hz)", 20, 5000, 100, key="sub_min_cutoff")
             max_cutoff_user = st.slider("Max Frequenza Taglio (Hz)", 1000, 20000, 8000, key="sub_max_cutoff")
             min_resonance_user = st.slider("Min Risonanza (Q)", 0.1, 5.0, 0.5, key="sub_min_res") 
@@ -308,8 +344,11 @@ def main():
         enable_fm_synthesis = st.sidebar.checkbox("🔊 Abilita Sintesi FM (Strato aggiuntivo)", value=False)
         
         if enable_fm_synthesis:
-            with st.sidebar.expander("Sintesi FM Parametri"):
-                st.markdown("*(Luminosità controlla Freq Carrier, Dettaglio controlla Freq Modulator e Indice)*")
+            with st.sidebar.expander("Sintesi FM Parametri", expanded=True): # Espandi di default se abilitato
+                st.markdown("**Controlli:**")
+                st.markdown("- **Frequenza Carrier:** controllata dalla **Luminosità** del video.")
+                st.markdown("- **Frequenza Modulator:** controllata dal **Movimento** del video.")
+                st.markdown("- **Indice di Modulazione:** controllato dal **Movimento** del video.")
                 min_carrier_freq_user = st.slider("Min Frequenza Carrier (Hz)", 20, 1000, 100, key="fm_min_carrier")
                 max_carrier_freq_user = st.slider("Max Frequenza Carrier (Hz)", 500, 5000, 1000, key="fm_max_carrier")
                 min_modulator_freq_user = st.slider("Min Frequenza Modulator (Hz)", 1, 500, 5, key="fm_min_modulator")
@@ -319,8 +358,10 @@ def main():
         
         # --- Sezione Pitch/Time Stretching (sempre attiva) ---
         st.sidebar.markdown("---")
-        with st.sidebar.expander("Pitch Shifting / Time Stretching"):
-            st.markdown("*(Applicato all'audio combinato. Luminosità controlla il Time Stretching, Dettaglio il Pitch Shifting)*")
+        with st.sidebar.expander("Pitch Shifting / Time Stretching", expanded=True): # Espandi di default
+            st.markdown("**Controlli:**")
+            st.markdown("- **Time Stretch Rate:** controllato dalla **Luminosità** del video.")
+            st.markdown("- **Pitch Shift:** controllato dal **Dettaglio/Contrasto** del video.")
             min_pitch_shift_semitones = st.slider("Min Pitch Shift (semitoni)", -24.0, 24.0, -12.0, 0.5, key="pitch_min")
             max_pitch_shift_semitones = st.slider("Max Pitch Shift (semitoni)", -24.0, 24.0, 12.0, 0.5, key="pitch_max")
             min_time_stretch_rate = st.slider("Min Time Stretch Rate", 0.1, 2.0, 0.8, 0.1, key="stretch_min") 
@@ -364,6 +405,7 @@ def main():
                     total_samples,
                     brightness_data, 
                     detail_data,
+                    movement_data, # Passa i dati di movimento
                     min_carrier_freq_user, max_carrier_freq_user,
                     min_modulator_freq_user, max_modulator_freq_user,
                     min_mod_index_user, max_mod_index_user
@@ -376,7 +418,7 @@ def main():
             # --- Processamento degli effetti dinamici (filtro, pitch, time stretch) ---
             with st.spinner("🎧 Applicazione effetti dinamici all'audio generato..."):
                 generated_audio = audio_gen.process_audio_segments(
-                    primary_audio_waveform, # Ora questo è l'audio base potenziato dall'FM
+                    primary_audio_waveform, 
                     brightness_data, 
                     detail_data,
                     min_cutoff=min_cutoff_user, 
