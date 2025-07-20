@@ -235,7 +235,7 @@ class AudioGenerator:
 
             pitch_shift_semitones = min_pitch_shift_semitones + current_detail * (max_pitch_shift_semitones - min_pitch_shift_semitones)
             time_stretch_rate = min_time_stretch_rate + current_brightness * (max_time_stretch_rate - min_time_stretch_rate)
-            time_stretch_rate = np.clip(time_stretch_rate, 0.1, 5.0) # Estendi leggermente il clip range
+            time_stretch_rate = np.clip(time_stretch_rate, 0.1, 5.0) 
 
             # Applica Pitch Shifting
             pitched_segment = librosa.effects.pitch_shift(
@@ -299,11 +299,19 @@ def main():
         st.markdown("---")
         st.subheader("🎶 Configurazione Sintesi Audio Sperimentale")
 
-        # --- Scelta del Tipo di Sintesi ---
-        synthesis_type = st.radio(
+        # --- Menu a tendina per la scelta del Tipo di Sintesi ---
+        synthesis_type = st.selectbox(
             "Seleziona il tipo di sintesi:",
             ("Sintesi Sottrattiva", "Sintesi FM")
         )
+
+        # Inizializza tutti i parametri a zero/default per evitare errori
+        min_cutoff_user, max_cutoff_user = 0, 0
+        min_resonance_user, max_resonance_user = 0, 0
+        min_carrier_freq_user, max_carrier_freq_user = 0, 0
+        min_modulator_freq_user, max_modulator_freq_user = 0, 0
+        min_mod_index_user, max_mod_index_user = 0, 0
+        apply_filter = False # Default a False, abilitato solo per sottrattiva
 
         # Parametri Condizionali per la Sintesi Sottrattiva
         if synthesis_type == "Sintesi Sottrattiva":
@@ -313,11 +321,7 @@ def main():
             min_resonance_user = st.sidebar.slider("Min Risonanza (Q)", 0.1, 5.0, 0.5) 
             max_resonance_user = st.sidebar.slider("Max Risonanza (Q)", 1.0, 30.0, 10.0) 
             apply_filter = True # Il filtro è intrinseco alla sintesi sottrattiva
-            # Imposta valori di default per FM se non usata
-            min_carrier_freq_user, max_carrier_freq_user = 0, 0
-            min_modulator_freq_user, max_modulator_freq_user = 0, 0
-            min_mod_index_user, max_mod_index_user = 0, 0
-        else: # Sintesi FM
+        elif synthesis_type == "Sintesi FM": # Sintesi FM
             st.sidebar.header("Parametri Sintesi FM")
             st.sidebar.markdown("*(Luminosità controlla Freq Carrier, Dettaglio controlla Freq Modulator e Indice)*")
             min_carrier_freq_user = st.sidebar.slider("Min Frequenza Carrier (Hz)", 20, 1000, 100)
@@ -326,12 +330,9 @@ def main():
             max_modulator_freq_user = st.sidebar.slider("Max Frequenza Modulator (Hz)", 10, 2000, 100)
             min_mod_index_user = st.sidebar.slider("Min Indice di Modulazione", 0.1, 10.0, 0.5, 0.1)
             max_mod_index_user = st.sidebar.slider("Max Indice di Modulazione", 1.0, 50.0, 5.0, 0.1)
-            apply_filter = False # Il filtro passa-basso non è tipico per FM se non come post-process
+            # apply_filter rimane False, poiché non si applica un filtro passa-basso a questo tipo di sintesi
 
-            # Imposta valori di default per filtro sottrattivo se non usato
-            min_cutoff_user, max_cutoff_user = 0, 0
-            min_resonance_user, max_resonance_user = 0, 0
-
+        # Parametri Pitch/Time Stretching (sempre visibili)
         st.sidebar.header("Parametri Pitch/Time Stretching")
         st.sidebar.markdown("*(Luminosità controlla il Time Stretching, Dettaglio il Pitch Shifting)*")
         min_pitch_shift_semitones = st.sidebar.slider("Min Pitch Shift (semitoni)", -24.0, 24.0, -12.0, 0.5)
@@ -401,7 +402,7 @@ def main():
                     max_pitch_shift_semitones=max_pitch_shift_semitones,
                     min_time_stretch_rate=min_time_stretch_rate,
                     max_time_stretch_rate=max_time_stretch_rate,
-                    apply_filter=apply_filter # Passa il flag per applicare il filtro solo se Sottrattiva
+                    apply_filter=apply_filter 
                 )
             
             if generated_audio is None or generated_audio.size == 0:
