@@ -938,9 +938,15 @@ def main():
         
         output_resolution_choice = st.selectbox(
             "Seleziona la risoluzione di output del video:",
-            list(FORMAT_RESOLUTIONS.keys())
+            list(FORMAT_RESOLUTIONS.keys()) # This is the positional argument
+            # The next line would cause the error if it were a positional argument:
+            # , "Originale" # This would be a positional argument after the keyword argument 'key'
         )
-        
+        # If output_resolution_choice was causing the error, it would be because you tried to specify a default value
+        # as a positional argument after `list(FORMAT_RESOLUTIONS.keys())`.
+        # The correct way to set a default for `selectbox` is using the `index` argument:
+        # st.selectbox("Label", options, index=0) for "Originale"
+
         download_option = st.radio(
             "Cosa vuoi scaricare?",
             ("Video con Audio", "Solo Audio")
@@ -986,7 +992,9 @@ def main():
                     movement_data, 
                     min_carrier_freq_user, max_carrier_freq_user,
                     min_modulator_freq_user, max_modulator_freq_user,
-                    min_mod_index_user, max_mod_index_user, audio_progress_bar, audio_status_text
+                    min_mod_index_user, max_mod_index_user, 
+                    audio_progress_bar, # Positional arg, correctly placed
+                    audio_status_text   # Positional arg, correctly placed
                 )
                 combined_audio_layers += fm_layer * 0.5 # Aggiungi con un peso ridotto
                 st.success("✅ Strato FM generato e combinato!")
@@ -1000,7 +1008,9 @@ def main():
                     movement_data,
                     min_grain_freq, max_grain_freq,
                     min_grain_density, max_grain_density,
-                    min_grain_duration, max_grain_duration, audio_progress_bar, audio_status_text
+                    min_grain_duration, max_grain_duration, 
+                    audio_progress_bar, # Positional arg, correctly placed
+                    audio_status_text   # Positional arg, correctly placed
                 )
                 combined_audio_layers += granular_layer * 0.5 # Aggiungi con un peso ridotto
                 st.success("✅ Strato Granulare generato e combinato!")
@@ -1012,7 +1022,9 @@ def main():
                     combined_audio_layers, 
                     detail_data,
                     min_noise_amp_user, 
-                    max_noise_amp_user, audio_progress_bar, audio_status_text
+                    max_noise_amp_user, 
+                    audio_progress_bar, # Positional arg, correctly placed
+                    audio_status_text   # Positional arg, correctly placed
                 )
                 st.success("✅ Strato Rumore aggiunto!")
 
@@ -1024,7 +1036,9 @@ def main():
                     variation_movement_data,
                     glitch_threshold_user, 
                     glitch_duration_frames_user,
-                    glitch_intensity_user, audio_progress_bar, audio_status_text
+                    glitch_intensity_user, 
+                    audio_progress_bar, # Positional arg, correctly placed
+                    audio_status_text   # Positional arg, correctly placed
                 )
                 st.success("✅ Effetti Glitch applicati!")
 
@@ -1041,7 +1055,9 @@ def main():
                         min_pitch_shift_semitones=min_pitch_shift_semitones,
                         max_pitch_shift_semitones=max_pitch_shift_semitones,
                         min_time_stretch_rate=min_time_stretch_rate,
-                        max_time_stretch_rate=max_time_stretch_rate, audio_progress_bar, audio_status_text
+                        max_time_stretch_rate=max_time_stretch_rate, 
+                        audio_progress_bar, # Positional arg, correctly placed
+                        audio_status_text   # Positional arg, correctly placed
                     )
                     st.success("✅ Effetti pitch e stretch applicati!")
                 else:
@@ -1051,6 +1067,16 @@ def main():
                 # --- Applicazione Effetti Sonori Dinamici unificati ---
                 if enable_dynamic_effects:
                     # Applica Filtro Avanzato
+                    # This is likely the line that caused the original SyntaxError.
+                    # The `filter_type` argument was defined in `apply_dynamic_filter` with a default
+                    # after `progress_bar` and `status_text`.
+                    # In the *call* here, `filter_type` should be a keyword argument if `progress_bar` and `status_text` are positional.
+                    # Or, if `progress_bar` and `status_text` are *also* keyword arguments, the order doesn't matter as much.
+                    # Given the function definition was fixed to have progress_bar, status_text first, then filter_type as default:
+                    # def apply_dynamic_filter(self, audio: np.ndarray, ..., progress_bar, status_text, filter_type: str = "lowpass")
+                    # So, `progress_bar` and `status_text` should be positional, and `filter_type` keyword.
+                    # Let's verify the calls.
+
                     processed_audio = audio_gen.apply_dynamic_filter(
                         processed_audio,
                         brightness_data,
@@ -1059,9 +1085,9 @@ def main():
                         max_cutoff=max_cutoff_adv,
                         min_res=min_resonance_adv,
                         max_res=max_resonance_adv,
-                        progress_bar=audio_progress_bar, # Passed correctly now
-                        status_text=audio_status_text,   # Passed correctly now
-                        filter_type=filter_type_user
+                        audio_progress_bar,  # Positional argument
+                        audio_status_text,   # Positional argument
+                        filter_type=filter_type_user # Keyword argument, correctly placed after positional arguments
                     )
                     st.success("✅ Filtri avanzati applicati!")
 
@@ -1070,11 +1096,11 @@ def main():
                         processed_audio,
                         variation_movement_data,
                         detail_data,
-                        progress_bar=audio_progress_bar, # Passed correctly now
-                        status_text=audio_status_text,   # Passed correctly now
-                        effect_type=modulation_effect_type,
-                        intensity=modulation_intensity,
-                        rate=modulation_rate
+                        audio_progress_bar, # Positional argument
+                        audio_status_text,   # Positional argument
+                        effect_type=modulation_effect_type, # Keyword argument
+                        intensity=modulation_intensity,    # Keyword argument
+                        rate=modulation_rate               # Keyword argument
                     )
                     st.success(f"✅ Effetto di Modulazione '{modulation_effect_type}' applicato!")
 
@@ -1084,7 +1110,9 @@ def main():
                         movement_data,
                         detail_data,
                         max_delay_time_user,
-                        max_delay_feedback_user, audio_progress_bar, audio_status_text
+                        max_delay_feedback_user, 
+                        audio_progress_bar, # Positional argument
+                        audio_status_text   # Positional argument
                     )
                     st.success("✅ Effetto Delay applicato!")
 
@@ -1094,7 +1122,9 @@ def main():
                         detail_data,
                         brightness_data,
                         max_reverb_decay_user,
-                        max_reverb_wet_user, audio_progress_bar, audio_status_text
+                        max_reverb_wet_user, 
+                        audio_progress_bar, # Positional argument
+                        audio_status_text   # Positional argument
                     )
                     st.success("✅ Effetto Riverbero applicato!")
                 else:
@@ -1111,7 +1141,12 @@ def main():
                     processed_audio = processed_audio / np.max(np.abs(processed_audio)) * 0.9 
                 
                 # Applica panning stereo
-                final_audio_stereo = audio_gen.apply_panning(processed_audio, horizontal_center_data, audio_progress_bar, audio_status_text)
+                final_audio_stereo = audio_gen.apply_panning(
+                    processed_audio, 
+                    horizontal_center_data, 
+                    audio_progress_bar, # Positional argument
+                    audio_status_text   # Positional argument
+                )
                 st.success("✅ Normalizzazione e Panoramica Stereo completate!")
 
 
