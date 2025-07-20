@@ -334,7 +334,7 @@ class AudioGenerator:
             
             if current_var_movement > glitch_threshold:
                 # Determina l'intensità del glitch in base alla variazione del movimento
-                # Maggiore la variazione, maggiore la probabilità/intensità del glitch
+                # Maggiore la variazione, maggiore la probabilità/intensiità del glitch
                 glitch_factor = (current_var_movement - glitch_threshold) / (np.max(variation_movement_data) - glitch_threshold + 1e-6)
                 glitch_factor = np.clip(glitch_factor, 0, 1) * glitch_intensity
                 
@@ -531,7 +531,6 @@ class AudioGenerator:
 
         for i in range(num_frames):
             frame_start_sample = i * self.samples_per_frame
-            # FIX: Cambiato self.samples_per_per_frame in self.samples_per_frame
             frame_end_sample = min((i + 1) * self.samples_per_frame, len(filtered_audio)) 
             
             audio_segment = filtered_audio[frame_start_sample:frame_end_sample]
@@ -649,7 +648,6 @@ class AudioGenerator:
         
         for i in range(num_frames):
             frame_start_sample = i * self.samples_per_frame
-            # FIX: Cambiato self.samples_per_per_frame in self.samples_per_frame
             frame_end_sample = min((i + 1) * self.samples_per_frame, len(modulated_audio)) 
             
             if frame_start_sample >= frame_end_sample:
@@ -784,7 +782,8 @@ def main():
 
         min_noise_amp_user, max_noise_amp_user = 0, 0
         glitch_threshold_user, glitch_duration_frames_user, glitch_intensity_user = 0, 0, 0
-        min_pitch_shift_semitones, max_pitch_shift_semitones = 0, 0
+        min_pitch_shift_semitones = 0 # Inizializzato
+        max_pitch_shift_semitones = 0 # Inizializzato
         min_time_stretch_rate, max_time_stretch_rate = 0, 0
         min_grain_freq, max_grain_freq = 0, 0
         min_grain_density, max_grain_density = 0, 0
@@ -794,6 +793,12 @@ def main():
         modulation_effect_type = "none"
         modulation_intensity = 0.5
         modulation_rate = 0.1
+
+        # Inizializzazione delle variabili per i filtri avanzati, anche se il blocco è disabilitato
+        min_cutoff_adv = 20
+        max_cutoff_adv = 20000
+        min_resonance_adv = 0.1
+        max_resonance_adv = 30.0
 
         # --- Sezione Sintesi Sottrattiva (con checkbox di abilitazione) ---
         st.sidebar.header("Generazione Suono Base")
@@ -1068,7 +1073,7 @@ def main():
                         min_cutoff=min_cutoff_adv,
                         max_cutoff=max_cutoff_adv,
                         min_res=min_resonance_adv,
-                        max_res=max_res_adv,
+                        max_res=max_resonance_adv,
                         progress_bar=audio_progress_bar,  
                         status_text=audio_status_text,     
                         filter_type=filter_type_user
