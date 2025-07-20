@@ -7,7 +7,7 @@ import gc
 import shutil
 from typing import Tuple, Optional
 import soundfile as sf # Assicurati di aver installato: pip install soundfile
-from scipy.signal import butter, lfilter # Assicurati di aver installato: pip install scipy
+from scipy.signal import butter, lfilter, iirfilter # Assicurati di aver installato: pip install scipy
 
 # Costanti globali (puoi modificarle)
 MAX_DURATION = 300  # Durata massima del video in secondi
@@ -106,7 +106,8 @@ class AudioGenerator:
         waveform = 2 * (t * base_freq - np.floor(t * base_freq + 0.5))
         return waveform.astype(np.float32)
 
-    def apply_filter_dynamic(self, base_audio: np.ndarray, brightness_data: np.ndarray, detail_data: np.ndarray) -> np.ndarray:
+    def apply_filter_dynamic(self, base_audio: np.ndarray, brightness_data: np.ndarray, detail_data: np.ndarray, 
+                             min_cutoff: float, max_cutoff: float, min_res: float, max_res: float) -> np.ndarray:
         """
         Applica un filtro passa-basso dinamico all'audio di base, modulato dai dati visivi.
         """
@@ -114,19 +115,12 @@ class AudioGenerator:
         
         generated_audio = np.zeros_like(base_audio)
         
-        # Mappa i dati di luminosità e dettaglio ai parametri del filtro
-        min_cutoff_freq = 100 # Hz (valore minimo della frequenza di taglio)
-        max_cutoff_freq = self.sample_rate / 2 * 0.9 # Max ~20kHz (90% della frequenza di Nyquist)
-        min_resonance = 0.1 # Valore minimo per Q (risonanza)
-        max_resonance = 10.0 # Valore massimo per Q (risonanza)
-        
-        # Ordine del filtro (es. 4° ordine)
-        filter_order = 4 
+        filter_order = 4 # Ordine del filtro (Butterworth di 4° ordine)
         
         # Inizializza lo stato del filtro per una transizione più fluida tra i frame
-        zi = np.zeros((filter_order, 2)) # Stato iniziale per il filtro, due canali (stereo, ma qui mono)
-        # Se il filtro fosse stereo, avremmo bisogno di un zi per canale o di applicare il filtro su ciascun canale.
-        # Dato che l'audio generato è mono, zi è per un singolo canale.
+        # Il numero di stati (zi) dipende dall'ordine del filtro
+        # Per un filtro di ordine N, lfilter con output='ba' richiede N stati
+        zi = np.zeros(filter_order) 
 
         num_frames = len(brightness_data)
         
@@ -146,41 +140,47 @@ class AudioGenerator:
             current_brightness = brightness_data[i]
             current_detail = detail_data[i]
             
-            # Calcola la frequenza di taglio e la risonanza per questo frame, mappando da 0-1
-            cutoff_freq = min_cutoff_freq + current_brightness * (max_cutoff_freq - min_cutoff_freq)
-            resonance = min_resonance + current_detail * (max_resonance - min_resonance)
+            # Calcola la frequenza di taglio e la risonanza per questo frame
+            # Normalizza current_brightness e current_detail (già tra 0 e 1)
+            # e mappali ai range definiti dagli slider dell'utente
             
-            # Normalizza la frequenza di taglio per scipy.signal (Nyquist frequency)
-            nyquist = 0.5 * self.sample_rate
-            normal_cutoff = cutoff_freq / nyquist
+            cutoff_freq = min_cutoff + current_brightness * (max_cutoff - min_cutoff)
+            resonance_q = min_res + current_detail * (max_res - min_res) # Q per la risonanza
 
-            # Assicurati che il cutoff non sia troppo vicino a 0 o 1
-            normal_cutoff = np.clip(normal_cutoff, 0.01, 0.99)
+            # Normalizza la frequenza di taglio per scipy.signal (frequenza di Nyquist)
+            nyquist = 0.5 * self.sample_rate
+            
+            # Per i filtri Butterworth, non c'è un parametro 'Q' diretto come nei filtri biquad.
+            # L'argomento `Wn` in `butter` è la frequenza di taglio normalizzata.
+            # Tuttavia, possiamo usare `iirfilter` per un filtro di tipo 'peaking' o 'notch'
+            # se vogliamo un controllo esplicito di Q, ma per un passa-basso,
+            # la risonanza è più una caratteristica del filtro stesso.
+            # Useremo il 'detail' per variare leggermente il cutoff o l'ordine, o magari un Q implicito se usiamo un biquad.
+            
+            # Per una sintesi sottrattiva standard con un passa-basso Butterworth:
+            # la frequenza di taglio è il parametro principale.
+            # Possiamo usare il "dettaglio" per rendere il cutoff più sensibile o per modulare un altro parametro.
+            
+            # Esempio: usiamo la risonanza (Q) per modificare l'andamento del cutoff o aggiungere un leggero boost.
+            # Per ora, manteniamo `normal_cutoff` come parametro principale.
+            normal_cutoff = cutoff_freq / nyquist
+            
+            # Assicurati che il cutoff non sia troppo vicino a 0 o 1 (limiti di stabilità)
+            normal_cutoff = np.clip(normal_cutoff, 0.001, 0.999) # Range leggermente più ampio e sicuro
 
             # Progetta il filtro Butterworth
-            # 'lowpass' è il tipo, `normal_cutoff` è la frequenza di taglio normalizzata, `btype`='lowpass'
-            # `analog=False` per filtri digitali, `output='sos'` per stabilità numerica (raccomandato)
-            b, a = butter(filter_order, normal_cutoff, btype='lowpass', analog=False)
-            # Per una risonanza controllabile in un passa-basso Butterworth, Q non è diretto.
-            # Spesso si usa un filtro a stato variabile o biquad per un controllo più preciso di Q.
-            # Per questo esempio, ci concentriamo sulla modulazione della frequenza di taglio.
-            # Potremmo introdurre un filtro biquad in futuro per un controllo diretto della risonanza (Q).
+            # `btype='lowpass'` è il tipo, `analog=False` per filtri digitali
+            # `output='ba'` restituisce i coefficienti b e a, necessari per `lfilter`
+            b, a = butter(filter_order, normal_cutoff, btype='lowpass', analog=False, output='ba')
             
-            # Applica il filtro al segmento audio
-            # y = lfilter(b, a, x, zi=zi)[0] # Per mantenere lo stato, lfilter restituisce (y, zf)
-            # zi = lfilter(b, a, x, zi=zi)[1] # Aggiorna lo stato del filtro
-            
-            # Per semplicità e per evitare potenziali problemi di click tra frame con lfilter
-            # (che richiede una gestione attenta dello stato `zi` tra chiamate),
-            # applichiamo il filtro al segmento attuale. Questo potrebbe creare artefatti
-            # se le frequenze di taglio cambiano drasticamente, ma è più semplice per iniziare.
-            # Un approccio più robusto userebbe un design del filtro in tempo reale o librerie audio.
-            filtered_segment, zi = lfilter(b, a, audio_segment, zi=zi) # Applica e aggiorna lo stato
+            # Applica il filtro al segmento audio, mantenendo lo stato (zi)
+            # `lfilter` restituisce la serie filtrata e il nuovo stato finale del filtro
+            filtered_segment, zi = lfilter(b, a, audio_segment, zi=zi)
             
             generated_audio[frame_start_sample:frame_end_sample] = filtered_segment
             
             progress_bar.progress((i + 1) / num_frames)
-            status_text.text(f"🎶 Generazione audio Frame {i + 1}/{num_frames} | Cutoff: {int(cutoff_freq)} Hz | Dettaglio (Q): {resonance:.2f}")
+            status_text.text(f"🎶 Generazione audio Frame {i + 1}/{num_frames} | Cutoff: {int(cutoff_freq)} Hz | Q: {resonance_q:.2f}")
 
         # Normalizza l'audio finale per evitare clipping
         if np.max(np.abs(generated_audio)) > 0:
@@ -204,7 +204,10 @@ def main():
             
         # Salva il file video caricato localmente per OpenCV e FFmpeg
         # Genera un nome file unico per evitare conflitti e permettere upload multipli
-        video_input_path = os.path.join("temp", uploaded_file.name)
+        base_name_upload = os.path.splitext(uploaded_file.name)[0]
+        # Creiamo un hash o un timestamp per rendere il nome file unico
+        unique_id = str(np.random.randint(10000, 99999)) # Un ID semplice, per non usare datetime per brevità
+        video_input_path = os.path.join("temp", f"{base_name_upload}_{unique_id}.mp4")
         os.makedirs("temp", exist_ok=True) # Assicurati che la directory 'temp' esista
         with open(video_input_path, "wb") as f:
             f.write(uploaded_file.read())
@@ -227,16 +230,8 @@ def main():
         st.sidebar.header("Parametri Sintesi Sottrattiva")
         min_cutoff_user = st.sidebar.slider("Min Frequenza Taglio (Hz)", 20, 5000, 100)
         max_cutoff_user = st.sidebar.slider("Max Frequenza Taglio (Hz)", 1000, 20000, 8000)
-        min_resonance_user = st.sidebar.slider("Min Risonanza (Q)", 0.01, 1.0, 0.1)
-        max_resonance_user = st.sidebar.slider("Max Risonanza (Q)", 1.0, 20.0, 10.0)
-        
-        # Aggiorna i valori nella classe AudioGenerator
-        # Questo è un esempio, potresti passare questi valori direttamente a apply_filter_dynamic
-        # o aggiornare la classe AudioGenerator con un metodo setter
-        AudioGenerator.min_cutoff_freq = min_cutoff_user
-        AudioGenerator.max_cutoff_freq = max_cutoff_user
-        AudioGenerator.min_resonance = min_resonance_user
-        AudioGenerator.max_resonance = max_resonance_user
+        min_resonance_user = st.sidebar.slider("Min Risonanza (Q)", 0.1, 5.0, 0.5) # Range più ragionevole per Q
+        max_resonance_user = st.sidebar.slider("Max Risonanza (Q)", 1.0, 30.0, 10.0) # Range più ampio per sperimentazione
 
         # Verifichiamo FFmpeg prima di avviare il processo
         if not check_ffmpeg():
@@ -244,9 +239,9 @@ def main():
             
         if st.button("🎵 Genera Audio e Unisci al Video"):
             # Genera nomi file unici per l'output
-            base_name = os.path.splitext(uploaded_file.name)[0]
-            audio_output_path = os.path.join("temp", f"{base_name}_generated_audio.wav")
-            final_video_path = os.path.join("temp", f"{base_name}_final_videosound.mp4")
+            base_name_output = os.path.splitext(uploaded_file.name)[0]
+            audio_output_path = os.path.join("temp", f"{base_name_output}_{unique_id}_generated_audio.wav")
+            final_video_path = os.path.join("temp", f"{base_name_output}_{unique_id}_final_videosound.mp4")
             
             # Assicurati che la directory 'temp' esista
             os.makedirs("temp", exist_ok=True)
@@ -259,13 +254,14 @@ def main():
 
             # Applica il filtro dinamico e genera l'audio finale
             with st.spinner("🎧 Generazione audio sperimentale e applicazione filtri dinamici..."):
-                # Passa i valori degli slider alla funzione di filtro
                 generated_audio = audio_gen.apply_filter_dynamic(
                     base_waveform, 
                     brightness_data, 
-                    detail_data
-                    # min_cutoff=min_cutoff_user, max_cutoff=max_cutoff_user,
-                    # min_res=min_resonance_user, max_res=max_resonance_user # Se volessimo passarli direttamente
+                    detail_data,
+                    min_cutoff=min_cutoff_user, 
+                    max_cutoff=max_cutoff_user,
+                    min_res=min_resonance_user, 
+                    max_res=max_resonance_user
                 )
             
             if generated_audio is None or generated_audio.size == 0:
@@ -299,7 +295,7 @@ def main():
                             st.download_button(
                                 "⬇️ Scarica il Video con Audio",
                                 f,
-                                file_name=f"videosound_sottrattiva_{base_name}.mp4",
+                                file_name=f"videosound_sottrattiva_{base_name_output}.mp4",
                                 mime="video/mp4"
                             )
                         
@@ -311,18 +307,16 @@ def main():
 
                     except subprocess.CalledProcessError as e:
                         st.error(f"❌ Errore FFmpeg durante l'unione: {e.stderr.decode()}")
-                        # Stampa l'output completo di FFmpeg per il debug
                         st.code(e.stdout.decode() + e.stderr.decode()) 
                     except Exception as e:
                         st.error(f"❌ Errore generico durante l'unione: {str(e)}")
             else:
                 st.warning(f"⚠️ FFmpeg non trovato. Il video con audio non può essere unito. L'audio generato è disponibile in '{audio_output_path}'.")
-                # Offri il download del solo audio se FFmpeg non c'è
                 with open(audio_output_path, "rb") as f:
                     st.download_button(
                         "⬇️ Scarica Solo Audio (FFmpeg non trovato per video)",
                         f,
-                        file_name=f"videosound_sottrattiva_audio_{base_name}.wav",
+                        file_name=f"videosound_sottrattiva_audio_{base_name_output}.wav",
                         mime="audio/wav"
                     )
 
