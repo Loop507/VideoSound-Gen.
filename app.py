@@ -54,7 +54,7 @@ def analyze_video_frames(video_path: str) -> Tuple[Optional[np.ndarray], Optiona
         return None, None, None, None, None, None, None
 
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    height = int(cap.get(cv2.CAP_PROP_HEIGHT)) # Usato CAP_PROP_HEIGHT invece di CAP_PROP_FRAME_HEIGHT per consistenza
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     video_duration = total_frames / fps if fps > 0 else 0
 
@@ -70,9 +70,9 @@ def analyze_video_frames(video_path: str) -> Tuple[Optional[np.ndarray], Optiona
 
     brightness_data = []
     detail_data = [] 
-    movement_data = [] # Nuovo: per il movimento
+    movement_data = [] 
     
-    prev_gray_frame = None # Per il calcolo del movimento
+    prev_gray_frame = None 
 
     progress_bar = st.progress(0)
     status_text = st.empty()
@@ -94,7 +94,6 @@ def analyze_video_frames(video_path: str) -> Tuple[Optional[np.ndarray], Optiona
 
         # 3. Movimento: Differenza assoluta media tra frame consecutivi
         if prev_gray_frame is not None:
-            # Calcola la differenza assoluta e normalizza per la dimensione del frame e il max pixel value (255)
             frame_diff = np.sum(cv2.absdiff(gray_frame, prev_gray_frame)) / (gray_frame.size * 255.0)
             movement_data.append(frame_diff)
         else:
@@ -109,21 +108,11 @@ def analyze_video_frames(video_path: str) -> Tuple[Optional[np.ndarray], Optiona
     st.success("✅ Analisi video completata!")
     
     # Assicurati che movement_data abbia la stessa lunghezza degli altri array
-    # Se il video ha solo 1 frame, movement_data sarà [0.0], quindi andrà bene
     if len(movement_data) < len(brightness_data):
-        # Questo può accadere se il loop si interrompe prima o se c'è solo un frame
-        # Per semplicità, replichiamo l'ultimo valore o aggiungiamo zeri
-        # Per video di un solo frame, movement_data sarà [0.0] e gli altri [valore_frame1], quindi deve avere la stessa lunghezza
-        if len(brightness_data) == 1 and len(movement_data) == 1:
-            pass # Già allineato
-        elif len(brightness_data) > 0:
-            # Replicare l'ultimo valore per i frame mancanti (dovrebbe essere solo l'ultimo se si rompe il loop)
-            # In un caso normale, length(movement_data) = length(brightness_data) - 1, quindi aggiungiamo 1
-            if len(movement_data) == len(brightness_data) - 1:
-                movement_data.append(movement_data[-1]) # Aggiungi l'ultimo valore
-            else: # Caso più complesso, riempi con zeri o media
-                while len(movement_data) < len(brightness_data):
-                    movement_data.append(0.0) # Riempi con zeri
+        while len(movement_data) < len(brightness_data):
+            # Se ci sono meno dati di movimento, replichiamo l'ultimo valore valido
+            # o aggiungiamo 0 se non ci sono dati di movimento
+            movement_data.append(movement_data[-1] if len(movement_data) > 0 else 0.0)
 
     return np.array(brightness_data), np.array(detail_data), np.array(movement_data), width, height, fps, video_duration
 
@@ -141,7 +130,7 @@ class AudioGenerator:
         return waveform.astype(np.float32)
 
     def generate_fm_layer(self, duration_samples: int,
-                             brightness_data: np.ndarray, detail_data: np.ndarray, movement_data: np.ndarray, # Aggiunto movement_data
+                             brightness_data: np.ndarray, detail_data: np.ndarray, movement_data: np.ndarray, 
                              min_carrier_freq: float, max_carrier_freq: float,
                              min_modulator_freq: float, max_modulator_freq: float,
                              min_mod_index: float, max_mod_index: float) -> np.ndarray:
@@ -166,17 +155,17 @@ class AudioGenerator:
                 continue
 
             current_brightness = brightness_data[i]
-            current_detail = detail_data[i] # Mantenuto per completezza, ma non usato direttamente in FM qui
-            current_movement = movement_data[i] # NUOVO
+            # current_detail = detail_data[i] # Non usato direttamente qui per FM
+            current_movement = movement_data[i] 
 
             # Mappatura dei parametri FM ai dati visivi
-            # Carrier Frequency -> Luminosità (come prima)
+            # Carrier Frequency -> Luminosità
             carrier_freq = min_carrier_freq + current_brightness * (max_carrier_freq - min_carrier_freq)
             
-            # Modulator Frequency -> Movimento (NUOVO)
+            # Modulator Frequency -> Movimento
             modulator_freq = min_modulator_freq + current_movement * (max_modulator_freq - min_modulator_freq)
             
-            # Modulation Index -> Movimento (NUOVO)
+            # Modulation Index -> Movimento
             mod_index = min_mod_index + current_movement * (max_mod_index - min_mod_index) 
 
             t_segment = t_overall[frame_start_sample:frame_end_sample]
@@ -208,7 +197,7 @@ class AudioGenerator:
         num_frames = len(brightness_data)
         status_text = st.empty()
         
-        # --- Fase 1: Filtro Dinamico (se abilitato, per sintesi sottrattiva) ---
+        # --- Fase 1: Filtro Dinamico (per sintesi sottrattiva) ---
         if apply_filter:
             progress_bar_filter = st.progress(0, text="🎶 Applicazione Filtro Dinamico...")
             zi = np.zeros(filter_order) 
@@ -293,7 +282,7 @@ def main():
     st.set_page_config(page_title="🎵 VideoSound Gen - Sperimentale", layout="centered")
     st.title("🎬 VideoSound Gen - Sperimentale")
     st.markdown("###### by Loop507") 
-    st.markdown("### Genera musica sperimentale da un video muto")
+    st.markdown("### Genera musica sperimentale da un video") # Titolo aggiornato
     st.markdown("Carica un video e osserva come le sue proprietà visive creano un paesaggio sonoro dinamico.")
 
     uploaded_file = st.file_uploader("🎞️ Carica un file video (.mp4, .mov, ecc.)", type=["mp4", "mov", "avi", "mkv"])
@@ -330,7 +319,7 @@ def main():
         
         # --- Sezione Sintesi Sottrattiva (sempre attiva come base) ---
         st.sidebar.header("Generazione Suono Base")
-        with st.sidebar.expander("Sintesi Sottrattiva (Filtro Passa-Basso)", expanded=True): # Espandi di default
+        with st.sidebar.expander("Sintesi Sottrattiva (Filtro Passa-Basso)", expanded=True): 
             st.markdown("**Controlli:**")
             st.markdown("- **Frequenza di Taglio:** controllata dalla **Luminosità** del video.")
             st.markdown("- **Risonanza:** controllata dal **Dettaglio/Contrasto** del video.")
@@ -344,7 +333,7 @@ def main():
         enable_fm_synthesis = st.sidebar.checkbox("🔊 Abilita Sintesi FM (Strato aggiuntivo)", value=False)
         
         if enable_fm_synthesis:
-            with st.sidebar.expander("Sintesi FM Parametri", expanded=True): # Espandi di default se abilitato
+            with st.sidebar.expander("Sintesi FM Parametri", expanded=True): 
                 st.markdown("**Controlli:**")
                 st.markdown("- **Frequenza Carrier:** controllata dalla **Luminosità** del video.")
                 st.markdown("- **Frequenza Modulator:** controllata dal **Movimento** del video.")
@@ -358,7 +347,7 @@ def main():
         
         # --- Sezione Pitch/Time Stretching (sempre attiva) ---
         st.sidebar.markdown("---")
-        with st.sidebar.expander("Pitch Shifting / Time Stretching", expanded=True): # Espandi di default
+        with st.sidebar.expander("Pitch Shifting / Time Stretching", expanded=True): 
             st.markdown("**Controlli:**")
             st.markdown("- **Time Stretch Rate:** controllato dalla **Luminosità** del video.")
             st.markdown("- **Pitch Shift:** controllato dal **Dettaglio/Contrasto** del video.")
@@ -405,13 +394,12 @@ def main():
                     total_samples,
                     brightness_data, 
                     detail_data,
-                    movement_data, # Passa i dati di movimento
+                    movement_data, 
                     min_carrier_freq_user, max_carrier_freq_user,
                     min_modulator_freq_user, max_modulator_freq_user,
                     min_mod_index_user, max_mod_index_user
                 )
                 # Mescola lo strato FM con l'audio sottrattivo
-                # Normalizziamo leggermente per evitare clipping eccessivo quando si combinano
                 primary_audio_waveform = (primary_audio_waveform * 0.7 + fm_layer * 0.3) 
                 st.success("✅ Strato FM combinato con l'audio base!")
 
@@ -429,7 +417,7 @@ def main():
                     max_pitch_shift_semitones=max_pitch_shift_semitones,
                     min_time_stretch_rate=min_time_stretch_rate,
                     max_time_stretch_rate=max_time_stretch_rate,
-                    apply_filter=True # Il filtro si applica sempre all'onda base sottrattiva
+                    apply_filter=True 
                 )
             
             if generated_audio is None or generated_audio.size == 0:
