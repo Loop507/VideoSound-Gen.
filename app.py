@@ -190,6 +190,91 @@ class AudioGenerator:
         
         return fm_audio_layer
 
+    def generate_granular_layer(self, duration_samples: int,
+                                brightness_data: np.ndarray, detail_data: np.ndarray, movement_data: np.ndarray,
+                                min_grain_freq: float, max_grain_freq: float,
+                                min_grain_density: float, max_grain_density: float,
+                                min_grain_duration: float, max_grain_duration: float,
+                                ) -> np.ndarray:
+        """
+        Genera un layer di sintesi granulare, modulato dai dati visivi.
+        
+        Parametri:
+        - min_grain_freq, max_grain_freq: range di frequenza dei grani (Pito)
+        - min_grain_density, max_grain_density: range di densità dei grani (Texture) - grani per secondo
+        - min_grain_duration, max_grain_duration: range di durata dei grani (Drone) - in secondi
+        """
+        st.info("🎵 Generazione Strato Granulare...")
+        granular_layer = np.zeros(duration_samples, dtype=np.float32)
+        
+        num_frames = len(brightness_data)
+        
+        progress_bar = st.progress(0, text="🎵 Generazione Strato Granulare...")
+        status_text = st.empty()
+
+        for i in range(num_frames):
+            frame_start_sample = i * self.samples_per_frame
+            frame_end_sample = min((i + 1) * self.samples_per_frame, duration_samples)
+            
+            if frame_start_sample >= frame_end_sample:
+                continue
+
+            current_brightness = brightness_data[i]
+            current_detail = detail_data[i]
+            current_movement = movement_data[i]
+
+            # Mappatura dei parametri granulari ai dati visivi
+            # Pitch (Pito) -> Luminosità
+            grain_freq = min_grain_freq + current_brightness * (max_grain_freq - min_grain_freq)
+            grain_freq = np.clip(grain_freq, 20, self.sample_rate / 2 - 100) # Assicura che la frequenza sia valida
+
+            # Densità (Texture) -> Movimento (più movimento = più grani)
+            grains_per_second = min_grain_density + current_movement * (max_grain_density - min_grain_density)
+            
+            # Durata Grano (Drone) -> Dettaglio/Contrasto (meno dettaglio = grani più lunghi per drone)
+            # Invertiamo il dettaglio per il drone: basso dettaglio -> alta durata grano
+            grain_duration_sec = max_grain_duration - current_detail * (max_grain_duration - min_grain_duration)
+            grain_duration_sec = np.clip(grain_duration_sec, 0.005, 0.5) # Durata minima 5ms, max 500ms
+            
+            
+            segment_duration_sec = (frame_end_sample - frame_start_sample) / self.sample_rate
+            num_grains_in_segment = int(grains_per_second * segment_duration_sec)
+
+            if num_grains_in_segment == 0:
+                progress_bar.progress((i + 1) / num_frames)
+                status_text.text(f"🎵 Granulare Frame {i + 1}/{num_frames} | Freq: {int(grain_freq)} Hz | Dens: {int(grains_per_second)}/s | Dur: {grain_duration_sec:.3f} s")
+                continue
+
+            grain_duration_samples = int(grain_duration_sec * self.sample_rate)
+            
+            # Creazione e sovrapposizione dei grani
+            for _ in range(num_grains_in_segment):
+                # Posizione casuale all'interno del segmento corrente
+                grain_start_sample_in_segment = np.random.randint(0, max(1, (frame_end_sample - frame_start_sample) - grain_duration_samples))
+                actual_grain_start = frame_start_sample + grain_start_sample_in_segment
+                actual_grain_end = min(actual_grain_start + grain_duration_samples, duration_samples)
+                
+                if actual_grain_start >= actual_grain_end: continue
+
+                t_grain = np.linspace(0, (actual_grain_end - actual_grain_start) / self.sample_rate, (actual_grain_end - actual_grain_start), endpoint=False)
+                
+                # Forma d'onda del grano (es. sinusoidale con inviluppo Hanning per evitare click)
+                grain_waveform = np.sin(2 * np.pi * grain_freq * t_grain)
+                
+                # Applica inviluppo (Hanning window)
+                window = np.hanning(len(grain_waveform))
+                grain_waveform *= window
+                
+                # Normalizza per evitare clipping quando si sommano molti grani
+                grain_waveform *= 0.1 
+
+                granular_layer[actual_grain_start:actual_grain_end] += grain_waveform
+            
+            progress_bar.progress((i + 1) / num_frames)
+            status_text.text(f"🎵 Granulare Frame {i + 1}/{num_frames} | Freq: {int(grain_freq)} Hz | Dens: {int(grains_per_second)}/s | Dur: {grain_duration_sec:.3f} s")
+        
+        return granular_layer
+
     def add_noise_layer(self, base_audio: np.ndarray, detail_data: np.ndarray, 
                         min_noise_amp: float, max_noise_amp: float) -> np.ndarray:
         """
@@ -420,6 +505,9 @@ def main():
         glitch_threshold_user, glitch_duration_frames_user, glitch_intensity_user = 0, 0, 0
         min_pitch_shift_semitones, max_pitch_shift_semitones = 0, 0
         min_time_stretch_rate, max_time_stretch_rate = 0, 0
+        min_grain_freq, max_grain_freq = 0, 0
+        min_grain_density, max_grain_density = 0, 0
+        min_grain_duration, max_grain_duration = 0, 0
 
 
         # --- Sezione Sintesi Sottrattiva (con checkbox di abilitazione) ---
@@ -450,6 +538,26 @@ def main():
                 max_modulator_freq_user = st.slider("Max Frequenza Modulator (Hz)", 10, 2000, 100, key="fm_max_modulator")
                 min_mod_index_user = st.slider("Min Indice di Modulazione", 0.1, 10.0, 0.5, 0.1, key="fm_min_index")
                 max_mod_index_user = st.slider("Max Indice di Modulazione", 1.0, 50.0, 5.0, 0.1, key="fm_max_index")
+
+        # --- Sezione Sintesi Granulare (con checkbox di abilitazione) ---
+        st.sidebar.markdown("---")
+        enable_granular_synthesis = st.sidebar.checkbox("🎶 **Abilita Sintesi Granulare**", value=False)
+
+        if enable_granular_synthesis:
+            with st.sidebar.expander("Sintesi Granulare Parametri", expanded=True):
+                st.markdown("**Controlli:**")
+                st.markdown("- **Frequenza Grani (Pito):** controllata dalla **Luminosità** del video.")
+                st.markdown("- **Densità Grani (Texture):** controllata dal **Movimento** del video.")
+                st.markdown("- **Durata Grani (Drone):** controllata dal **Dettaglio/Contrasto** del video.")
+                
+                min_grain_freq = st.slider("Min Frequenza Grano (Hz) - Pitch/Pito", 50, 2000, 200, key="gran_min_freq")
+                max_grain_freq = st.slider("Max Frequenza Grano (Hz) - Pitch/Pito", 1000, 8000, 1500, key="gran_max_freq")
+                
+                min_grain_density = st.slider("Min Densità Grani (Grani/sec) - Texture", 1, 100, 10, key="gran_min_dens")
+                max_grain_density = st.slider("Max Densità Grani (Grani/sec) - Texture", 20, 500, 100, key="gran_max_dens")
+                
+                min_grain_duration = st.slider("Min Durata Grano (sec) - Drone", 0.005, 0.2, 0.01, 0.001, key="gran_min_dur")
+                max_grain_duration = st.slider("Max Durata Grano (sec) - Drone", 0.05, 1.0, 0.2, 0.001, key="gran_max_dur")
         
         # --- Sezione Noise (attivabile con checkbox) ---
         st.sidebar.markdown("---")
@@ -505,8 +613,9 @@ def main():
             
         if st.button("🎵 Genera e Prepara Download"):
             base_name_output = os.path.splitext(uploaded_file.name)[0]
-            audio_output_path = os.path.join("temp", f"{base_name_output}_{unique_id}_generated_audio.wav") 
-            final_video_path = os.path.join("temp", f"{base_name_output}_{unique_id}_final_videosound.mp4")
+            unique_id_audio = str(np.random.randint(10000, 99999))
+            audio_output_path = os.path.join("temp", f"{base_name_output}_{unique_id_audio}_generated_audio.wav") 
+            final_video_path = os.path.join("temp", f"{base_name_output}_{unique_id_audio}_final_videosound.mp4")
             
             os.makedirs("temp", exist_ok=True)
 
@@ -514,13 +623,17 @@ def main():
             
             total_samples = int(video_duration * AUDIO_SAMPLE_RATE)
             
+            # Inizializza l'audio base a silenzio
+            combined_audio_layers = np.zeros(total_samples, dtype=np.float32)
+
             # --- Generazione dell'audio base (Sintesi Sottrattiva) ---
-            primary_audio_waveform = np.zeros(total_samples, dtype=np.float32) # Inizializza a zero
             if enable_subtractive_synthesis:
                 st.info("🎵 Generazione dell'onda base (Sintesi Sottrattiva)...")
-                primary_audio_waveform = audio_gen.generate_subtractive_waveform(total_samples)
+                subtractive_layer = audio_gen.generate_subtractive_waveform(total_samples)
+                combined_audio_layers += subtractive_layer
+                st.success("✅ Strato Sintesi Sottrattiva generato!")
             else:
-                st.info("🎵 Sintesi Sottrattiva disabilitata. Partendo da audio silenzioso.")
+                st.info("🎵 Sintesi Sottrattiva disabilitata.")
 
 
             # --- Aggiungi lo strato FM se abilitato ---
@@ -533,14 +646,28 @@ def main():
                     min_modulator_freq_user, max_modulator_freq_user,
                     min_mod_index_user, max_mod_index_user
                 )
-                # Mescola lo strato FM con l'audio sottrattivo
-                primary_audio_waveform = (primary_audio_waveform * 0.7 + fm_layer * 0.3) 
-                st.success("✅ Strato FM combinato con l'audio base!")
+                combined_audio_layers += fm_layer * 0.5 # Aggiungi con un peso ridotto
+                st.success("✅ Strato FM generato e combinato!")
+
+            # --- Aggiungi lo strato Granulare se abilitato ---
+            if enable_granular_synthesis:
+                granular_layer = audio_gen.generate_granular_layer(
+                    total_samples,
+                    brightness_data, 
+                    detail_data, 
+                    movement_data,
+                    min_grain_freq, max_grain_freq,
+                    min_grain_density, max_grain_density,
+                    min_grain_duration, max_grain_duration
+                )
+                combined_audio_layers += granular_layer * 0.5 # Aggiungi con un peso ridotto
+                st.success("✅ Strato Granulare generato e combinato!")
 
             # --- Aggiungi il layer di Rumore se abilitato ---
             if enable_noise_effect:
-                primary_audio_waveform = audio_gen.add_noise_layer(
-                    primary_audio_waveform, 
+                # Applica il rumore all'audio combinato fino a questo punto
+                combined_audio_layers = audio_gen.add_noise_layer(
+                    combined_audio_layers, 
                     detail_data,
                     min_noise_amp_user, 
                     max_noise_amp_user
@@ -549,8 +676,9 @@ def main():
 
             # --- Applica effetti Glitch se abilitati ---
             if enable_glitch_effect:
-                primary_audio_waveform = audio_gen.apply_glitch_effect(
-                    primary_audio_waveform, 
+                # Applica il glitch all'audio combinato fino a questo punto
+                combined_audio_layers = audio_gen.apply_glitch_effect(
+                    combined_audio_layers, 
                     variation_movement_data,
                     glitch_threshold_user, 
                     glitch_duration_frames_user,
@@ -561,7 +689,7 @@ def main():
             # --- Processamento degli effetti dinamici (filtro, pitch, time stretch) ---
             with st.spinner("🎧 Applicazione effetti dinamici all'audio generato..."):
                 generated_audio = audio_gen.process_audio_segments(
-                    primary_audio_waveform, 
+                    combined_audio_layers, # Passa l'audio combinato finora
                     brightness_data, 
                     detail_data,
                     min_cutoff=min_cutoff_user, 
@@ -581,6 +709,10 @@ def main():
                 return
 
             try:
+                # Normalizza l'audio finale per evitare clipping
+                if np.max(np.abs(generated_audio)) > 0:
+                    generated_audio = generated_audio / np.max(np.abs(generated_audio)) * 0.9 
+
                 sf.write(audio_output_path, generated_audio, AUDIO_SAMPLE_RATE)
                 st.success(f"✅ Audio sperimentale processato e salvato in '{audio_output_path}'")
             except Exception as e:
