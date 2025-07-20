@@ -6,8 +6,8 @@ import subprocess
 import gc
 import shutil
 from typing import Tuple, Optional
-import soundfile as sf # Assicurati di aver installato: pip install soundfile
-from scipy.signal import butter, lfilter, iirfilter # Assicurati di aver installato: pip install scipy
+import soundfile as sf
+from scipy.signal import butter, lfilter
 
 # Costanti globali (puoi modificarle)
 MAX_DURATION = 300  # Durata massima del video in secondi
@@ -16,6 +16,14 @@ MAX_FILE_SIZE = 50 * 1024 * 1024  # Dimensione massima del file (50 MB)
 AUDIO_SAMPLE_RATE = 44100 # Frequenza di campionamento per l'audio generato
 AUDIO_FPS = 30 # Frame per secondo dell'audio (dovrebbe corrispondere al video per semplicità)
 
+# Definizioni delle risoluzioni per i formati
+# (width, height)
+FORMAT_RESOLUTIONS = {
+    "Originale": (0, 0), # Usiamo 0,0 come segnaposto per la risoluzione originale
+    "1:1 (Quadrato)": (720, 720),     # Aggiornato: 720x720
+    "16:9 (Orizzontale)": (1280, 720), # Aggiornato: 1280x720 (HD Ready)
+    "9:16 (Verticale)": (720, 1280)    # Aggiornato: 720x1280 (Verticale HD Ready)
+}
 
 def check_ffmpeg() -> bool:
     """Verifica se FFmpeg è installato e disponibile nel PATH."""
@@ -118,8 +126,6 @@ class AudioGenerator:
         filter_order = 4 # Ordine del filtro (Butterworth di 4° ordine)
         
         # Inizializza lo stato del filtro per una transizione più fluida tra i frame
-        # Il numero di stati (zi) dipende dall'ordine del filtro
-        # Per un filtro di ordine N, lfilter con output='ba' richiede N stati
         zi = np.zeros(filter_order) 
 
         num_frames = len(brightness_data)
@@ -131,50 +137,24 @@ class AudioGenerator:
             frame_start_sample = i * self.samples_per_frame
             frame_end_sample = min((i + 1) * self.samples_per_frame, len(base_audio)) # Evita sforamenti
             
-            # Preleva il segmento audio per il frame corrente
             audio_segment = base_audio[frame_start_sample:frame_end_sample]
             
             if audio_segment.size == 0:
-                continue # Salta frame se non c'è audio
+                continue 
 
             current_brightness = brightness_data[i]
             current_detail = detail_data[i]
             
-            # Calcola la frequenza di taglio e la risonanza per questo frame
-            # Normalizza current_brightness e current_detail (già tra 0 e 1)
-            # e mappali ai range definiti dagli slider dell'utente
-            
             cutoff_freq = min_cutoff + current_brightness * (max_cutoff - min_cutoff)
-            resonance_q = min_res + current_detail * (max_res - min_res) # Q per la risonanza
+            resonance_q = min_res + current_detail * (max_res - min_res) 
 
-            # Normalizza la frequenza di taglio per scipy.signal (frequenza di Nyquist)
             nyquist = 0.5 * self.sample_rate
-            
-            # Per i filtri Butterworth, non c'è un parametro 'Q' diretto come nei filtri biquad.
-            # L'argomento `Wn` in `butter` è la frequenza di taglio normalizzata.
-            # Tuttavia, possiamo usare `iirfilter` per un filtro di tipo 'peaking' o 'notch'
-            # se vogliamo un controllo esplicito di Q, ma per un passa-basso,
-            # la risonanza è più una caratteristica del filtro stesso.
-            # Useremo il 'detail' per variare leggermente il cutoff o l'ordine, o magari un Q implicito se usiamo un biquad.
-            
-            # Per una sintesi sottrattiva standard con un passa-basso Butterworth:
-            # la frequenza di taglio è il parametro principale.
-            # Possiamo usare il "dettaglio" per rendere il cutoff più sensibile o per modulare un altro parametro.
-            
-            # Esempio: usiamo la risonanza (Q) per modificare l'andamento del cutoff o aggiungere un leggero boost.
-            # Per ora, manteniamo `normal_cutoff` come parametro principale.
             normal_cutoff = cutoff_freq / nyquist
             
-            # Assicurati che il cutoff non sia troppo vicino a 0 o 1 (limiti di stabilità)
-            normal_cutoff = np.clip(normal_cutoff, 0.001, 0.999) # Range leggermente più ampio e sicuro
+            normal_cutoff = np.clip(normal_cutoff, 0.001, 0.999) 
 
-            # Progetta il filtro Butterworth
-            # `btype='lowpass'` è il tipo, `analog=False` per filtri digitali
-            # `output='ba'` restituisce i coefficienti b e a, necessari per `lfilter`
             b, a = butter(filter_order, normal_cutoff, btype='lowpass', analog=False, output='ba')
             
-            # Applica il filtro al segmento audio, mantenendo lo stato (zi)
-            # `lfilter` restituisce la serie filtrata e il nuovo stato finale del filtro
             filtered_segment, zi = lfilter(b, a, audio_segment, zi=zi)
             
             generated_audio[frame_start_sample:frame_end_sample] = filtered_segment
@@ -182,16 +162,14 @@ class AudioGenerator:
             progress_bar.progress((i + 1) / num_frames)
             status_text.text(f"🎶 Generazione audio Frame {i + 1}/{num_frames} | Cutoff: {int(cutoff_freq)} Hz | Q: {resonance_q:.2f}")
 
-        # Normalizza l'audio finale per evitare clipping
         if np.max(np.abs(generated_audio)) > 0:
-            generated_audio = generated_audio / np.max(np.abs(generated_audio)) * 0.9 # Normalizza a 0.9 per sicurezza
+            generated_audio = generated_audio / np.max(np.abs(generated_audio)) * 0.9 
             
         return generated_audio
 
 def main():
     st.set_page_config(page_title="🎵 VideoSound Gen - Sperimentale", layout="centered")
     st.title("🎬 VideoSound Gen - Sperimentale")
-    # Aggiungi la dicitura con caratteri più piccoli qui
     st.markdown("###### by Loop507") 
     st.markdown("### Genera musica sperimentale da un video muto")
     st.markdown("Carica un video e osserva come le sue proprietà visive creano un paesaggio sonoro dinamico attraverso la sintesi sottrattiva.")
@@ -202,27 +180,22 @@ def main():
         if not validate_video_file(uploaded_file):
             return
             
-        # Salva il file video caricato localmente per OpenCV e FFmpeg
-        # Genera un nome file unico per evitare conflitti e permettere upload multipli
         base_name_upload = os.path.splitext(uploaded_file.name)[0]
-        # Creiamo un hash o un timestamp per rendere il nome file unico
-        unique_id = str(np.random.randint(10000, 99999)) # Un ID semplice, per non usare datetime per brevità
+        unique_id = str(np.random.randint(10000, 99999)) 
         video_input_path = os.path.join("temp", f"{base_name_upload}_{unique_id}.mp4")
-        os.makedirs("temp", exist_ok=True) # Assicurati che la directory 'temp' esista
+        os.makedirs("temp", exist_ok=True) 
         with open(video_input_path, "wb") as f:
             f.write(uploaded_file.read())
         st.success("🎥 Video caricato correttamente!")
 
-        # Analizza i frame del video
         with st.spinner("📊 Analisi frame video (luminosità, dettaglio) in corso..."):
             brightness_data, detail_data, width, height, fps, video_duration = analyze_video_frames(video_input_path)
         
-        if brightness_data is None: # Se l'analisi fallisce
+        if brightness_data is None: 
             return
         
-        st.info(f"🎥 Durata video: {video_duration:.2f} secondi | Risoluzione: {width}x{height} | FPS: {fps:.2f}")
+        st.info(f"🎥 Durata video: {video_duration:.2f} secondi | Risoluzione Originale: {width}x{height} | FPS: {fps:.2f}")
 
-        # Configurazione degli effetti audio
         st.markdown("---")
         st.subheader("🎶 Configurazione Sintesi Audio Sperimentale")
 
@@ -230,29 +203,39 @@ def main():
         st.sidebar.header("Parametri Sintesi Sottrattiva")
         min_cutoff_user = st.sidebar.slider("Min Frequenza Taglio (Hz)", 20, 5000, 100)
         max_cutoff_user = st.sidebar.slider("Max Frequenza Taglio (Hz)", 1000, 20000, 8000)
-        min_resonance_user = st.sidebar.slider("Min Risonanza (Q)", 0.1, 5.0, 0.5) # Range più ragionevole per Q
-        max_resonance_user = st.sidebar.slider("Max Risonanza (Q)", 1.0, 30.0, 10.0) # Range più ampio per sperimentazione
+        min_resonance_user = st.sidebar.slider("Min Risonanza (Q)", 0.1, 5.0, 0.5) 
+        max_resonance_user = st.sidebar.slider("Max Risonanza (Q)", 1.0, 30.0, 10.0) 
 
-        # Verifichiamo FFmpeg prima di avviare il processo
+        st.markdown("---")
+        st.subheader("⬇️ Opzioni di Download")
+        
+        # Selezione della risoluzione di output
+        output_resolution_choice = st.selectbox(
+            "Seleziona la risoluzione di output del video:",
+            list(FORMAT_RESOLUTIONS.keys())
+        )
+        
+        # Scegli cosa scaricare
+        download_option = st.radio(
+            "Cosa vuoi scaricare?",
+            ("Video con Audio", "Solo Audio")
+        )
+
         if not check_ffmpeg():
-            st.warning("⚠️ FFmpeg non disponibile sul tuo sistema. Non sarà possibile unire l'audio al video. Assicurati che FFmpeg sia installato e nel PATH.")
+            st.warning("⚠️ FFmpeg non disponibile sul tuo sistema. L'unione o la ricodifica del video potrebbe non funzionare. Assicurati che FFmpeg sia installato e nel PATH.")
             
-        if st.button("🎵 Genera Audio e Unisci al Video"):
-            # Genera nomi file unici per l'output
+        if st.button("🎵 Genera e Prepara Download"):
             base_name_output = os.path.splitext(uploaded_file.name)[0]
-            audio_output_path = os.path.join("temp", f"{base_name_output}_{unique_id}_generated_audio.wav")
+            audio_output_path = os.path.join("temp", f"{base_name_output}_{unique_id}_generated_audio.wav") 
             final_video_path = os.path.join("temp", f"{base_name_output}_{unique_id}_final_videosound.mp4")
             
-            # Assicurati che la directory 'temp' esista
             os.makedirs("temp", exist_ok=True)
 
-            audio_gen = AudioGenerator(AUDIO_SAMPLE_RATE, int(fps)) # Usiamo gli FPS del video per l'audio
+            audio_gen = AudioGenerator(AUDIO_SAMPLE_RATE, int(fps)) 
             
-            # Genera la waveform di base per tutta la durata
             total_samples = int(video_duration * AUDIO_SAMPLE_RATE)
             base_waveform = audio_gen.generate_base_waveform(total_samples)
 
-            # Applica il filtro dinamico e genera l'audio finale
             with st.spinner("🎧 Generazione audio sperimentale e applicazione filtri dinamici..."):
                 generated_audio = audio_gen.apply_filter_dynamic(
                     base_waveform, 
@@ -272,53 +255,80 @@ def main():
                 sf.write(audio_output_path, generated_audio, AUDIO_SAMPLE_RATE)
                 st.success(f"✅ Audio sperimentale generato e salvato in '{audio_output_path}'")
             except Exception as e:
-                st.error(f"❌ Errore nel salvataggio dell'audio: {str(e)}")
+                st.error(f"❌ Errore nel salvataggio dell'audio WAV: {str(e)}")
                 return
             
-            # Unisci l'audio al video usando FFmpeg
-            if check_ffmpeg():
-                with st.spinner("🔗 Unione audio e video con FFmpeg..."):
-                    try:
-                        subprocess.run([
-                            "ffmpeg", "-y",
-                            "-i", video_input_path, 
-                            "-i", audio_output_path, 
-                            "-c:v", "copy", 
-                            "-c:a", "aac", "-b:a", "192k", 
-                            "-map", "0:v:0", "-map", "1:a:0", 
-                            "-shortest", 
-                            final_video_path
-                        ], capture_output=True, check=True)
-                        st.success(f"✅ Video finale con audio salvato in '{final_video_path}'")
-                        
-                        with open(final_video_path, "rb") as f:
-                            st.download_button(
-                                "⬇️ Scarica il Video con Audio",
-                                f,
-                                file_name=f"videosound_sottrattiva_{base_name_output}.mp4",
-                                mime="video/mp4"
-                            )
-                        
-                        # Pulizia files temporanei
-                        for temp_f in [video_input_path, audio_output_path, final_video_path]:
-                            if os.path.exists(temp_f):
-                                os.remove(temp_f)
-                        st.info("🗑️ File temporanei puliti.")
-
-                    except subprocess.CalledProcessError as e:
-                        st.error(f"❌ Errore FFmpeg durante l'unione: {e.stderr.decode()}")
-                        st.code(e.stdout.decode() + e.stderr.decode()) 
-                    except Exception as e:
-                        st.error(f"❌ Errore generico durante l'unione: {str(e)}")
-            else:
-                st.warning(f"⚠️ FFmpeg non trovato. Il video con audio non può essere unito. L'audio generato è disponibile in '{audio_output_path}'.")
+            # Gestione del download in base alla scelta
+            if download_option == "Solo Audio":
                 with open(audio_output_path, "rb") as f:
                     st.download_button(
-                        "⬇️ Scarica Solo Audio (FFmpeg non trovato per video)",
+                        "⬇️ Scarica Solo Audio (WAV)", 
                         f,
                         file_name=f"videosound_sottrattiva_audio_{base_name_output}.wav",
-                        mime="audio/wav"
+                        mime="audio/wav" 
                     )
+                if os.path.exists(video_input_path):
+                    os.remove(video_input_path) 
+                if os.path.exists(audio_output_path):
+                    os.remove(audio_output_path)
+                st.info("🗑️ File temporanei puliti.")
+
+            elif download_option == "Video con Audio":
+                if check_ffmpeg():
+                    with st.spinner("🔗 Unione e ricodifica video/audio con FFmpeg (potrebbe richiedere tempo)..."):
+                        target_width, target_height = FORMAT_RESOLUTIONS[output_resolution_choice]
+                        
+                        # Se la scelta è "Originale", usa la risoluzione del video di input
+                        if output_resolution_choice == "Originale":
+                            target_width = width
+                            target_height = height
+
+                        # Filtro complesso per scalare e fare padding (letterbox/pillarbox)
+                        vf_complex = f"scale='min({target_width},iw*({target_height}/ih)):min({target_height},ih*({target_width}/iw))',pad={target_width}:{target_height}:(ow-iw)/2:(oh-ih)/2:color=black"
+
+                        try:
+                            subprocess.run([
+                                "ffmpeg", "-y",
+                                "-i", video_input_path, 
+                                "-i", audio_output_path, 
+                                "-c:v", "libx264", 
+                                "-preset", "medium", 
+                                "-crf", "23", 
+                                "-vf", vf_complex, 
+                                "-c:a", "aac", "-b:a", "192k", 
+                                "-map", "0:v:0", "-map", "1:a:0", 
+                                "-shortest", 
+                                final_video_path
+                            ], capture_output=True, check=True)
+                            st.success(f"✅ Video finale con audio salvato in '{final_video_path}'")
+                            
+                            with open(final_video_path, "rb") as f:
+                                st.download_button(
+                                    "⬇️ Scarica il Video con Audio",
+                                    f,
+                                    file_name=f"videosound_sottrattiva_{base_name_output}_{output_resolution_choice.replace(' ', '_')}.mp4",
+                                    mime="video/mp4"
+                                )
+                            
+                            for temp_f in [video_input_path, audio_output_path, final_video_path]:
+                                if os.path.exists(temp_f):
+                                    os.remove(temp_f)
+                            st.info("🗑️ File temporanei puliti.")
+
+                        except subprocess.CalledProcessError as e:
+                            st.error(f"❌ Errore FFmpeg durante l'unione/ricodifica: {e.stderr.decode()}")
+                            st.code(e.stdout.decode() + e.stderr.decode()) 
+                        except Exception as e:
+                            st.error(f"❌ Errore generico durante l'unione/ricodifica: {str(e)}")
+                else:
+                    st.warning(f"⚠️ FFmpeg non trovato. Il video con audio non può essere unito o ricodificato. L'audio generato è disponibile in '{audio_output_path}'.")
+                    with open(audio_output_path, "rb") as f:
+                        st.download_button(
+                            "⬇️ Scarica Solo Audio (WAV temporaneo)",
+                            f,
+                            file_name=f"videosound_sottrattiva_audio_{base_name_output}.wav",
+                            mime="audio/wav"
+                        )
 
 
 if __name__ == "__main__":
