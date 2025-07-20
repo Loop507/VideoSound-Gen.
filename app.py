@@ -531,7 +531,8 @@ class AudioGenerator:
 
         for i in range(num_frames):
             frame_start_sample = i * self.samples_per_frame
-            frame_end_sample = min((i + 1) * self.samples_per_per_frame, len(filtered_audio))
+            # FIX: Cambiato self.samples_per_per_frame in self.samples_per_frame
+            frame_end_sample = min((i + 1) * self.samples_per_frame, len(filtered_audio)) 
             
             audio_segment = filtered_audio[frame_start_sample:frame_end_sample]
             if audio_segment.size == 0: continue 
@@ -648,7 +649,8 @@ class AudioGenerator:
         
         for i in range(num_frames):
             frame_start_sample = i * self.samples_per_frame
-            frame_end_sample = min((i + 1) * self.samples_per_frame, len(modulated_audio))
+            # FIX: Cambiato self.samples_per_per_frame in self.samples_per_frame
+            frame_end_sample = min((i + 1) * self.samples_per_frame, len(modulated_audio)) 
             
             if frame_start_sample >= frame_end_sample:
                 continue
@@ -987,10 +989,10 @@ def main():
                     min_carrier_freq_user, max_carrier_freq_user,
                     min_modulator_freq_user, max_modulator_freq_user,
                     min_mod_index_user, max_mod_index_user, 
-                    progress_bar=audio_progress_bar, # Ora keyword argument
-                    status_text=audio_status_text   # Ora keyword argument
+                    progress_bar=audio_progress_bar, 
+                    status_text=audio_status_text   
                 )
-                combined_audio_layers += fm_layer * 0.5 # Aggiungi con un peso ridotto
+                combined_audio_layers += fm_layer * 0.5 
                 st.success("✅ Strato FM generato e combinato!")
 
             # --- Aggiungi lo strato Granulare se abilitato ---
@@ -1003,36 +1005,34 @@ def main():
                     min_grain_freq, max_grain_freq,
                     min_grain_density, max_grain_density,
                     min_grain_duration, max_grain_duration, 
-                    progress_bar=audio_progress_bar, # Ora keyword argument
-                    status_text=audio_status_text   # Ora keyword argument
+                    progress_bar=audio_progress_bar, 
+                    status_text=audio_status_text   
                 )
-                combined_audio_layers += granular_layer * 0.5 # Aggiungi con un peso ridotto
+                combined_audio_layers += granular_layer * 0.5 
                 st.success("✅ Strato Granulare generato e combinato!")
 
             # --- Aggiungi il layer di Rumore se abilitato ---
             if enable_noise_effect:
-                # Applica il rumore all'audio combinato fino a questo punto
                 combined_audio_layers = audio_gen.add_noise_layer(
                     combined_audio_layers, 
                     detail_data,
                     min_noise_amp_user, 
                     max_noise_amp_user, 
-                    progress_bar=audio_progress_bar, # Ora keyword argument
-                    status_text=audio_status_text   # Ora keyword argument
+                    progress_bar=audio_progress_bar, 
+                    status_text=audio_status_text   
                 )
                 st.success("✅ Strato Rumore aggiunto!")
 
             # --- Applica effetti Glitch se abilitati ---
             if enable_glitch_effect:
-                # Applica il glitch all'audio combinato fino a questo punto
                 combined_audio_layers = audio_gen.apply_glitch_effect(
                     combined_audio_layers, 
                     variation_movement_data,
                     glitch_threshold_user, 
                     glitch_duration_frames_user,
                     glitch_intensity_user, 
-                    progress_bar=audio_progress_bar, # Ora keyword argument
-                    status_text=audio_status_text   # Ora keyword argument
+                    progress_bar=audio_progress_bar, 
+                    status_text=audio_status_text   
                 )
                 st.success("✅ Effetti Glitch applicati!")
 
@@ -1050,8 +1050,8 @@ def main():
                         max_pitch_shift_semitones=max_pitch_shift_semitones,
                         min_time_stretch_rate=min_time_stretch_rate,
                         max_time_stretch_rate=max_time_stretch_rate, 
-                        progress_bar=audio_progress_bar, # Ora keyword argument
-                        status_text=audio_status_text   # Ora keyword argument
+                        progress_bar=audio_progress_bar, 
+                        status_text=audio_status_text   
                     )
                     st.success("✅ Effetti pitch e stretch applicati!")
                 else:
@@ -1068,9 +1068,9 @@ def main():
                         min_cutoff=min_cutoff_adv,
                         max_cutoff=max_cutoff_adv,
                         min_res=min_resonance_adv,
-                        max_res=max_resonance_adv,
-                        progress_bar=audio_progress_bar,  # Ora keyword argument
-                        status_text=audio_status_text,     # Ora keyword argument
+                        max_res=max_res_adv,
+                        progress_bar=audio_progress_bar,  
+                        status_text=audio_status_text,     
                         filter_type=filter_type_user
                     )
                     st.success("✅ Filtri avanzati applicati!")
@@ -1080,8 +1080,8 @@ def main():
                         processed_audio,
                         variation_movement_data,
                         detail_data,
-                        progress_bar=audio_progress_bar, # Ora keyword argument
-                        status_text=audio_status_text,    # Ora keyword argument
+                        progress_bar=audio_progress_bar, 
+                        status_text=audio_status_text,    
                         effect_type=modulation_effect_type,
                         intensity=modulation_intensity,
                         rate=modulation_rate
@@ -1095,8 +1095,8 @@ def main():
                         detail_data,
                         max_delay_time_user,
                         max_delay_feedback_user,
-                        progress_bar=audio_progress_bar, # Ora keyword argument
-                        status_text=audio_status_text    # Ora keyword argument
+                        progress_bar=audio_progress_bar, 
+                        status_text=audio_status_text    
                     )
                     st.success("✅ Effetto Delay applicato!")
 
@@ -1107,8 +1107,8 @@ def main():
                         brightness_data,
                         max_reverb_decay_user,
                         max_reverb_wet_user,
-                        progress_bar=audio_progress_bar, # Ora keyword argument
-                        status_text=audio_status_text    # Ora keyword argument
+                        progress_bar=audio_progress_bar, 
+                        status_text=audio_status_text    
                     )
                     st.success("✅ Effetto Riverbero applicato!")
                 else:
@@ -1128,8 +1128,8 @@ def main():
                 final_audio_stereo = audio_gen.apply_panning(
                     processed_audio, 
                     horizontal_center_data, 
-                    progress_bar=audio_progress_bar, # Ora keyword argument
-                    status_text=audio_status_text   # Ora keyword argument
+                    progress_bar=audio_progress_bar, 
+                    status_text=audio_status_text   
                 )
                 st.success("✅ Normalizzazione e Panoramica Stereo completate!")
 
