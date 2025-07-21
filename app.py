@@ -502,8 +502,16 @@ def main():
     # Variabili per memorizzare i parametri scelti dall'utente per la descrizione finale
     params = {}
 
+    # Inizializza audio_output_path e base_name_output a None per evitare UnboundLocalError
+    # Saranno sovrascritti se il pulsante viene cliccato e la generazione audio avviene.
+    audio_output_path = None
+    base_name_output = None
+
     if uploaded_file is not None:
         if not validate_video_file(uploaded_file):
+            # Se la validazione fallisce, pulisci il file caricato e termina
+            if os.path.exists(f"temp_input_{uploaded_file.name}"):
+                os.remove(f"temp_input_{uploaded_file.name}")
             return
 
         st.sidebar.success("✅ Video caricato con successo!")
@@ -518,6 +526,9 @@ def main():
         if duration_seconds == 0.0: # Se l'analisi fallisce o video troppo corto/lungo
             os.remove(video_input_path)
             return
+
+        # base_name_output è ora definito qui, prima dell'uso condizionale
+        base_name_output = os.path.splitext(uploaded_file.name)[0]
 
         st.subheader("Generazione Audio")
         
@@ -871,77 +882,89 @@ def main():
 
 
         if st.button("Genera Video con Audio"):
+            # Sempre tenta la generazione audio se il pulsante è cliccato
+            st.info("🎵 Generazione e mixaggio audio in corso... Attendere.")
+            progress_bar_audio = st.progress(0)
+            status_text_audio = st.empty()
+
+            combined_audio = np.zeros(audio_generator.total_samples, dtype=np.float32)
+
+            # Generazione dei Layer Audio
+            if use_subtractive:
+                subtractive_audio = audio_generator.generate_subtractive_waveform(sub_freq_scaled, sub_amp_scaled, sub_waveform_type)
+                combined_audio += subtractive_audio
+            
+            if use_fm:
+                fm_audio = audio_generator.generate_fm_layer(fm_carrier_scaled, fm_mod_scaled, fm_mod_idx_scaled, fm_amp_scaled)
+                combined_audio += fm_audio
+
+            if use_granular:
+                granular_audio = audio_generator.generate_granular_layer(gran_density_scaled, gran_duration_scaled, gran_amp_scaled)
+                combined_audio += granular_audio
+
+            if use_noise:
+                noise_audio = audio_generator.add_noise_layer(combined_audio, noise_amp_scaled)
+                combined_audio += noise_audio # Aggiungi al combined_audio esistente
+
+            progress_bar_audio.progress(30)
+            status_text_audio.text("Applicazione effetti audio...")
+
+            # Applicazione degli Effetti Audio
+            if use_glitch:
+                combined_audio = audio_generator.apply_glitch_effect(combined_audio, glitch_factor_scaled, glitch_intensity_data)
+            
+            if use_delay:
+                combined_audio = audio_generator.apply_delay_effect(combined_audio, delay_time_scaled, delay_feedback_scaled)
+
+            if use_reverb:
+                combined_audio = audio_generator.apply_reverb_effect(combined_audio, reverb_decay_scaled, reverb_mix_scaled)
+
+            if use_eq:
+                combined_audio = audio_generator.apply_eq_effect(combined_audio, eq_low_scaled, eq_mid_scaled, eq_high_scaled)
+
+            progress_bar_audio.progress(70)
+            status_text_audio.text("Normalizzazione audio...")
+
+            if normalize_audio:
+                # Prevenire divisione per zero se l'audio è silenzioso
+                if np.max(np.abs(combined_audio)) > 1e-6:
+                    combined_audio = librosa.util.normalize(combined_audio)
+                else:
+                    combined_audio = np.zeros_like(combined_audio) # Mantieni a zero se già silenzioso
+
+            # Assicurati che l'audio sia nel range [-1, 1] per soundfile
+            combined_audio = np.clip(combined_audio, -1.0, 1.0)
+            
+            # audio_output_path è assegnato qui, sempre se il pulsante è cliccato
+            audio_output_path = "output_audio.wav"
+            sf.write(audio_output_path, combined_audio, AUDIO_SAMPLE_RATE)
+            
+            progress_bar_audio.progress(100)
+            status_text_audio.text("Audio generato!")
+            st.success("✅ Audio generato con successo!")
+            
+            gc.collect() # Libera memoria
+
+            # Ora controlla FFmpeg DOPO la generazione audio
             if not check_ffmpeg():
-                st.error("❌ FFmpeg non è installato o non è nel PATH. Impossibile processare il video.")
-                st.info("Per favore, installa FFmpeg e assicurati che sia accessibile dal terminale.")
-            else:
-                st.info("🎵 Generazione e mixaggio audio in corso... Attendere.")
-                progress_bar_audio = st.progress(0)
-                status_text_audio = st.empty()
-
-                combined_audio = np.zeros(audio_generator.total_samples, dtype=np.float32)
-
-                # Generazione dei Layer Audio
-                if use_subtractive:
-                    subtractive_audio = audio_generator.generate_subtractive_waveform(sub_freq_scaled, sub_amp_scaled, sub_waveform_type)
-                    combined_audio += subtractive_audio
-                
-                if use_fm:
-                    fm_audio = audio_generator.generate_fm_layer(fm_carrier_scaled, fm_mod_scaled, fm_mod_idx_scaled, fm_amp_scaled)
-                    combined_audio += fm_audio
-
-                if use_granular:
-                    granular_audio = audio_generator.generate_granular_layer(gran_density_scaled, gran_duration_scaled, gran_amp_scaled)
-                    combined_audio += granular_audio
-
-                if use_noise:
-                    noise_audio = audio_generator.add_noise_layer(combined_audio, noise_amp_scaled)
-                    combined_audio += noise_audio # Aggiungi al combined_audio esistente
-
-                progress_bar_audio.progress(30)
-                status_text_audio.text("Applicazione effetti audio...")
-
-                # Applicazione degli Effetti Audio
-                if use_glitch:
-                    combined_audio = audio_generator.apply_glitch_effect(combined_audio, glitch_factor_scaled, glitch_intensity_data)
-                
-                if use_delay:
-                    combined_audio = audio_generator.apply_delay_effect(combined_audio, delay_time_scaled, delay_feedback_scaled)
-
-                if use_reverb:
-                    combined_audio = audio_generator.apply_reverb_effect(combined_audio, reverb_decay_scaled, reverb_mix_scaled)
-
-                if use_eq:
-                    combined_audio = audio_generator.apply_eq_effect(combined_audio, eq_low_scaled, eq_mid_scaled, eq_high_scaled)
-
-                progress_bar_audio.progress(70)
-                status_text_audio.text("Normalizzazione audio...")
-
-                if normalize_audio:
-                    # Prevenire divisione per zero se l'audio è silenzioso
-                    if np.max(np.abs(combined_audio)) > 1e-6:
-                        combined_audio = librosa.util.normalize(combined_audio)
-                    else:
-                        combined_audio = np.zeros_like(combined_audio) # Mantieni a zero se già silenzioso
-
-                # Assicurati che l'audio sia nel range [-1, 1] per soundfile
-                combined_audio = np.clip(combined_audio, -1.0, 1.0)
-                
-                audio_output_path = "output_audio.wav"
-                sf.write(audio_output_path, combined_audio, AUDIO_SAMPLE_RATE)
-                
-                progress_bar_audio.progress(100)
-                status_text_audio.text("Audio generato!")
-                st.success("✅ Audio generato con successo!")
-                
-                gc.collect() # Libera memoria
-
-                # Processo FFmpeg
+                st.warning(f"⚠️ FFmpeg non è installato o non è nel PATH. Impossibile unire il video con l'audio. L'audio generato è disponibile in '{audio_output_path}'.")
+                with open(audio_output_path, "rb") as f:
+                    st.download_button(
+                        "⬇️ Scarica Solo Audio (WAV temporaneo)",
+                        f,
+                        file_name=f"videosound_generato_audio_{base_name_output}.wav",
+                        mime="audio/wav"
+                    )
+                # Pulisci i file temporanei ANCHE se FFmpeg non è stato trovato
+                for temp_f in [video_input_path, audio_output_path]:
+                    if temp_f and os.path.exists(temp_f):
+                        os.remove(temp_f)
+                st.info("🗑️ File temporanei puliti.")
+            else: # FFmpeg è disponibile, procedi con l'unione di video e audio
                 st.info("🎥 Unione audio/video e ricodifica in corso... Potrebbe richiedere del tempo.")
                 progress_bar_video = st.progress(0)
                 status_text_video = st.empty()
 
-                base_name_output = os.path.splitext(uploaded_file.name)[0]
                 final_video_path = f"output_{base_name_output}_{output_resolution_choice.replace(' ', '_')}.mp4"
                 
                 ffmpeg_command = ["ffmpeg", "-y"]
@@ -1030,7 +1053,7 @@ def main():
                         )
                     
                     # Pulisci i file temporanei
-                    for temp_f in [video_input_path, audio_output_path, temp_original_audio_path if use_original_audio else None]:
+                    for temp_f in [video_input_path, audio_output_path, temp_original_audio_path if use_original_audio else None, final_video_path]:
                         if temp_f and os.path.exists(temp_f):
                             os.remove(temp_f)
                     st.info("🗑️ File temporanei puliti.")
@@ -1038,19 +1061,23 @@ def main():
                 except subprocess.CalledProcessError as e:
                     st.error(f"❌ Errore FFmpeg durante l'unione/ricodifica: {e.stderr.decode()}")
                     st.code(e.stdout.decode() + e.stderr.decode())
+                    # Pulisci i file temporanei anche in caso di errore FFmpeg
+                    for temp_f in [video_input_path, audio_output_path, temp_original_audio_path if use_original_audio else None]:
+                        if temp_f and os.path.exists(temp_f):
+                            os.remove(temp_f)
+                    st.info("🗑️ File temporanei puliti.")
                 except Exception as e:
                     st.error(f"❌ Errore generico durante l'unione/ricodifica: {str(e)}")
-        else: # Questo else è correttamente allineato con if st.button
-            st.warning(f"⚠️ FFmpeg non trovato. Il video con audio non può essere unito o ricodificato. L'audio generato è disponibile in '{audio_output_path}'.")
-            with open(audio_output_path, "rb") as f:
-                st.download_button(
-                    "⬇️ Scarica Solo Audio (WAV temporaneo)",
-                    f,
-                    file_name=f"videosound_generato_audio_{base_name_output}.wav",
-                    mime="audio/wav"
-                )
+                    # Pulisci i file temporanei anche in caso di errore generico
+                    for temp_f in [video_input_path, audio_output_path, temp_original_audio_path if use_original_audio else None]:
+                        if temp_f and os.path.exists(temp_f):
+                            os.remove(temp_f)
+                    st.info("🗑️ File temporanei puliti.")
+        # Non c'è più un blocco 'else' diretto per 'if st.button' che usi audio_output_path
+        # La logica del "FFmpeg non trovato" è ora gestita all'interno del blocco 'if st.button'
+        # Questo previene l'UnboundLocalError quando il pulsante non è ancora stato cliccato.
 
-        # Modifica 2: Descrizione del brano alla fine con tutti i parametri
+
         # Questa sezione è volutamente fuori dal blocco if/else del pulsante,
         # ma all'interno dell'if uploaded_file is not None.
         st.markdown("---")
