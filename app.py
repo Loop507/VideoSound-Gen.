@@ -1120,87 +1120,107 @@ def main():
             st.error(f"❌ Errore durante il salvataggio dell'audio: {e}")
             return
 
-        ---
-        ## 📝 Resoconto di Generazione del Suono
-        Il suono che hai appena generato è il risultato di un'interazione dinamica tra le impostazioni che hai scelto e i dati estratti dal video (o definiti manualmente).
-        Questo soundscape è stato creato con **VideoSound Gen by Loop507**.
+        # --- Inizio Sezione Resoconto di Generazione del Suono ---
+        # Costruisci il testo del resoconto in modo programmatico
+        report_text = """
+---
+## 📝 Resoconto di Generazione del Suono
+Il suono che hai appena generato è il risultato di un'interazione dinamica tra le impostazioni che hai scelto e i dati estratti dal video (o definiti manualmente).
+Questo soundscape è stato creato con **VideoSound Gen by Loop507**.
 
-        ### 🚀 Riepilogo Generale
-        - **Sorgente Input:** `{input_mode}`
-        {f"- **Video Originale:** `{uploaded_file.name}`" if input_mode == "Carica un Video" and uploaded_file is not None else ""}
-        - **Durata Audio Generato:** `{video_duration:.2f}` secondi
-        - **Frequenza di Campionamento Audio:** `{AUDIO_SAMPLE_RATE}` Hz
-        - **Frame Rate di Analisi/Virtuale:** `{fps:.2f}` FPS
+### 🚀 Riepilogo Generale
+- **Sorgente Input:** `{input_mode}`
+""".format(input_mode=input_mode)
 
-        ### 🎶 Effetti e Modulazioni Applicati
-
-        {"" if not enable_subtractive_synthesis else f"""
-        ##### Sintesi Sottrattiva (Suono Base)
-        - **Forma d'Onda:** `{waveform_type_user}`
-        - **Frequenza di Taglio Filtro:** Modulata dalla **Luminosità** del video/input, variando tra `{min_cutoff_user}` Hz (luminosità bassa) e `{max_cutoff_user}` Hz (luminosità alta).
-        - **Risonanza Filtro:** Modulata dal **Dettaglio/Contrasto** del video/input, variando tra `{min_resonance_user:.1f}` Q (dettaglio basso) e `{max_resonance_user:.1f}` Q (dettaglio alto).
-        * Andamento Luminosità Media: `{np.mean(brightness_data):.2f}`. Andamento Dettaglio Medio: `{np.mean(detail_data):.2f}`.
-        * *Note:* Un aumento della luminosità tenderà ad aprire il filtro rendendo il suono più brillante. Un maggiore dettaglio aumenterà la risonanza, rendendo il suono più "aggressivo" o "tagliente".
-        """}
-
-        {"" if not enable_fm_synthesis else f"""
-        ##### Sintesi FM (Frequenza Modulata)
-        - **Frequenza Carrier:** Modulata dalla **Luminosità**, variando tra `{min_carrier_freq_user}` Hz e `{max_carrier_freq_user}` Hz.
-        - **Frequenza Modulatore:** Modulata dal **Movimento**, variando tra `{min_modulator_freq_user}` Hz e `{max_modulator_freq_user}` Hz.
-        - **Indice di Modulazione:** Modulato dal **Dettaglio/Contrasto**, variando tra `{min_mod_index_user:.1f}` e `{max_mod_index_user:.1f}`.
-        * Andamento Movimento Medio: `{np.mean(movement_data):.2f}`. Andamento Dettaglio Medio: `{np.mean(detail_data):.2f}`.
-        * *Note:* L'FM crea timbri complessi e spesso metallici. Maggiore movimento o dettaglio amplifica la modulazione, producendo suoni più ricchi e dissonanti.
-        """}
-
-        {"" if not enable_granular_synthesis else f"""
-        ##### Sintesi Granulare
-        - **Frequenza Grani:** Modulata dalla **Luminosità** (min: `{min_grain_freq}` Hz, max: `{max_grain_freq}` Hz).
-        - **Densità Grani:** Modulata dal **Movimento** (min: `{min_grain_density:.1f}`, max: `{max_grain_density:.1f}`).
-        - **Durata Grani:** Modulata dal **Dettaglio/Contrasto** (min: `{min_grain_duration:.3f}`s, max: `{max_grain_duration:.3f}`s).
-        * *Note:* La sintesi granulare 'scompone' il suono in piccole particelle (grani). Maggiore movimento e luminosità tendono a creare una texture più densa e rapida.
-        """}
-
-        {"" if not enable_noise_effect else f"""
-        ##### Effetto Rumore
-        - **Ampiezza Rumore:** Modulata dal **Dettaglio/Contrasto**, variando tra `{min_noise_amp_user:.2f}` e `{max_noise_amp_user:.2f}`.
-        * *Note:* L'aggiunta di rumore può simulare texture sabbiose o atmosferiche. Un maggiore dettaglio porta a un rumore più evidente.
-        """}
-
-        {"" if not enable_glitch_effect else f"""
-        ##### Effetto Glitch
-        - **Soglia Glitch:** `{glitch_threshold_user:.2f}` (variazione movimento oltre cui scatta il glitch).
-        - **Durata Glitch:** `{glitch_duration_frames_user}` frame.
-        - **Intensità Glitch:** `{glitch_intensity_user:.2f}`.
-        * Andamento Variazione Movimento Media: `{np.mean(variation_movement_data):.2f}`.
-        * *Note:* I glitch sono attivati da cambiamenti rapidi nel movimento del video/input, creando interruzioni o distorsioni nel suono.
-        """}
+        if input_mode == "Carica un Video" and uploaded_file is not None:
+            report_text += f"- **Video Originale:** `{uploaded_file.name}`\n"
         
-        {"" if not enable_pitch_time_stretch else f"""
-        ##### Pitch Shifting e Time Stretching
-        - **Pitch Shift:** Modulato dalla **Luminosità**, variando tra `{min_pitch_shift_semitones}` e `{max_pitch_shift_semitones}` semitoni.
-        - **Time Stretch:** Modulato dal **Dettaglio/Contrasto**, variando tra `{min_time_stretch_rate:.2f}` (più lento) e `{max_time_stretch_rate:.2f}` (più veloce).
-        * *Note:* La luminosità può alzare o abbassare l'intonazione, mentre il dettaglio può rallentare o accelerare il tempo, alterando la percezione della durata.
-        """}
+        report_text += f"""
+- **Durata Audio Generato:** `{video_duration:.2f}` secondi
+- **Frequenza di Campionamento Audio:** `{AUDIO_SAMPLE_RATE}` Hz
+- **Frame Rate di Analisi/Virtuale:** `{fps:.2f}` FPS
 
-        {"" if not enable_dynamic_effects else f"""
-        ##### Effetti Dinamici Avanzati
-        - **Filtro Avanzato:** `Abilitato` ({filter_type_user})
-        * Cutoff da **Luminosità** ({min_cutoff_adv} Hz - {max_cutoff_adv} Hz). Risonanza da **Dettaglio** ({min_resonance_adv:.1f} Q - {max_resonance_adv:.1f} Q).
-        - **Effetto di Modulazione:** `{modulation_effect_type}` (Intensità: `{modulation_intensity:.2f}`, Rate: `{modulation_rate:.2f}` Hz)
-        * Modulato da **Variazione Movimento** e **Dettaglio**.
-        - **Delay:** `Abilitato` (Max Tempo: `{max_delay_time_user:.2f}` s, Max Feedback: `{max_delay_feedback_user:.2f}`)
-        * Modulato da **Movimento** e **Dettaglio**.
-        - **Riverbero:** `Abilitato` (Max Decay: `{max_reverb_decay_user:.2f}` s, Max Wet: `{max_reverb_wet_user:.2f}`)
-        * Modulato da **Dettaglio** e **Luminosità**.
-        """}
+### 🎶 Effetti e Modulazioni Applicati
+"""
 
-        ##### Panning Stereo
-        - L'audio è stato panoramizzato tra sinistra e destra in base alla posizione del **Centro di Massa Orizzontale** del video/input.
-        * Andamento Centro Orizzontale Medio: `{np.mean(horizontal_center_data):.2f}` (0.0=sinistra, 1.0=destra).
+        if enable_subtractive_synthesis:
+            report_text += f"""
+##### Sintesi Sottrattiva (Suono Base)
+- **Forma d'Onda:** `{waveform_type_user}`
+- **Frequenza di Taglio Filtro:** Modulata dalla **Luminosità** del video/input, variando tra `{min_cutoff_user}` Hz (luminosità bassa) e `{max_cutoff_user}` Hz (luminosità alta).
+- **Risonanza Filtro:** Modulata dal **Dettaglio/Contrasto** del video/input, variando tra `{min_resonance_user:.1f}` Q (dettaglio basso) e `{max_resonance_user:.1f}` Q (dettaglio alto).
+* Andamento Luminosità Media: `{np.mean(brightness_data):.2f}`. Andamento Dettaglio Medio: `{np.mean(detail_data):.2f}`.
+* *Note:* Un aumento della luminosità tenderà ad aprire il filtro rendendo il suono più brillante. Un maggiore dettaglio aumenterà la risonanza, rendendo il suono più "aggressivo" o "tagliente".
+"""
 
-        ---
-        Speriamo che questo resoconto ti aiuti a comprendere meglio il processo creativo e il legame tra le immagini (o i tuoi parametri) e il suono generato!
-        ---
+        if enable_fm_synthesis:
+            report_text += f"""
+##### Sintesi FM (Frequenza Modulata)
+- **Frequenza Carrier:** Modulata dalla **Luminosità**, variando tra `{min_carrier_freq_user}` Hz e `{max_carrier_freq_user}` Hz.
+- **Frequenza Modulatore:** Modulata dal **Movimento**, variando tra `{min_modulator_freq_user}` Hz e `{max_modulator_freq_user}` Hz.
+- **Indice di Modulazione:** Modulato dal **Dettaglio/Contrasto**, variando tra `{min_mod_index_user:.1f}` e `{max_mod_index_user:.1f}`.
+* Andamento Movimento Medio: `{np.mean(movement_data):.2f}`. Andamento Dettaglio Medio: `{np.mean(detail_data):.2f}`.
+* *Note:* L'FM crea timbri complessi e spesso metallici. Maggiore movimento o dettaglio amplifica la modulazione, producendo suoni più ricchi e dissonanti.
+"""
+
+        if enable_granular_synthesis:
+            report_text += f"""
+##### Sintesi Granulare
+- **Frequenza Grani:** Modulata dalla **Luminosità** (min: `{min_grain_freq}` Hz, max: `{max_grain_freq}` Hz).
+- **Densità Grani:** Modulata dal **Movimento** (min: `{min_grain_density:.1f}`, max: `{max_grain_density:.1f}`).
+- **Durata Grani:** Modulata dal **Dettaglio/Contrasto** (min: `{min_grain_duration:.3f}`s, max: `{max_grain_duration:.3f}`s).
+* *Note:* La sintesi granulare 'scompone' il suono in piccole particelle (grani). Maggiore movimento e luminosità tendono a creare una texture più densa e rapida.
+"""
+
+        if enable_noise_effect:
+            report_text += f"""
+##### Effetto Rumore
+- **Ampiezza Rumore:** Modulata dal **Dettaglio/Contrasto**, variando tra `{min_noise_amp_user:.2f}` e `{max_noise_amp_user:.2f}`.
+* *Note:* L'aggiunta di rumore può simulare texture sabbiose o atmosferiche. Un maggiore dettaglio porta a un rumore più evidente.
+"""
+
+        if enable_glitch_effect:
+            report_text += f"""
+##### Effetto Glitch
+- **Soglia Glitch:** `{glitch_threshold_user:.2f}` (variazione movimento oltre cui scatta il glitch).
+- **Durata Glitch:** `{glitch_duration_frames_user}` frame.
+- **Intensità Glitch:** `{glitch_intensity_user:.2f}`.
+* Andamento Variazione Movimento Media: `{np.mean(variation_movement_data):.2f}`.
+* *Note:* I glitch sono attivati da cambiamenti rapidi nel movimento del video/input, creando interruzioni o distorsioni nel suono.
+"""
+        
+        if enable_pitch_time_stretch:
+            report_text += f"""
+##### Pitch Shifting e Time Stretching
+- **Pitch Shift:** Modulato dalla **Luminosità**, variando tra `{min_pitch_shift_semitones}` e `{max_pitch_shift_semitones}` semitoni.
+- **Time Stretch:** Modulato dal **Dettaglio/Contrasto**, variando tra `{min_time_stretch_rate:.2f}` (più lento) e `{max_time_stretch_rate:.2f}` (più veloce).
+* *Note:* La luminosità può alzare o abbassare l'intonazione, mentre il dettaglio può rallentare o accelerare il tempo, alterando la percezione della durata.
+"""
+
+        if enable_dynamic_effects:
+            report_text += f"""
+##### Effetti Dinamici Avanzati
+- **Filtro Avanzato:** `Abilitato` ({filter_type_user})
+* Cutoff da **Luminosità** ({min_cutoff_adv} Hz - {max_cutoff_adv} Hz). Risonanza da **Dettaglio** ({min_resonance_adv:.1f} Q - {max_resonance_adv:.1f} Q).
+- **Effetto di Modulazione:** `{modulation_effect_type}` (Intensità: `{modulation_intensity:.2f}`, Rate: `{modulation_rate:.2f}` Hz)
+* Modulato da **Variazione Movimento** e **Dettaglio**.
+- **Delay:** `Abilitato` (Max Tempo: `{max_delay_time_user:.2f}` s, Max Feedback: `{max_delay_feedback_user:.2f}`)
+* Modulato da **Movimento** e **Dettaglio**.
+- **Riverbero:** `Abilitato` (Max Decay: `{max_reverb_decay_user:.2f}` s, Max Wet: `{max_reverb_wet_user:.2f}`)
+* Modulato da **Dettaglio** e **Luminosità**.
+"""
+
+        report_text += f"""
+##### Panning Stereo
+- L'audio è stato panoramizzato tra sinistra e destra in base alla posizione del **Centro di Massa Orizzontale** del video/input.
+* Andamento Centro Orizzontale Medio: `{np.mean(horizontal_center_data):.2f}` (0.0=sinistra, 1.0=destra).
+
+---
+Speriamo che questo resoconto ti aiuti a comprendere meglio il processo creativo e il legame tra le immagini (o i tuoi parametri) e il suono generato!
+---
+"""
+        # Ora passa la stringa completa a st.markdown
+        st.markdown(report_text)
 
         # --- Sezione Download ---
         if download_option == "Solo Audio":
