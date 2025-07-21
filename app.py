@@ -1,3 +1,12 @@
+Hai riscontrato un altro `ValueError`, questa volta nella funzione `apply_glitch_effect` alla riga 315, durante l'assegnazione: `glitched_audio[start_glitch_sample:end_glitch_sample] = glitched_segment`.
+
+Questo errore è simile al precedente e indica che la lunghezza dell'array `glitched_segment` non corrisponde esattamente alla lunghezza dello slice `glitched_audio[start_glitch_sample:end_glitch_sample]` a cui stai cercando di assegnare.
+
+Il problema si verifica principalmente quando il tipo di glitch è "repeat" e `np.tile` crea un segmento ripetuto più lungo della porzione di audio a cui dovrebbe essere applicato il glitch. Ho modificato la logica per garantire che `glitched_segment` abbia sempre la lunghezza esatta dello slice di destinazione, sia troncandolo che riempiendolo con zeri se necessario.
+
+Sostituisci il contenuto del tuo file `app.py` con il codice seguente, che include questa correzione:
+
+```python
 import streamlit as st
 import numpy as np
 import cv2
@@ -306,15 +315,23 @@ class AudioGenerator:
 
                         if glitch_type == "repeat":
                             repeat_count = np.random.randint(1, 3)
-                            # Assicurati che il tile sia della stessa forma del segmento
-                            glitched_segment = np.tile(segment, repeat_count)
-                            if glitched_segment.ndim == 1:
-                                glitched_segment = glitched_segment[:len(segment)]
+                            # Create a temporary repeated segment
+                            temp_repeated_segment = np.tile(segment, repeat_count)
+                            
+                            # Ensure glitched_segment has the exact length of the target slice (len(segment))
+                            if temp_repeated_segment.ndim == 1:
+                                glitched_segment = temp_repeated_segment[:len(segment)]
+                                # If it's still too short (e.g. if original segment was extremely short), pad it
+                                if len(glitched_segment) < len(segment):
+                                    glitched_segment = np.pad(glitched_segment, (0, len(segment) - len(glitched_segment)))
                             else: # Stereo
-                                glitched_segment = glitched_segment[:segment.shape[0], :]
+                                glitched_segment = temp_repeated_segment[:segment.shape[0], :]
+                                if glitched_segment.shape[0] < segment.shape[0]:
+                                    glitched_segment = np.pad(glitched_segment, ((0, segment.shape[0] - glitched_segment.shape[0]), (0,0)))
                             glitched_audio[start_glitch_sample:end_glitch_sample] = glitched_segment
+
                         elif glitch_type == "noise":
-                            # CORREZIONE: Genera il rumore con la stessa forma del segmento
+                            # Genera il rumore con la stessa forma del segmento
                             glitch_noise = np.random.normal(0, glitch_intensity * 0.5, size=segment.shape)
                             glitched_audio[start_glitch_sample:end_glitch_sample] = glitch_noise
                         elif glitch_type == "reverse":
@@ -1033,3 +1050,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+```
