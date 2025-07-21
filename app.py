@@ -10,644 +10,1022 @@ import soundfile as sf
 from scipy.signal import butter, lfilter
 import librosa
 import librosa.display
-import time # Importa il modulo time
+import time
+from scipy.ndimage import uniform_filter1d
 
-# --- COSTANTI GLOBALI ---
-AUDIO_SAMPLE_RATE = 44100 # Hz
-AUDIO_FPS = 30 # Frame rate per l'analisi e la generazione audio
-MAX_DURATION = 120 # Secondi, durata massima per i video/audio generati (ad esempio, 2 minuti)
+# --- Costanti ---
+AUDIO_SAMPLE_RATE = 44100  # Hz
+AUDIO_FPS = 25 # Frame rate virtuale per l'audio, se non c'è video
+MAX_DURATION = 180 # Secondi, durata massima audio/video per evitare carichi eccessivi
+FFMPEG_PATH = "ffmpeg" # Assicurati che ffmpeg sia nel PATH o specifica il percorso completo
 
+# Risoluzioni comuni per l'output video
 FORMAT_RESOLUTIONS = {
-    "Originale": (0, 0), # Mantiene la risoluzione originale del video
+    "Originale": None, # Manterrà la risoluzione originale del video caricato
+    "1080p (Full HD)": (1920, 1080),
     "720p (HD)": (1280, 720),
-    "1080p (Full HD)": (1920, 1080)
+    "480p (SD)": (854, 480)
 }
-# --- FINE COSTANTI GLOBALI ---
 
-# --- FUNZIONI HELPER ---
-
-def check_ffmpeg() -> bool:
-    """Verifica se FFmpeg è installato e accessibile nel PATH."""
+# --- Funzioni Helper ---
+def check_ffmpeg():
+    """Controlla se FFmpeg è installato e accessibile."""
     try:
-        subprocess.run(["ffmpeg", "-version"], capture_output=True, check=True)
+        subprocess.run([FFMPEG_PATH, "-version"], capture_output=True, check=True)
         return True
     except (subprocess.CalledProcessError, FileNotFoundError):
         return False
 
-def validate_video_file(uploaded_file) -> bool:
-    """Controlla la validità del file video caricato."""
-    if uploaded_file.size == 0:
-        st.error("❌ Il file video è vuoto. Carica un file valido.")
+def _map_value(
+    value: float,
+    old_min: float,
+    old_max: float,
+    new_min: float,
+    new_max: float
+) -> float:
+    """Mappa un valore da un intervallo a un altro, con clipping."""
+    if old_max == old_min:
+        return new_min # Evita divisione per zero se l'intervallo è piatto
+    
+    # Clipa il valore all'interno del vecchio intervallo prima di mapparlo
+    clipped_value = np.clip(value, old_min, old_max)
+    
+    mapped_value = new_min + (clipped_value - old_min) * (new_max - new_min) / (old_max - old_min)
+    return float(mapped_value) # Converti a float nativo per compatibilità
+
+def validate_video_file(uploaded_file):
+    """Controlla la dimensione del file video e il tipo."""
+    if uploaded_file.size > 200 * 1024 * 1024: # 200 MB limite
+        st.error("❌ Il file video è troppo grande. Dimensione massima consentita: 200 MB.")
         return False
-    if uploaded_file.type not in ["video/mp4", "video/quicktime", "video/x-msvideo", "video/x-matroska"]:
-        st.error("❌ Formato video non supportato. Carica un file MP4, MOV, AVI o MKV.")
+    if not uploaded_file.type.startswith("video/"):
+        st.error("❌ Il file caricato non è un video valido.")
         return False
-    # Puoi aggiungere qui ulteriori controlli, ad esempio sulla dimensione massima.
     return True
 
-def analyze_video_frames(video_path: str, progress_bar, status_text) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray], Optional[int], Optional[int], Optional[float], Optional[float]]:
+def analyze_video_frames(video_path: str, progress_bar, status_text) -> Tuple[
+    Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray],
+    Optional[np.ndarray], int, int, float, float
+]:
     """
-    Analizza i frame di un video per estrarre dati di luminosità, dettaglio/contrasto, movimento e centro di massa orizzontale.
-    Restituisce array di luminosità, dettaglio, movimento, variazione di movimento e centro di massa,
-    oltre a larghezza, altezza, FPS e durata del video.
+    Analizza i frame di un video per estrarre luminosità, dettaglio, movimento,
+    variazione del movimento e centro orizzontale.
     """
     cap = cv2.VideoCapture(video_path)
-
     if not cap.isOpened():
-        st.error(f"❌ Impossibile aprire il file video: {video_path}")
-        return None, None, None, None, None, None, None, None, None
+        st.error(f"❌ Impossibile aprire il video: {video_path}")
+        return None, None, None, None, None, 0, 0, 0.0, 0.0
 
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     fps = cap.get(cv2.CAP_PROP_FPS)
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    video_duration = total_frames / fps if fps > 0 else 0
+    duration = frame_count / fps if fps > 0 else 0.0
 
-    brightness_data = []
-    detail_data = []
-    movement_data = []
-    variation_movement_data = [] # Per catturare la velocità di cambiamento del movimento
-    horizontal_center_data = [] # Per il centro di massa orizzontale
+    if frame_count == 0 or fps == 0:
+        st.error("❌ Il video non contiene frame o ha un FPS pari a zero. Potrebbe essere corrotto.")
+        cap.release()
+        return None, None, None, None, None, 0, 0, 0.0, 0.0
 
-    prev_gray_frame = None
-    prev_movement = 0.0
+    brightness_values = []
+    detail_values = []
+    movement_values = []
+    horizontal_center_values = []
+    prev_frame_gray = None
 
-    frame_count = 0
-    while True:
+    start_time = time.time()
+    for i in range(frame_count):
         ret, frame = cap.read()
         if not ret:
             break
 
         gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-        # Luminosità (media dei pixel, normalizzata a 0-1)
-        brightness = np.mean(gray_frame) / 255.0
-        brightness_data.append(brightness)
+        # Luminosità (media dei pixel in scala di grigi)
+        brightness_values.append(np.mean(gray_frame) / 255.0)
 
-        # Dettaglio/Contrasto (deviazione standard dei pixel, normalizzata a 0-1)
-        detail = np.std(gray_frame) / 255.0
-        detail_data.append(detail)
+        # Dettaglio/Contrasto (varianza di Laplacian)
+        # La varianza del Laplaciano è un buon indicatore di nitidezza/dettaglio
+        laplacian_var = cv2.Laplacian(gray_frame, cv2.CV_64F).var()
+        detail_values.append(laplacian_var)
 
-        # Movimento (differenza assoluta tra frame consecutivi, normalizzata a 0-1)
-        current_movement = 0.0
-        if prev_gray_frame is not None:
-            current_movement = np.sum(cv2.absdiff(gray_frame, prev_gray_frame)) / (gray_frame.size * 255.0)
-            movement_data.append(current_movement)
+        # Movimento (differenza assoluta tra frame)
+        if prev_frame_gray is not None:
+            diff_frame = cv2.absdiff(gray_frame, prev_frame_gray)
+            movement_values.append(np.mean(diff_frame) / 255.0)
         else:
-            movement_data.append(0.0) # Primo frame ha movimento 0
+            movement_values.append(0.0) # Primo frame non ha movimento
+        prev_frame_gray = gray_frame
 
-        # Variazione del movimento (quanto velocemente cambia il movimento)
-        variation_movement = abs(current_movement - prev_movement)
-        variation_movement_data.append(variation_movement)
-        
-        # Centro di massa orizzontale
-        if np.sum(gray_frame) > 0: # Evita divisione per zero per frame completamente neri
-            moments = cv2.moments(gray_frame)
-            if moments['m00'] != 0:
-                cx = moments['m10'] / moments['m00']
-                normalized_cx = cx / width # Normalizzato tra 0 (sinistra) e 1 (destra)
-                horizontal_center_data.append(normalized_cx)
-            else:
-                horizontal_center_data.append(0.5) # Centro se il frame è nero
+        # Centro orizzontale di "attività" (basato sull'intensità orizzontale)
+        # Calcola la media delle intensità dei pixel per ogni colonna
+        column_means = np.mean(gray_frame, axis=0)
+        # Calcola il "centro di massa" delle intensità delle colonne
+        if np.sum(column_means) > 0:
+            center_x = np.sum(np.arange(width) * column_means) / np.sum(column_means)
+            horizontal_center_values.append(center_x / width) # Normalizza tra 0 e 1
         else:
-            horizontal_center_data.append(0.5) # Centro se il frame è nero
+            horizontal_center_values.append(0.5) # Centro se il frame è nero
 
-        prev_gray_frame = gray_frame
-        prev_movement = current_movement
-
-        frame_count += 1
-        progress_bar.progress(frame_count / total_frames)
-        status_text.text(f"📊 Analisi Frame {frame_count}/{total_frames} | Lum: {brightness:.2f} | Det: {detail:.2f} | Mov: {movement_data[-1]:.2f} | VarMov: {variation_movement_data[-1]:.2f} | Pan: {horizontal_center_data[-1]:.2f}")
-
+        # Aggiorna la progress bar ogni 50 frame o alla fine
+        if i % 50 == 0 or i == frame_count - 1:
+            progress = (i + 1) / frame_count
+            progress_bar.progress(progress)
+            elapsed_time = time.time() - start_time
+            estimated_total_time = elapsed_time / progress if progress > 0 else 0
+            remaining_time = estimated_total_time - elapsed_time
+            
+            status_text.text(f"Analisi: {progress*100:.1f}% completata. "
+                             f"Tempo stimato rimanente: {remaining_time:.1f}s")
+            
     cap.release()
-    gc.collect() # Libera memoria
 
-    # Assicurati che tutti gli array abbiano la stessa lunghezza
-    # A volte movement_data e variation_movement_data sono più corti di 1
-    max_len = len(brightness_data)
-    for arr in [movement_data, variation_movement_data, horizontal_center_data]:
-        if len(arr) < max_len:
-            while len(arr) < max_len:
-                # Ripeti l'ultimo valore o un valore predefinito
-                arr.append(arr[-1] if len(arr) > 0 else 0.5 if arr is horizontal_center_data else 0.0)
+    # Normalizza i valori di dettaglio e movimento
+    brightness_data = np.array(brightness_values, dtype=np.float32)
+    detail_data = np.array(detail_values, dtype=np.float32)
+    movement_data = np.array(movement_values, dtype=np.float32)
+    horizontal_center_data = np.array(horizontal_center_values, dtype=np.float32)
 
-    return np.array(brightness_data), np.array(detail_data), np.array(movement_data), np.array(variation_movement_data), np.array(horizontal_center_data), width, height, fps, video_duration
+    # Normalizzazione per Dettaglio (potrebbe essere necessario un min/max dinamico)
+    if detail_data.max() > detail_data.min():
+        detail_data = (detail_data - detail_data.min()) / (detail_data.max() - detail_data.min())
+    else:
+        detail_data = np.zeros_like(detail_data) # Tutti uguali, imposta a zero
 
-# --- CLASSE AUDIO GENERATOR ---
+    # Normalizzazione per Movimento
+    if movement_data.max() > movement_data.min():
+        movement_data = (movement_data - movement_data.min()) / (movement_data.max() - movement_data.min())
+    else:
+        movement_data = np.zeros_like(movement_data)
 
+    # Calcola la variazione del movimento (per il glitch)
+    variation_movement_data = np.abs(np.diff(movement_data, prepend=movement_data[0]))
+    # Normalizza la variazione del movimento
+    if variation_movement_data.max() > variation_movement_data.min():
+        variation_movement_data = (variation_movement_data - variation_movement_data.min()) / \
+                                  (variation_movement_data.max() - variation_movement_data.min())
+    else:
+        variation_movement_data = np.zeros_like(variation_movement_data)
+
+    # Clip finale a 0-1 per tutti i dati per sicurezza
+    brightness_data = np.clip(brightness_data, 0.0, 1.0)
+    detail_data = np.clip(detail_data, 0.0, 1.0)
+    movement_data = np.clip(movement_data, 0.0, 1.0)
+    variation_movement_data = np.clip(variation_movement_data, 0.0, 1.0)
+    horizontal_center_data = np.clip(horizontal_center_data, 0.0, 1.0)
+
+    # DEBUG: Controlla che i dati siano finiti dopo l'analisi
+    if not np.all(np.isfinite(brightness_data)):
+        st.error("❌ brightness_data contiene valori non finiti dopo l'analisi.")
+        brightness_data[~np.isfinite(brightness_data)] = 0.0
+    if not np.all(np.isfinite(detail_data)):
+        st.error("❌ detail_data contiene valori non finiti dopo l'analisi.")
+        detail_data[~np.isfinite(detail_data)] = 0.0
+    if not np.all(np.isfinite(movement_data)):
+        st.error("❌ movement_data contiene valori non finiti dopo l'analisi.")
+        movement_data[~np.isfinite(movement_data)] = 0.0
+    if not np.all(np.isfinite(variation_movement_data)):
+        st.error("❌ variation_movement_data contiene valori non finiti dopo l'analisi.")
+        variation_movement_data[~np.isfinite(variation_movement_data)] = 0.0
+    if not np.all(np.isfinite(horizontal_center_data)):
+        st.error("❌ horizontal_center_data contiene valori non finiti dopo l'analisi.")
+        horizontal_center_data[~np.isfinite(horizontal_center_data)] = 0.5 # Metti a centro
+
+    return brightness_data, detail_data, movement_data, variation_movement_data, horizontal_center_data, width, height, fps, duration
+
+# --- Classe AudioGenerator ---
 class AudioGenerator:
-    def __init__(self, sample_rate: int, video_fps: int):
+    def __init__(self, sample_rate: int, fps: int):
         self.sample_rate = sample_rate
-        self.video_fps = video_fps
-        self.fade_duration = 0.1 # Secondi per fade in/out per evitare click
+        self.fps = fps
+        self.frame_to_sample_ratio = sample_rate / fps
 
-    def _map_value(self, value, old_min, old_max, new_min, new_max):
-        """Mappa un valore da un intervallo a un altro."""
-        if old_max == old_min: # Evita divisione per zero
-            return new_min
-        mapped_value = ((value - old_min) / (old_max - old_min)) * (new_max - new_min) + new_min
-        return np.clip(mapped_value, new_min, new_max)
-
-    def _create_envelope(self, num_samples: int, attack_time: float, release_time: float) -> np.ndarray:
-        """Crea un inviluppo ADSR semplice (solo A e R)."""
-        attack_samples = int(attack_time * self.sample_rate)
-        release_samples = int(release_time * self.sample_rate)
-        
-        envelope = np.ones(num_samples, dtype=np.float32)
-        
-        if attack_samples > 0:
-            envelope[:attack_samples] = np.linspace(0, 1, attack_samples)
-        if release_samples > 0:
-            envelope[-release_samples:] = np.linspace(1, 0, release_samples)
-        
-        return envelope
+    def _map_value_to_samples(self, control_data: np.ndarray, current_frame: int, min_val: float, max_val: float) -> float:
+        """Mappa un valore di controllo basato sul frame corrente a un intervallo specificato."""
+        if current_frame >= len(control_data):
+            current_frame = len(control_data) - 1 # Evita IndexError per il padding di librosa
+        mapped_val = _map_value(control_data[current_frame], 0.0, 1.0, min_val, max_val)
+        return mapped_val
 
     def generate_subtractive_waveform(self, num_samples: int, waveform_type: str = "sawtooth") -> np.ndarray:
-        """Genera un'onda base per la sintesi sottrattiva."""
-        t = np.linspace(0, num_samples / self.sample_rate, num_samples, endpoint=False)
-        freq = 220 # Frequenza fissa di base, sarà modulata dal filtro
+        """Genera una forma d'onda base."""
+        t = np.linspace(0, num_samples / self.sample_rate, num_samples, endpoint=False, dtype=np.float32)
+        
+        # Frequenza base fissa, puoi renderla modulabile dalla luminosità se vuoi
+        base_freq = 440 # Hz
 
         if waveform_type == "sine":
-            waveform = np.sin(2 * np.pi * freq * t)
+            waveform = np.sin(2 * np.pi * base_freq * t)
         elif waveform_type == "square":
-            waveform = np.sign(np.sin(2 * np.pi * freq * t))
+            waveform = np.sign(np.sin(2 * np.pi * base_freq * t))
         elif waveform_type == "sawtooth":
-            waveform = 2 * (t * freq - np.floor(t * freq + 0.5))
+            waveform = 2 * (t * base_freq - np.floor(t * base_freq + 0.5))
         elif waveform_type == "triangle":
-            waveform = 2 * np.abs(2 * (t * freq - np.floor(t * freq + 0.5))) - 1
+            waveform = 2 * np.abs(2 * (t * base_freq - np.floor(t * base_freq + 0.5))) - 1
         else:
-            waveform = np.zeros(num_samples) # Fallback
-
-        # Applica un inviluppo per evitare click all'inizio e alla fine
-        fade_samples = int(self.fade_duration * self.sample_rate)
-        waveform[:fade_samples] *= np.linspace(0, 1, fade_samples)
-        waveform[-fade_samples:] *= np.linspace(1, 0, fade_samples)
-
-        return waveform.astype(np.float32)
-
-    def apply_dynamic_filter(self, audio_data: np.ndarray, brightness_data: np.ndarray, detail_data: np.ndarray,
-                             min_cutoff: float, max_cutoff: float, min_res: float, max_res: float,
-                             progress_bar, status_text, filter_type: str = "lowpass") -> np.ndarray:
-        """Applica un filtro dinamico (lowpass, highpass, bandpass, bandstop) modulato dai dati."""
-        filtered_audio = np.copy(audio_data)
+            waveform = np.zeros(num_samples, dtype=np.float32) # Default a silenzio se tipo sconosciuto
         
-        # Mappa i dati di analisi al frame rate audio
-        brightness_interp = np.interp(np.arange(len(audio_data)),
-                                      np.arange(len(brightness_data)) * (self.sample_rate / self.video_fps),
-                                      brightness_data)
-        detail_interp = np.interp(np.arange(len(audio_data)),
-                                  np.arange(len(detail_data)) * (self.sample_rate / self.video_fps),
-                                  detail_data)
-
-        block_size = self.sample_rate // self.video_fps # Applica il filtro per blocchi
+        return waveform
+    
+    def apply_dynamic_filter(self,
+                             audio_data: np.ndarray,
+                             brightness_data: np.ndarray,
+                             detail_data: np.ndarray,
+                             min_cutoff: float,
+                             max_cutoff: float,
+                             min_res: float,
+                             max_res: float,
+                             progress_bar,
+                             status_text,
+                             filter_type: str = "lowpass") -> np.ndarray:
+        """
+        Applica un filtro dinamico (lowpass, highpass, bandpass, bandstop) all'audio.
+        La frequenza di taglio è modulata dalla luminosità, la risonanza dal dettaglio.
+        """
+        filtered_audio = np.zeros_like(audio_data, dtype=np.float32)
         
-        for i in range(0, len(audio_data), block_size):
-            end_idx = min(i + block_size, len(audio_data))
-            current_brightness = brightness_interp[i]
-            current_detail = detail_interp[i]
+        # Interpolazione dei dati di controllo per l'audio
+        num_frames = len(brightness_data)
+        frames_indices = np.arange(num_frames)
+        audio_indices = np.linspace(0, num_frames - 1, len(audio_data))
 
-            # Mappa luminosità al cutoff
-            cutoff_freq = self._map_value(current_brightness, 0.0, 1.0, min_cutoff, max_cutoff)
-            # Mappa dettaglio alla risonanza (Q)
-            resonance_q = self._map_value(current_detail, 0.0, 1.0, min_res, max_res)
+        brightness_interp = np.interp(audio_indices, frames_indices, brightness_data)
+        detail_interp = np.interp(audio_indices, frames_indices, detail_data)
+        
+        # Clipa i valori interpolati per sicurezza
+        brightness_interp = np.clip(brightness_interp, 0.0, 1.0)
+        detail_interp = np.clip(detail_interp, 0.0, 1.0)
 
-            # Progetta il filtro
-            # 'Q' in scipy è 1/BW, mentre la risonanza audio è spesso Q. Quindi usiamo 1/Q per il BW.
-            if filter_type == "lowpass":
-                b, a = butter(2, cutoff_freq, btype='low', fs=self.sample_rate, analog=False, output='ba')
-            elif filter_type == "highpass":
-                b, a = butter(2, cutoff_freq, btype='high', fs=self.sample_rate, analog=False, output='ba')
-            elif filter_type == "bandpass":
-                nyq = 0.5 * self.sample_rate
-                low_cut = max(20, cutoff_freq - resonance_q * 10) # Semplificazione per banda
-                high_cut = min(self.sample_rate / 2 - 100, cutoff_freq + resonance_q * 10)
-                b, a = butter(2, [low_cut / nyq, high_cut / nyq], btype='band', analog=False, output='ba')
-            elif filter_type == "bandstop":
-                nyq = 0.5 * self.sample_rate
-                low_cut = max(20, cutoff_freq - resonance_q * 10) # Semplificazione per banda
-                high_cut = min(self.sample_rate / 2 - 100, cutoff_freq + resonance_q * 10)
-                b, a = butter(2, [low_cut / nyq, high_cut / nyq], btype='bandstop', analog=False, output='ba')
-            else: # Default a lowpass
-                b, a = butter(2, cutoff_freq, btype='low', fs=self.sample_rate, analog=False, output='ba')
+        # DEBUG: Controlla che gli interpolati siano finiti
+        if not np.all(np.isfinite(brightness_interp)):
+            st.warning("⚠️ brightness_interp contiene NaN/inf nel filtro. Sostituzione con 0.5.")
+            brightness_interp[~np.isfinite(brightness_interp)] = 0.5
+        if not np.all(np.isfinite(detail_interp)):
+            st.warning("⚠️ detail_interp contiene NaN/inf nel filtro. Sostituzione con 0.5.")
+            detail_interp[~np.isfinite(detail_interp)] = 0.5
+
+        # Applica una media mobile sui dati interpolati per smussare le transizioni
+        window_size = int(self.sample_rate / self.fps / 2) # Mezza finestra basata su mezzo frame
+        if window_size % 2 == 0: window_size += 1 # Assicura che sia dispari per uniform_filter1d
+        if window_size > 1:
+            brightness_interp = uniform_filter1d(brightness_interp, size=window_size)
+            detail_interp = uniform_filter1d(detail_interp, size=window_size)
+
+        for i in range(len(audio_data)):
             
-            # Applica il filtro al blocco corrente
-            filtered_audio[i:end_idx] = lfilter(b, a, audio_data[i:end_idx])
+            # Calcola cutoff e risonanza per il sample corrente
+            # La luminosità controlla la frequenza di taglio (da min_cutoff a max_cutoff)
+            current_cutoff = _map_value(brightness_interp[i], 0.0, 1.0, min_cutoff, max_cutoff)
+            
+            # Il dettaglio controlla la risonanza (da min_res a max_res)
+            current_resonance = _map_value(detail_interp[i], 0.0, 1.0, min_res, max_res)
 
-            progress_bar.progress(end_idx / len(audio_data))
-            status_text.text(f"🎧 Applicazione Filtro Dinamico... Freq: {cutoff_freq:.0f} Hz, Res: {resonance_q:.1f}")
+            # Normalizza la frequenza di taglio per butter
+            nyquist = 0.5 * self.sample_rate
+            normal_cutoff = current_cutoff / nyquist
 
+            # Limita la frequenza di taglio normalizzata per evitare problemi
+            if normal_cutoff >= 1.0:
+                normal_cutoff = 0.99
+            elif normal_cutoff <= 0.0:
+                normal_cutoff = 0.01 # Evita 0 per logaritmico, e evita frequenze non valide
+            
+            # Calcola Wn (frequenza di taglio normalizzata) e Q (risonanza) per il filtro
+            # Per butter, Wn è la frequenza normalizzata, Q è la risonanza (non direttamente mappabile 1:1 con Q del filtro risonante)
+            # Per un filtro passa-banda/stop, Wn può essere una tupla (low, high)
+            
+            # Utilizziamo un filtro IIR a stato variabile per un controllo più diretto di Q
+            # Tuttavia, scrivi un filtro a stato variabile è complesso.
+            # Per semplicità, useremo `librosa.effects.band_biquad` o filtri Butterworth
+            # `librosa` non ha filtri dinamici per Q, quindi simuliamo con Butterworth o lo escludiamo.
+
+            # Per questo esempio, usiamo Butterworth con una frequenza di taglio variabile.
+            # La risonanza Q non è direttamente un parametro del filtro Butterworth standard in scipy.
+            # Se la risonanza è cruciale, si dovrebbe usare un filtro biquad dinamico o un SVF.
+            # Per ora, la risonanza sarà un parametro "non usato" per i filtri Butterworth,
+            # o usiamo librosa.effects.band_biquad che ha un parametro Q.
+            
+            # Utilizziamo librosa.effects.band_biquad per un controllo migliore di Q
+            # Richiede l'intero audio per volta, quindi dobbiamo ricalcolare a ogni chiamata
+            # OPPURE lo applichiamo in batch più piccoli, ma è più complesso
+            # L'approccio più semplice è calcolare i parametri per ogni frame e applicare un filtro statico.
+            
+            # Per Streamlit e Librosa, la strategia migliore è applicare i filtri su blocchi audio
+            # calcolando i parametri del filtro per ogni blocco.
+            
+            # Numero di campioni per blocco (corrisponde a un "frame" audio)
+            samples_per_block = int(self.sample_rate / self.fps)
+            
+            # Calcola i coefficienti del filtro per il blocco corrente.
+            # `librosa.effects.band_biquad` è una buona scelta per un filtro dinamico
+            # ma richiede un array audio completo o blocchi.
+            
+            # Un approccio più efficiente per filtri dinamici con librosa è `librosa.effects.band_reject` etc.
+            # che non sono dinamici.
+            # Per filtri dinamici punto-per-punto, serve una propria implementazione o PyTorch/TensorFlow per DSP
+            
+            # Soluzione alternativa: applichiamo il filtro sul segnale *interpolato*
+            # Questo è un compromesso tra un filtro davvero dinamico e la performance
+            
+            # Il metodo più "librosa-friendly" per filtri dinamici implica l'uso di filtri IIR
+            # per segmenti o un design di filtro in tempo reale (complesso).
+            # Se la variazione è lenta, possiamo ricalcolare i coefficienti ogni frame.
+            
+            # Invece di applicare sample per sample (che è inefficiente),
+            # applichiamo i parametri del filtro per ogni "frame" logico del video.
+            
+        filtered_audio_blocks = []
+        
+        # Calcola i punti in cui ricalcolare il filtro
+        frame_sample_indices = (np.arange(num_frames) * self.frame_to_sample_ratio).astype(int)
+        frame_sample_indices = np.clip(frame_sample_indices, 0, len(audio_data) - 1)
+
+        for i in range(num_frames):
+            start_sample = frame_sample_indices[i]
+            end_sample = frame_sample_indices[i+1] if i + 1 < num_frames else len(audio_data)
+            
+            if start_sample >= end_sample:
+                continue # Salta blocchi vuoti
+
+            block = audio_data[start_sample:end_sample]
+
+            if len(block) == 0:
+                continue
+
+            current_cutoff = _map_value(brightness_interp[start_sample], 0.0, 1.0, min_cutoff, max_cutoff)
+            current_resonance = _map_value(detail_interp[start_sample], 0.0, 1.0, min_res, max_res)
+
+            # Normalizza la frequenza di taglio per librosa
+            nyquist = 0.5 * self.sample_rate
+            normal_cutoff = current_cutoff / nyquist
+
+            # Assicurati che cutoff sia valido per il filtro
+            if filter_type == "bandpass" or filter_type == "bandstop":
+                # Per bandpass/bandstop, serve una banda. Per ora, simuliamo con un cutoff singolo
+                # Se vogliamo una banda, dobbiamo definire anche una larghezza di banda.
+                # Per semplicità, mappiamo un singolo cutoff.
+                # Questo significa che i filtri bandpass/bandstop potrebbero non comportarsi come previsto
+                # senza un secondo parametro.
+                # Per ora, li useremo come se fossero dei lowpass/highpass centrati.
+                # Se l'utente vuole un vero bandpass, dovrebbe specificare due frequenze.
+                
+                # Per evitare errori, facciamo un cutoff singolo per Butterworth
+                # e useremo `librosa.effects.band_biquad` se è davvero un bandpass.
+                # Ma librosa.effects.band_biquad opera sull'intero segnale.
+                
+                # Ritorno a scipy.signal.butter e lfilter per gestione blocco per blocco
+                # Per Butterworth, Q non è un parametro diretto. Consideriamo solo il cutoff.
+                if normal_cutoff >= 0.99: normal_cutoff = 0.99
+                if normal_cutoff <= 0.01: normal_cutoff = 0.01
+
+                b, a = butter(4, normal_cutoff, btype=filter_type, analog=False)
+                filtered_block = lfilter(b, a, block)
+            else: # lowpass, highpass
+                if normal_cutoff >= 0.99: normal_cutoff = 0.99
+                if normal_cutoff <= 0.01: normal_cutoff = 0.01
+                
+                b, a = butter(4, normal_cutoff, btype=filter_type, analog=False)
+                filtered_block = lfilter(b, a, block)
+            
+            filtered_audio_blocks.append(filtered_block)
+            
+            if i % (num_frames // 100 + 1) == 0: # Aggiorna la progress bar
+                progress = (i + 1) / num_frames
+                progress_bar.progress(progress)
+                status_text.text(f"Applicazione Filtro: {progress*100:.1f}% completata.")
+        
+        # Concatena tutti i blocchi filtrati
+        # Assicurati che la lunghezza finale sia uguale a quella di input
+        concatenated_audio = np.concatenate(filtered_audio_blocks)
+        
+        # Pad o taglia per adattarsi alla lunghezza originale
+        if len(concatenated_audio) < len(audio_data):
+            padded_audio = np.pad(concatenated_audio, (0, len(audio_data) - len(concatenated_audio)), 'constant')
+            filtered_audio = padded_audio
+        elif len(concatenated_audio) > len(audio_data):
+            filtered_audio = concatenated_audio[:len(audio_data)]
+        else:
+            filtered_audio = concatenated_audio
+            
         return filtered_audio
 
-    def generate_fm_layer(self, num_samples: int, brightness_data: np.ndarray, movement_data: np.ndarray,
-                          min_carrier_freq: float, max_carrier_freq: float,
-                          min_modulator_freq: float, max_modulator_freq: float,
-                          min_mod_index: float, max_mod_index: float,
-                          progress_bar, status_text) -> np.ndarray:
-        """Genera un layer audio usando la sintesi FM, modulata da luminosità, movimento e dettaglio."""
+    def generate_fm_layer(self,
+                          num_samples: int,
+                          brightness_data: np.ndarray,
+                          movement_data: np.ndarray, # Usato per modulare la frequenza del modulatore
+                          min_carrier_freq: float,
+                          max_carrier_freq: float,
+                          min_modulator_freq: float,
+                          max_modulator_freq: float,
+                          min_mod_index: float,
+                          max_mod_index: float,
+                          progress_bar,
+                          status_text) -> np.ndarray:
+        """Genera un layer audio usando la sintesi FM."""
         fm_layer = np.zeros(num_samples, dtype=np.float32)
-        t = np.linspace(0, num_samples / self.sample_rate, num_samples, endpoint=False)
+        t = np.linspace(0, num_samples / self.sample_rate, num_samples, endpoint=False, dtype=np.float32)
 
-        # Interpola i dati di controllo per allinearli ai campioni audio
-        brightness_interp = np.interp(t, np.arange(len(brightness_data)) / self.video_fps, brightness_data)
-        movement_interp = np.interp(t, np.arange(len(movement_data)) / self.video_fps, movement_data)
-        # Assumiamo che il dettaglio_data sia lo stesso di movement_data per l'indice di modulazione per semplicità qui,
-        # ma potresti passare un dettaglio_data separato se lo desideri.
-        detail_interp = movement_interp # Puoi usare detail_data effettivo se lo hai
+        num_frames = len(brightness_data)
+        frames_indices = np.arange(num_frames)
+        audio_indices = np.linspace(0, num_frames - 1, num_samples)
 
-        for i in range(num_samples):
-            # Modula la frequenza portante (carrier) con la luminosità
-            carrier_freq = self._map_value(brightness_interp[i], 0.0, 1.0, min_carrier_freq, max_carrier_freq)
-            
-            # Modula la frequenza modulante con il movimento
-            modulator_freq = self._map_value(movement_interp[i], 0.0, 1.0, min_modulator_freq, max_modulator_freq)
-            
-            # Modula l'indice di modulazione con il dettaglio
-            mod_index = self._map_value(detail_interp[i], 0.0, 1.0, min_mod_index, max_mod_index)
+        carrier_freq_interp = np.interp(audio_indices, frames_indices, brightness_data)
+        modulator_freq_interp = np.interp(audio_indices, frames_indices, movement_data)
+        mod_index_interp = np.interp(audio_indices, frames_indices, detail_data) # Usiamo detail per l'indice
 
-            # Calcola il valore del campione FM
-            fm_layer[i] = np.sin(2 * np.pi * carrier_freq * t[i] + mod_index * np.sin(2 * np.pi * modulator_freq * t[i]))
-
-            if i % (self.sample_rate * 2) == 0: # Aggiorna ogni 2 secondi per performance
-                progress_bar.progress(i / num_samples)
-                status_text.text(f"🎵 Generazione FM... Carr: {carrier_freq:.0f}Hz, Mod: {modulator_freq:.0f}Hz, Index: {mod_index:.1f}")
+        carrier_freq_interp = _map_value(carrier_freq_interp, 0.0, 1.0, min_carrier_freq, max_carrier_freq)
+        modulator_freq_interp = _map_value(modulator_freq_interp, 0.0, 1.0, min_modulator_freq, max_modulator_freq)
+        mod_index_interp = _map_value(mod_index_interp, 0.0, 1.0, min_mod_index, max_mod_index)
         
-        # Applica inviluppo per fade
-        fade_samples = int(self.fade_duration * self.sample_rate)
-        fm_layer[:fade_samples] *= np.linspace(0, 1, fade_samples)
-        fm_layer[-fade_samples:] *= np.linspace(1, 0, fade_samples)
+        # Evita divisioni per zero o valori estremi
+        carrier_freq_interp = np.clip(carrier_freq_interp, 10.0, 20000.0)
+        modulator_freq_interp = np.clip(modulator_freq_interp, 1.0, 1000.0)
+        mod_index_interp = np.clip(mod_index_interp, 0.0, 100.0) # Limita l'indice di modulazione per prevenire overflow
 
-        return fm_layer.astype(np.float32)
+        # Accumulatori di fase per evitare problemi di discontinuità
+        phase_carrier = 0.0
+        phase_modulator = 0.0
+        
+        samples_per_frame = int(self.sample_rate / self.fps)
+        
+        for i in range(num_samples):
+            # Ottieni i valori interpolati per il sample corrente
+            current_carrier_freq = carrier_freq_interp[i]
+            current_modulator_freq = modulator_freq_interp[i]
+            current_mod_index = mod_index_interp[i]
 
-    def generate_granular_layer(self, num_samples: int, brightness_data: np.ndarray, detail_data: np.ndarray, movement_data: np.ndarray,
-                                min_grain_freq: float, max_grain_freq: float,
-                                min_grain_density: float, max_grain_density: float,
-                                min_grain_duration: float, max_grain_duration: float,
-                                progress_bar, status_text) -> np.ndarray:
-        """Genera un layer audio usando la sintesi granulare, modulata dai dati."""
+            # Calcola la fase del modulatore
+            modulator_value = np.sin(phase_modulator)
+            
+            # Applica l'indice di modulazione alla frequenza del carrier
+            # Il termine di modulazione è current_mod_index * modulator_value
+            fm_freq = current_carrier_freq + current_mod_index * current_modulator_freq * modulator_value
+            
+            # Aggiorna la fase del carrier usando la frequenza modulata
+            phase_carrier += 2 * np.pi * fm_freq / self.sample_rate
+            
+            # Aggiorna la fase del modulatore
+            phase_modulator += 2 * np.pi * current_modulator_freq / self.sample_rate
+            
+            # Genera il sample FM
+            fm_layer[i] = np.sin(phase_carrier)
+
+            if i % samples_per_frame == 0:
+                progress = i / num_samples
+                progress_bar.progress(progress)
+                status_text.text(f"Generazione FM: {progress*100:.1f}% completata.")
+        
+        progress_bar.progress(1.0)
+        status_text.text("Generazione FM: 100% completata.")
+
+        # Clip finale per prevenire overflow prima di sommare
+        fm_layer = np.clip(fm_layer, -1.0, 1.0)
+        
+        return fm_layer
+
+    def generate_granular_layer(self,
+                                num_samples: int,
+                                brightness_data: np.ndarray,
+                                detail_data: np.ndarray,
+                                movement_data: np.ndarray,
+                                min_grain_freq: float,
+                                max_grain_freq: float,
+                                min_grain_density: float,
+                                max_grain_density: float,
+                                min_grain_duration: float,
+                                max_grain_duration: float,
+                                progress_bar,
+                                status_text) -> np.ndarray:
+        """Genera un layer audio usando la sintesi granulare."""
         granular_layer = np.zeros(num_samples, dtype=np.float32)
         
-        # Interpola i dati di controllo
-        t_control = np.arange(len(brightness_data)) / self.video_fps
-        t_audio = np.linspace(0, num_samples / self.sample_rate, num_samples, endpoint=False)
+        num_frames = len(brightness_data)
+        frames_indices = np.arange(num_frames)
+        audio_indices = np.linspace(0, num_frames - 1, num_samples)
 
-        brightness_interp = np.interp(t_audio, t_control, brightness_data)
-        detail_interp = np.interp(t_audio, t_control, detail_data)
-        movement_interp = np.interp(t_audio, t_control, movement_data)
+        grain_freq_interp = np.interp(audio_indices, frames_indices, brightness_data)
+        grain_density_interp = np.interp(audio_indices, frames_indices, movement_data)
+        grain_duration_interp = np.interp(audio_indices, frames_indices, detail_data)
 
-        current_time = 0.0
-        while current_time < num_samples / self.sample_rate:
-            sample_idx = int(current_time * self.sample_rate)
-            if sample_idx >= num_samples:
-                break
+        grain_freq_interp = _map_value(grain_freq_interp, 0.0, 1.0, min_grain_freq, max_grain_freq)
+        grain_density_interp = _map_value(grain_density_interp, 0.0, 1.0, min_grain_density, max_grain_density)
+        grain_duration_interp = _map_value(grain_duration_interp, 0.0, 1.0, min_grain_duration, max_grain_duration)
 
-            # Mappa i parametri per il grano corrente
-            br = brightness_interp[sample_idx]
-            det = detail_interp[sample_idx]
-            mov = movement_interp[sample_idx]
+        # Assicurati che le durate siano positive
+        grain_duration_interp = np.clip(grain_duration_interp, 0.001, None)
 
-            grain_freq = self._map_value(br, 0.0, 1.0, min_grain_freq, max_grain_freq)
-            grain_density = self._map_value(mov, 0.0, 1.0, min_grain_density, max_grain_density)
-            grain_duration = self._map_value(det, 0.0, 1.0, min_grain_duration, max_grain_duration)
-
-            grain_samples = int(grain_duration * self.sample_rate)
+        current_sample = 0
+        while current_sample < num_samples:
             
-            # Genera un piccolo "grano" (es. rumore o onda impulsiva)
-            grain = np.random.randn(grain_samples) * 0.1 # Rumore bianco come grano
-            # grain = np.sin(2 * np.pi * grain_freq * np.linspace(0, grain_duration, grain_samples, endpoint=False)) * 0.2
+            # Scegli i parametri per il grano corrente in base all'interpolazione
+            # Usa il valore del punto più vicino all'inizio del grano
+            idx = int(current_sample / (num_samples / num_frames))
+            idx = np.clip(idx, 0, num_frames - 1)
 
-            # Applica un piccolo inviluppo al grano per evitare click
-            fade_grain_samples = min(int(0.01 * self.sample_rate), grain_samples // 2)
-            if fade_grain_samples > 0:
-                grain[:fade_grain_samples] *= np.linspace(0, 1, fade_grain_samples)
-                grain[-fade_grain_samples:] *= np.linspace(1, 0, fade_grain_samples)
+            freq = grain_freq_interp[current_sample]
+            density_factor = grain_density_interp[current_sample]
+            duration_s = grain_duration_interp[current_sample]
+
+            # Calcola la durata in campioni
+            grain_samples = int(duration_s * self.sample_rate)
             
-            # Aggiungi il grano all'audio finale
-            end_grain_idx = min(sample_idx + grain_samples, num_samples)
-            granular_layer[sample_idx:end_grain_idx] += grain[:end_grain_idx - sample_idx]
+            # Genera il grano (es. onda sinusoidale con inviluppo)
+            grain_t = np.linspace(0, duration_s, grain_samples, endpoint=False, dtype=np.float32)
+            grain_waveform = np.sin(2 * np.pi * freq * grain_t)
 
-            # Avanza il tempo in base alla densità
-            # Minore densità = maggiore salto di tempo tra i grani
-            time_advance = 1.0 / (grain_density * self.video_fps + 0.1) # Aggiungi 0.1 per evitare divisione per zero
-            current_time += time_advance
+            # Applica un inviluppo (es. Hann window)
+            window = np.hanning(grain_samples)
+            grain = grain_waveform * window
 
-            if sample_idx % (self.sample_rate * 2) == 0:
-                progress_bar.progress(sample_idx / num_samples)
-                status_text.text(f"🎵 Generazione Granulare... Freq: {grain_freq:.1f}Hz, Dens: {grain_density:.1f}, Dur: {grain_duration:.3f}s")
+            # Aggiungi il grano al layer principale
+            end_grain_sample = current_sample + grain_samples
+            
+            # Gestisci il caso in cui il grano superi la fine dell'audio
+            if end_grain_sample > num_samples:
+                grain_to_add = grain[:num_samples - current_sample]
+                granular_layer[current_sample:num_samples] += grain_to_add
+            else:
+                granular_layer[current_sample:end_grain_sample] += grain
+            
+            # Calcola il tempo al prossimo grano basato sulla densità
+            # Una densità più alta significa che i grani si sovrappongono di più o sono più ravvicinati
+            # Intervallo tra grani in secondi
+            # Minore density_factor -> maggiore intervallo
+            # Maggiore density_factor -> minore intervallo (più sovrapposizione)
+            interval_s = duration_s * (1.0 - np.clip(density_factor, 0.0, 0.99)) # Evita 1.0 per non avere intervallo zero
+            
+            current_sample += int(interval_s * self.sample_rate) # Avanza al prossimo punto di partenza del grano
+
+            if current_sample % int(num_samples / 100 + 1) == 0:
+                progress = current_sample / num_samples
+                progress_bar.progress(progress)
+                status_text.text(f"Generazione Granulare: {progress*100:.1f}% completata.")
         
-        # Applica inviluppo finale
-        fade_samples = int(self.fade_duration * self.sample_rate)
-        granular_layer[:fade_samples] *= np.linspace(0, 1, fade_samples)
-        granular_layer[-fade_samples:] *= np.linspace(1, 0, fade_samples)
+        progress_bar.progress(1.0)
+        status_text.text("Generazione Granulare: 100% completata.")
 
-        return granular_layer.astype(np.float32)
+        granular_layer = np.clip(granular_layer, -1.0, 1.0)
+        return granular_layer
 
-    def add_noise_layer(self, audio_data: np.ndarray, detail_data: np.ndarray,
-                        min_amp: float, max_amp: float,
-                        progress_bar, status_text) -> np.ndarray:
-        """Aggiunge un layer di rumore bianco modulato dal dettaglio."""
-        noise_layer = np.random.randn(len(audio_data)).astype(np.float32)
+    def add_noise_layer(self,
+                        audio_data: np.ndarray,
+                        detail_data: np.ndarray,
+                        min_noise_amp: float,
+                        max_noise_amp: float,
+                        progress_bar,
+                        status_text) -> np.ndarray:
+        """Aggiunge rumore bianco modulato dall'ampiezza in base al dettaglio."""
         
-        detail_interp = np.interp(np.arange(len(audio_data)),
-                                  np.arange(len(detail_data)) * (self.sample_rate / self.video_fps),
-                                  detail_data)
+        num_frames = len(detail_data)
+        frames_indices = np.arange(num_frames)
+        audio_indices = np.linspace(0, num_frames - 1, len(audio_data))
+
+        noise_amp_interp = np.interp(audio_indices, frames_indices, detail_data)
+        noise_amp_interp = _map_value(noise_amp_interp, 0.0, 1.0, min_noise_amp, max_noise_amp)
+        noise_amp_interp = np.clip(noise_amp_interp, 0.0, 1.0) # Ampiezza tra 0 e 1
+
+        noise = np.random.uniform(-1.0, 1.0, len(audio_data)).astype(np.float32)
+        modulated_noise = noise * noise_amp_interp
+
+        # Applica una leggera media mobile sull'ampiezza del rumore per evitare click bruschi
+        window_size = int(self.sample_rate / self.fps / 2) # Mezza finestra basata su mezzo frame
+        if window_size % 2 == 0: window_size += 1 # Assicura che sia dispari per uniform_filter1d
+        if window_size > 1:
+            modulated_noise = uniform_filter1d(modulated_noise, size=window_size)
+            
+        combined_audio = audio_data + modulated_noise
         
-        modulated_noise = np.zeros_like(noise_layer)
-        for i in range(len(noise_layer)):
-            current_amp = self._map_value(detail_interp[i], 0.0, 1.0, min_amp, max_amp)
-            modulated_noise[i] = noise_layer[i] * current_amp
-            if i % (self.sample_rate * 2) == 0:
-                progress_bar.progress(i / len(audio_data))
-                status_text.text(f"🎵 Aggiunta Rumore... Ampiezza: {current_amp:.2f}")
+        # Aggiorna progress bar (una sola volta per semplicità o per blocchi)
+        progress_bar.progress(1.0)
+        status_text.text("Aggiunta Rumore: 100% completata.")
 
-        return audio_data + modulated_noise
+        return np.clip(combined_audio, -1.0, 1.0)
 
-    def apply_glitch_effect(self, audio_data: np.ndarray, variation_movement_data: np.ndarray,
-                            glitch_threshold: float, glitch_duration_frames: int, glitch_intensity: float,
-                            progress_bar, status_text) -> np.ndarray:
-        """Applica effetti glitch in base alla variazione del movimento."""
+    def apply_glitch_effect(self,
+                            audio_data: np.ndarray,
+                            variation_movement_data: np.ndarray,
+                            glitch_threshold: float,
+                            glitch_duration_frames: int,
+                            glitch_intensity: float,
+                            progress_bar,
+                            status_text) -> np.ndarray:
+        """Applica un effetto glitch all'audio basato sulla variazione del movimento."""
         glitched_audio = np.copy(audio_data)
         
-        variation_movement_interp = np.interp(np.arange(len(audio_data)),
-                                              np.arange(len(variation_movement_data)) * (self.sample_rate / self.video_fps),
-                                              variation_movement_data)
-        
-        glitch_duration_samples = int(glitch_duration_frames * (self.sample_rate / self.video_fps)) # Durata in campioni
-        
-        for i in range(len(glitched_audio)):
-            if variation_movement_interp[i] > glitch_threshold:
-                # Applica un glitch: es. salto, ripetizione o inversione di un piccolo segmento
-                start_glitch = max(0, i - glitch_duration_samples // 2)
-                end_glitch = min(len(glitched_audio), i + glitch_duration_samples // 2)
+        num_frames = len(variation_movement_data)
+        samples_per_frame = int(self.sample_rate / self.fps)
+
+        for i in range(num_frames):
+            if variation_movement_data[i] > glitch_threshold:
+                start_sample = i * samples_per_frame
+                end_sample = min(start_sample + glitch_duration_frames * samples_per_frame, len(audio_data))
                 
-                if end_glitch > start_glitch:
-                    segment = glitched_audio[start_glitch:end_glitch]
-                    
-                    # Esempio di glitch: inversione e amplificazione
-                    glitched_segment = segment[::-1] * (1.0 + glitch_intensity)
-                    
-                    glitched_audio[start_glitch:end_glitch] = glitched_segment
-                
-                # Per evitare glitch troppo ravvicinati
-                i += glitch_duration_samples # Salta in avanti dopo un glitch
+                if start_sample >= end_sample:
+                    continue
+
+                segment = glitched_audio[start_sample:end_sample]
+
+                if len(segment) > 0:
+                    # Inverti il segmento e applica intensità
+                    glitched_audio[start_sample:end_sample] = segment[::-1] * (1.0 + glitch_intensity)
             
-            if i % (self.sample_rate * 2) == 0:
-                progress_bar.progress(i / len(glitched_audio))
-                status_text.text(f"⚙️ Applicazione Glitch... VarMov: {variation_movement_interp[i]:.2f}")
-
-        return glitched_audio
-
-    def apply_pitch_time_stretch(self, audio_data: np.ndarray, brightness_data: np.ndarray, detail_data: np.ndarray,
-                                 min_pitch_shift_semitones: float, max_pitch_shift_semitones: float,
-                                 min_time_stretch_rate: float, max_time_stretch_rate: float,
-                                 progress_bar, status_text) -> np.ndarray:
-        """Applica pitch shifting e time stretching modulati dai dati."""
-        # Librosa richiede l'intero segnale per queste operazioni, non è per-sample
-        # Applicheremo la trasformazione una volta sola con valori medi o all'inizio/fine
-        # Questo è un compromesso per l'efficienza in Streamlit.
-        # Per una vera modulazione dinamica per-sample, sarebbe molto più complesso.
-
-        # Calcola i valori medi per l'intera traccia (o puoi prendere i valori iniziali/finali)
-        avg_brightness = np.mean(brightness_data)
-        avg_detail = np.mean(detail_data)
-
-        pitch_shift_semitones = self._map_value(avg_brightness, 0.0, 1.0, min_pitch_shift_semitones, max_pitch_shift_semitones)
-        time_stretch_rate = self._map_value(avg_detail, 0.0, 1.0, min_time_stretch_rate, max_time_stretch_rate)
-
-        st.info(f"🎶 Applicando Pitch Shift di {pitch_shift_semitones:.2f} semitoni e Time Stretch di fattore {time_stretch_rate:.2f}...")
-
-        # Pitch shifting
-        y_pitched = librosa.effects.pitch_shift(
-            y=audio_data, sr=self.sample_rate, n_steps=pitch_shift_semitones
-        )
+            if i % (num_frames // 100 + 1) == 0:
+                progress_bar.progress((i + 1) / num_frames)
+                status_text.text(f"Applicazione Glitch: {(i + 1) / num_frames * 100:.1f}% completata.")
         
-        # Time stretching
-        # Assicurati che il rate non sia troppo piccolo o grande
-        time_stretch_rate = np.clip(time_stretch_rate, 0.1, 10.0) # Limita per evitare problemi
-        # librosa.effects.time_stretch può introdurre artefatti o cambiare la lunghezza
-        # Se si cambia la lunghezza, l'audio deve essere riallineato agli altri layer, il che è complesso.
-        # Per ora, usiamo librosa.effects.time_stretch, ma sii consapevole degli artefatti.
-        y_stretched = librosa.effects.time_stretch(
-            y=y_pitched, rate=time_stretch_rate, n_fft=2048, hop_length=512
-        )
-        
-        # Riapplicare la lunghezza originale se time_stretch ha cambiato la lunghezza
-        if len(y_stretched) != len(audio_data):
-            # Tronca o pad with zeros
-            if len(y_stretched) > len(audio_data):
-                y_stretched = y_stretched[:len(audio_data)]
-            else:
-                y_stretched = np.pad(y_stretched, (0, len(audio_data) - len(y_stretched)), 'constant')
-
         progress_bar.progress(1.0)
-        status_text.text("✅ Pitch Shift e Time Stretch applicati!")
-        return y_stretched.astype(np.float32)
+        status_text.text("Applicazione Glitch: 100% completata.")
 
-    def apply_modulation_effect(self, audio_data: np.ndarray, variation_movement_data: np.ndarray, detail_data: np.ndarray,
-                                progress_bar, status_text, effect_type: str = "chorus", intensity: float = 0.5, rate: float = 0.1) -> np.ndarray:
-        """Applica un effetto di modulazione (chorus, flanger, phaser) modulato dai dati."""
-        modulated_audio = np.copy(audio_data)
+        return np.clip(glitched_audio, -1.0, 1.0)
 
-        # La modulazione è un effetto globale, non per-sample con librosa facilmente.
-        # Usiamo l'intensità e il rate forniti dall'utente.
-        # I dati visivi potrebbero modulare questi parametri nel tempo, ma per la prima versione
-        # li useremo per influenzare l'esistenza/intensità dell'effetto.
-
-        # Potresti mappare `intensity` con `detail_data` e `rate` con `variation_movement_data`
-        # per una modulazione più dinamica, ma richiederebbe un'implementazione a blocchi o un DSP più avanzato.
-        # Per ora, useremo i valori fissi o medi.
+    def apply_pitch_time_stretch(self,
+                                 audio_data: np.ndarray,
+                                 brightness_data: np.ndarray,
+                                 detail_data: np.ndarray,
+                                 min_pitch_shift_semitones: float,
+                                 max_pitch_shift_semitones: float,
+                                 min_time_stretch_rate: float,
+                                 max_time_stretch_rate: float,
+                                 status_text) -> np.ndarray:
+        """
+        Applica pitch shifting e time stretching dinamici all'audio.
+        Il pitch è controllato dalla luminosità, il time stretch dal dettaglio.
+        """
+        processed_audio = np.copy(audio_data)
         
-        # Librosa non ha effetti di modulazione diretti come chorus/flanger/phaser.
-        # Questa è una semplificazione o un placeholder.
-        # Per una vera implementazione, sarebbero necessarie librerie DSP più complete (es. Pytecs, Pysounddevice con elaborazione real-time).
+        num_frames = len(brightness_data)
+        samples_per_frame = int(self.sample_rate / self.fps)
+
+        # Assicurati che audio_data sia mono per librosa.effects
+        if processed_audio.ndim > 1:
+            processed_audio = processed_audio.mean(axis=1) # Converti a mono
+
+        # Interpola i dati di controllo per avere un valore per ogni "blocco" audio
+        frame_indices = np.arange(num_frames)
+        # Blocchi per l'elaborazione (es. 100ms per blocco)
+        block_size_samples = int(self.sample_rate * 0.1) # 100 ms blocks
         
-        # Per semplicità, qui faremo una modulazione di ampiezza basata su detail_data e movement_data
-        # come un effetto "di modulazione" generico, che può essere interpretato come un tremolo o auto-wah base.
+        stretched_segments = []
+        original_samples_processed = 0
 
-        detail_interp = np.interp(np.arange(len(audio_data)),
-                                  np.arange(len(detail_data)) * (self.sample_rate / self.video_fps),
-                                  detail_data)
-        
-        variation_movement_interp = np.interp(np.arange(len(audio_data)),
-                                              np.arange(len(variation_movement_data)) * (self.sample_rate / self.video_fps),
-                                              variation_movement_data)
+        for i in range(0, len(processed_audio), block_size_samples):
+            current_block = processed_audio[i : i + block_size_samples]
+            if len(current_block) == 0:
+                continue
 
-        if effect_type == "tremolo":
-            # Modulazione di ampiezza
-            lfo_freq = self._map_value(variation_movement_interp, 0.0, 1.0, 0.1, 10.0) # Frequenza LFO da var. movimento
-            tremolo_depth = self._map_value(detail_interp, 0.0, 1.0, 0.0, intensity) # Profondità da dettaglio
+            # Calcola l'indice del frame video corrispondente all'inizio del blocco audio
+            current_frame_idx = int((i / self.sample_rate) * self.fps)
+            current_frame_idx = np.clip(current_frame_idx, 0, num_frames - 1)
 
-            t_lfo = np.linspace(0, len(audio_data) / self.sample_rate, len(audio_data), endpoint=False)
+            # Mappa i valori di controllo per il blocco corrente
+            pitch_shift_semitones = _map_value(
+                brightness_data[current_frame_idx],
+                0.0, 1.0, min_pitch_shift_semitones, max_pitch_shift_semitones
+            )
+            time_stretch_rate = _map_value(
+                detail_data[current_frame_idx],
+                0.0, 1.0, min_time_stretch_rate, max_time_stretch_rate
+            )
             
-            for i in range(len(audio_data)):
-                current_lfo_freq = lfo_freq[i] if isinstance(lfo_freq, np.ndarray) else lfo_freq
-                current_tremolo_depth = tremolo_depth[i] if isinstance(tremolo_depth, np.ndarray) else tremolo_depth
-                
-                # Modulatore sinusoidale per l'ampiezza
-                modulator = 1 + current_tremolo_depth * np.sin(2 * np.pi * current_lfo_freq * t_lfo[i])
-                modulated_audio[i] *= modulator
-                
-            status_text.text(f"🎧 Applicazione Tremolo... Profondità: {intensity:.2f}, Rate: {rate:.2f}")
+            # Applica lo stretch (librosa.effects.time_stretch può cambiare la lunghezza)
+            # Utilizza hop_length calcolato dalla block_size
+            hop_length = int(current_block.shape[0] / 4) # Generalmente una frazione del blocco
+            if hop_length == 0: hop_length = 256 # Minimum hop length
 
-        elif effect_type in ["chorus", "flanger", "phaser", "none"]:
-            # Per questi, librosa non ha implementazioni dirette.
-            # Qui si potrebbe aggiungere codice custom DSP o usare una libreria esterna.
-            # Per ora, se non è tremolo, non applichiamo nulla o una modulazione base.
-            if effect_type != "none":
-                st.warning(f"⚠️ L'effetto '{effect_type}' è un placeholder. Librosa non lo supporta direttamente. Verrà applicato un effetto minimo.")
-                # Esempio minimo: un leggero delay variabile
-                max_delay_s = 0.005  # max 5ms
-                delay_samples = int(max_delay_s * self.sample_rate)
+            try:
+                stretched_block = librosa.effects.time_stretch(current_block, rate=time_stretch_rate, hop_length=hop_length)
                 
-                delay_line = np.zeros(delay_samples, dtype=np.float32)
+                # Applica il pitch shift
+                # librosa.effects.pitch_shift usa un FFT, quindi il block deve avere una certa lunghezza
+                # Se stretched_block è troppo corto, potrebbe dare errore.
+                # Min_length per FFT è 2 * hop_length, spesso 2048 o 4096.
+                if len(stretched_block) < 2048: # Scegli un valore ragionevole
+                    # Padda il blocco se troppo corto per librosa
+                    stretched_block = np.pad(stretched_block, (0, 2048 - len(stretched_block)), mode='constant')
                 
-                for i in range(len(audio_data)):
-                    # Modula il tempo di delay con detail_data
-                    current_delay_time_norm = self._map_value(detail_interp[i], 0.0, 1.0, 0.0, 1.0)
-                    actual_delay_idx = int(current_delay_time_norm * delay_samples)
-                    
-                    if i - actual_delay_idx >= 0:
-                        delay_val = modulated_audio[i - actual_delay_idx]
-                        modulated_audio[i] += delay_val * (intensity * 0.5) # Aggiunge il segnale ritardato con un'intensità
-            status_text.text(f"🎧 Placeholder per {effect_type} applicato.")
+                # Assicurati che non ci siano NaN/inf prima del pitch_shift
+                if not np.all(np.isfinite(stretched_block)):
+                    status_text.warning("⚠️ Blocco audio non finito prima del pitch_shift. Sostituzione con zeri.")
+                    stretched_block[~np.isfinite(stretched_block)] = 0.0
+
+                pitched_stretched_block = librosa.effects.pitch_shift(
+                    stretched_block,
+                    sr=self.sample_rate,
+                    n_steps=pitch_shift_semitones
+                )
+                
+                # Rimuovi il padding extra se applicato
+                pitched_stretched_block = pitched_stretched_block[:len(stretched_block)] # Torna alla lunghezza del stretched_block originale
+                
+                stretched_segments.append(pitched_stretched_block)
+                original_samples_processed += len(current_block)
+            except Exception as e:
+                status_text.error(f"❌ Errore durante l'applicazione di pitch/time stretch ad un blocco: {e}. Il blocco verrà saltato.")
+                # Se c'è un errore, aggiungiamo un segmento di silenzio o il blocco originale
+                stretched_segments.append(np.zeros_like(current_block, dtype=np.float32))
+                original_samples_processed += len(current_block)
+
+
+            progress = i / len(processed_audio)
+            # progress_bar.progress(progress) # Aggiornamento costante potrebbe rallentare
+            status_text.text(f"Applicazione Pitch/Time Stretch: {progress*100:.1f}% completata.")
+        
+        if stretched_segments:
+            final_stretched_audio = np.concatenate(stretched_segments)
         else:
-            st.warning(f"Tipo di effetto di modulazione '{effect_type}' non riconosciuto. Nessun effetto applicato.")
-        
-        progress_bar.progress(1.0)
-        return modulated_audio.astype(np.float32)
+            final_stretched_audio = np.zeros_like(audio_data, dtype=np.float32)
 
-    def apply_delay_effect(self, audio_data: np.ndarray, movement_data: np.ndarray, detail_data: np.ndarray,
-                           max_delay_time: float, max_delay_feedback: float,
-                           progress_bar, status_text) -> np.ndarray:
-        """Applica un effetto delay (eco) modulato dai dati."""
+        # Pad o taglia per adattarsi alla lunghezza originale
+        if len(final_stretched_audio) < len(audio_data):
+            final_stretched_audio = np.pad(final_stretched_audio, (0, len(audio_data) - len(final_stretched_audio)), 'constant')
+        elif len(final_stretched_audio) > len(audio_data):
+            final_stretched_audio = final_stretched_audio[:len(audio_data)]
+
+        # Assicurati che l'output sia mono e pulito
+        if final_stretched_audio.ndim > 1:
+            final_stretched_audio = final_stretched_audio.mean(axis=1)
+
+        # Controllo finale dei valori non finiti
+        if not np.all(np.isfinite(final_stretched_audio)):
+            status_text.warning("⚠️ L'audio finale dopo pitch/time stretch contiene NaN/inf. Sostituzione con zeri.")
+            final_stretched_audio[~np.isfinite(final_stretched_audio)] = 0.0
+            
+        return final_stretched_audio
+
+
+    def apply_delay_effect(self,
+                           audio_data: np.ndarray,
+                           movement_data: np.ndarray,
+                           detail_data: np.ndarray,
+                           max_delay_time_s: float,
+                           max_delay_feedback: float,
+                           progress_bar,
+                           status_text) -> np.ndarray:
+        """Applica un effetto delay dinamico."""
+        
         delayed_audio = np.copy(audio_data)
         
-        # Interpola i dati di controllo
-        movement_interp = np.interp(np.arange(len(audio_data)),
-                                    np.arange(len(movement_data)) * (self.sample_rate / self.video_fps),
-                                    movement_data)
-        detail_interp = np.interp(np.arange(len(audio_data)),
-                                  np.arange(len(detail_data)) * (self.sample_rate / self.video_fps),
-                                  detail_data)
+        num_frames = len(movement_data)
+        samples_per_frame = int(self.sample_rate / self.fps)
 
-        # Linea di delay (buffer circolare)
-        max_delay_samples = int(max_delay_time * self.sample_rate)
-        if max_delay_samples == 0:
-            return delayed_audio # Nessun delay se il tempo massimo è 0
+        audio_len_samples = len(audio_data)
+        
+        # Interpola i dati di controllo per l'intero array audio
+        frames_indices = np.arange(num_frames)
+        audio_indices = np.linspace(0, num_frames - 1, audio_len_samples)
 
-        delay_line = np.zeros(max_delay_samples, dtype=np.float32)
-        write_idx = 0
+        delay_time_interp = np.interp(audio_indices, frames_indices, movement_data)
+        delay_feedback_interp = np.interp(audio_indices, frames_indices, detail_data)
+
+        # Mappa agli intervalli desiderati
+        delay_time_interp = _map_value(delay_time_interp, 0.0, 1.0, 0.01, max_delay_time_s) # Min delay time
+        delay_feedback_interp = _map_value(delay_feedback_interp, 0.0, 1.0, 0.0, max_delay_feedback)
+        
+        # Clipa feedback per evitare runaway (feedback > 1.0)
+        delay_feedback_interp = np.clip(delay_feedback_interp, 0.0, 0.99)
+
+        # Buffer per il delay (dimensione massima necessaria)
+        max_delay_samples = int(max_delay_time_s * self.sample_rate) + 1
+        delay_buffer = np.zeros(max_delay_samples, dtype=np.float32)
+        buffer_ptr = 0 # Puntatore circolare
+
+        for i in range(audio_len_samples):
+            current_delay_time_s = delay_time_interp[i]
+            current_delay_feedback = delay_feedback_interp[i]
+
+            # Calcola il delay in campioni
+            delay_samples = int(current_delay_time_s * self.sample_rate)
+            delay_samples = np.clip(delay_samples, 0, max_delay_samples - 1) # Assicurati che sia nel buffer
+
+            # Indice di lettura dal buffer
+            read_idx = (buffer_ptr - delay_samples + max_delay_samples) % max_delay_samples
+            
+            # Leggi dal buffer
+            delayed_signal = delay_buffer[read_idx]
+
+            # Scrivi nel buffer (audio_in + feedback_del_segnale_ritardato)
+            input_signal = audio_data[i]
+            # Assicurati che input_signal sia finito
+            if not np.isfinite(input_signal):
+                input_signal = 0.0
+                
+            signal_to_buffer = input_signal + delayed_signal * current_delay_feedback
+            delay_buffer[buffer_ptr] = signal_to_buffer
+            
+            # Aggiungi il segnale ritardato all'output (dry/wet mix implicito qui, potresti aggiungere un dry/wet knob)
+            delayed_audio[i] = input_signal + delayed_signal # Mix secco/umido semplice
+
+            # Aggiorna il puntatore del buffer
+            buffer_ptr = (buffer_ptr + 1) % max_delay_samples
+            
+            if i % (audio_len_samples // 100 + 1) == 0:
+                progress_bar.progress(i / audio_len_samples)
+                status_text.text(f"Applicazione Delay: {i / audio_len_samples * 100:.1f}% completata.")
+        
+        progress_bar.progress(1.0)
+        status_text.text("Applicazione Delay: 100% completata.")
+
+        return np.clip(delayed_audio, -1.0, 1.0)
+
+    def apply_reverb_effect(self,
+                            audio_data: np.ndarray,
+                            detail_data: np.ndarray, # Per modulare il decadimento
+                            brightness_data: np.ndarray, # Per modulare il wet level
+                            max_reverb_decay_s: float,
+                            max_reverb_wet_level: float,
+                            progress_bar,
+                            status_text) -> np.ndarray:
+        """Applica un effetto riverbero dinamico (simulato con delay multipli)."""
+        # Per un vero riverbero, servirebbe una convoluzione con una Impulse Response (IR).
+        # Per semplicità e performance, simuliamo un riverbero con un insieme di delay con feedback.
+        # Questa non è una vera riverberazione ma un effetto "spaziale".
+
+        reverbed_audio = np.zeros_like(audio_data, dtype=np.float32)
+
+        num_frames = len(detail_data)
+        
+        # Interpola i dati di controllo per l'intero array audio
+        frames_indices = np.arange(num_frames)
+        audio_indices = np.linspace(0, num_frames - 1, len(audio_data))
+
+        decay_interp = np.interp(audio_indices, frames_indices, detail_data)
+        wet_interp = np.interp(audio_indices, frames_indices, brightness_data)
+
+        decay_interp = _map_value(decay_interp, 0.0, 1.0, 0.1, max_reverb_decay_s)
+        wet_interp = _map_value(wet_interp, 0.0, 1.0, 0.0, max_reverb_wet_level)
+        
+        # Clipa i valori
+        decay_interp = np.clip(decay_interp, 0.1, 5.0) # Decay da 0.1s a 5s
+        wet_interp = np.clip(wet_interp, 0.0, 1.0)
+
+        # Simulazione riverbero con più linee di delay (es. 4-5 linee)
+        num_delay_lines = 4
+        # Tempi di delay primi (non multipli)
+        delay_times = np.array([0.029, 0.037, 0.043, 0.051]) # Tempi in secondi
+        
+        delay_buffers = [np.zeros(int(t * self.sample_rate) + 1, dtype=np.float32) for t in delay_times]
+        buffer_pointers = [0] * num_delay_lines
 
         for i in range(len(audio_data)):
-            # Modula il tempo di delay con il movimento
-            current_delay_time_norm = self._map_value(movement_interp[i], 0.0, 1.0, 0.0, 1.0)
-            read_idx = int(write_idx - (current_delay_time_norm * max_delay_samples)) % max_delay_samples
+            current_decay = decay_interp[i]
+            current_wet = wet_interp[i]
+
+            # Calcola il feedback per ogni linea di delay in base al decadimento globale
+            # Un decadimento più lungo implica un feedback più alto
+            # Feedback come e^(-1/tau) dove tau è il tempo di decadimento
+            current_feedback_factor = 1.0 - (1.0 / (current_decay * self.sample_rate + 1e-6)) # Approssimazione
+            current_feedback_factor = np.clip(current_feedback_factor, 0.0, 0.99) # Impedisce runaway
+
+            wet_signal = 0.0
+            input_signal = audio_data[i]
             
-            # Modula il feedback con il dettaglio
-            current_feedback = self._map_value(detail_interp[i], 0.0, 1.0, 0.0, max_delay_feedback)
-            
-            # Leggi dal delay line
-            delayed_sample = delay_line[read_idx]
+            # Assicurati che input_signal sia finito
+            if not np.isfinite(input_signal):
+                input_signal = 0.0
 
-            # Aggiungi il sample corrente al delay line con feedback
-            delay_line[write_idx] = audio_data[i] + delayed_sample * current_feedback
-            
-            # Aggiungi il sample ritardato all'output principale
-            delayed_audio[i] += delayed_sample * 0.5 # Mix del segnale dry e wet (0.5)
-
-            write_idx = (write_idx + 1) % max_delay_samples
-
-            if i % (self.sample_rate * 2) == 0:
-                progress_bar.progress(i / len(audio_data))
-                status_text.text(f"⏰ Applicazione Delay... Time: {current_delay_time_norm * max_delay_time:.2f}s, FB: {current_feedback:.2f}")
-
-        return delayed_audio.astype(np.float32)
-
-    def apply_reverb_effect(self, audio_data: np.ndarray, detail_data: np.ndarray, brightness_data: np.ndarray,
-                            max_decay_time: float, max_wet_level: float,
-                            progress_bar, status_text) -> np.ndarray:
-        """Applica un effetto di riverbero modulato dai dati."""
-        # Il riverbero è complesso da implementare dinamicamente per-sample senza librerie dedicate.
-        # Useremo una semplificazione con un filtro FIR/IIR lungo o una convoluzione con un impulso
-        # Questa implementazione userà una serie di delay in parallelo (comb filters) per simulare un riverbero base.
-
-        reverbed_audio = np.copy(audio_data)
-
-        detail_interp = np.interp(np.arange(len(audio_data)),
-                                  np.arange(len(detail_data)) * (self.sample_rate / self.video_fps),
-                                  detail_data)
-        brightness_interp = np.interp(np.arange(len(audio_data)),
-                                      np.arange(len(brightness_data)) * (self.sample_rate / self.video_fps),
-                                      brightness_data)
-        
-        # Parametri di riverbero basici (possono essere modulati)
-        num_delays = 8 # Numero di linee di delay parallele
-        delay_times = [0.023, 0.031, 0.037, 0.041, 0.043, 0.053, 0.061, 0.067] # Tempi di delay in secondi (primi dispari)
-        decay_factors = [0.7, 0.65, 0.75, 0.68, 0.72, 0.69, 0.71, 0.73] # Fattori di decadimento per ogni linea
-
-        delay_buffers = [np.zeros(int(dt * self.sample_rate), dtype=np.float32) for dt in delay_times]
-        write_indices = [0] * num_delays
-
-        for i in range(len(audio_data)):
-            current_wet_level = self._map_value(detail_interp[i], 0.0, 1.0, 0.0, max_wet_level)
-            current_decay_mult = self._map_value(brightness_interp[i], 0.0, 1.0, 0.5, 1.0) # Modula il decadimento
-
-            reverb_output_sum = 0.0
-            for j in range(num_delays):
-                buf_len = len(delay_buffers[j])
-                read_idx = (write_indices[j] + 1) % buf_len # Legge il più "vecchio" campione
+            for j in range(num_delay_lines):
+                delay_buffer = delay_buffers[j]
+                buffer_ptr = buffer_pointers[j]
                 
-                # Input al delay line: una parte del segnale originale + il feedback
-                input_to_delay = audio_data[i] + delay_buffers[j][read_idx] * (decay_factors[j] * current_decay_mult)
+                delay_samples = int(delay_times[j] * self.sample_rate)
+                delay_samples = np.clip(delay_samples, 0, len(delay_buffer) - 1)
+
+                read_idx = (buffer_ptr - delay_samples + len(delay_buffer)) % len(delay_buffer)
                 
-                delay_buffers[j][write_indices[j]] = input_to_delay
-                reverb_output_sum += delay_buffers[j][read_idx]
+                delayed_val = delay_buffer[read_idx]
+                
+                # Aggiungi il segnale di input al buffer con feedback
+                signal_to_buffer = input_signal + delayed_val * current_feedback_factor
+                delay_buffer[buffer_ptr] = signal_to_buffer
 
-                write_indices[j] = (write_indices[j] + 1) % buf_len
+                wet_signal += delayed_val # Aggiungi al segnale umido
 
-            reverbed_audio[i] = audio_data[i] + reverb_output_sum * current_wet_level
+                buffer_pointers[j] = (buffer_ptr + 1) % len(delay_buffer)
+            
+            # Mix dry/wet
+            reverbed_audio[i] = audio_data[i] * (1.0 - current_wet) + wet_signal * current_wet
 
-            if i % (self.sample_rate * 2) == 0:
+            if i % (len(audio_data) // 100 + 1) == 0:
                 progress_bar.progress(i / len(audio_data))
-                status_text.text(f"✨ Applicazione Riverbero... Wet: {current_wet_level:.2f}, Decay: {current_decay_mult * max_decay_time:.2f}s")
+                status_text.text(f"Applicazione Riverbero: {i / len(audio_data) * 100:.1f}% completata.")
         
-        return reverbed_audio.astype(np.float32)
+        progress_bar.progress(1.0)
+        status_text.text("Applicazione Riverbero: 100% completata.")
+
+        return np.clip(reverbed_audio, -1.0, 1.0)
+
+    def apply_modulation_effect(self,
+                                audio_data: np.ndarray,
+                                variation_movement_data: np.ndarray,
+                                detail_data: np.ndarray,
+                                progress_bar,
+                                status_text,
+                                effect_type: str = "tremolo",
+                                intensity: float = 0.5, # Base intensity
+                                rate: float = 0.1) -> np.ndarray: # Base rate (Hz)
+        """Applica un effetto di modulazione dinamico (es. Tremolo)."""
+        # Per ora implementiamo solo un Tremolo semplice.
+        # Chorus/Flanger/Phaser richiederebbero implementazioni più complesse (delay modulati)
+        modulated_audio = np.copy(audio_data)
+        
+        num_frames = len(variation_movement_data)
+        samples_per_frame = int(self.sample_rate / self.fps)
+
+        audio_len_samples = len(audio_data)
+        
+        frames_indices = np.arange(num_frames)
+        audio_indices = np.linspace(0, num_frames - 1, audio_len_samples)
+
+        # Moduliamo intensità e rate in base ai dati video
+        # Esempio: Variazione Movimento per il rate, Dettaglio per l'intensità
+        modulated_intensity_interp = np.interp(audio_indices, frames_indices, detail_data)
+        modulated_rate_interp = np.interp(audio_indices, frames_indices, variation_movement_data)
+
+        # Mappiamo ai valori utente + modulazione
+        # Minima intensità / rate per evitare 0
+        modulated_intensity_interp = _map_value(modulated_intensity_interp, 0.0, 1.0, 0.1, intensity)
+        modulated_rate_interp = _map_value(modulated_rate_interp, 0.0, 1.0, 0.05, rate * 10) # Fino a 10 volte il rate base
+
+        if effect_type == "tremolo":
+            # Tremolo: modulazione dell'ampiezza
+            # LFO (Low Frequency Oscillator)
+            lfo_phase = 0.0
+            for i in range(audio_len_samples):
+                current_rate = modulated_rate_interp[i]
+                current_intensity = modulated_intensity_interp[i]
+
+                # Genera l'onda LFO (es. sinusoide)
+                lfo_value = np.sin(lfo_phase) * current_intensity
+                
+                # Modula l'ampiezza
+                # La modulazione dovrebbe variare tra 1-intensità e 1+intensità
+                amplitude_mod = 1.0 + lfo_value # Va da 1-int a 1+int
+                
+                modulated_audio[i] = audio_data[i] * np.clip(amplitude_mod, 0.0, 2.0) # Clip per evitare valori negativi/eccessivi
+
+                # Aggiorna la fase dell'LFO
+                lfo_phase += 2 * np.pi * current_rate / self.sample_rate
+                
+                if i % (audio_len_samples // 100 + 1) == 0:
+                    progress_bar.progress(i / audio_len_samples)
+                    status_text.text(f"Applicazione Tremolo: {i / audio_len_samples * 100:.1f}% completata.")
+        # Puoi aggiungere qui if/elif per chorus, flanger, phaser
+        # Questi richiederebbero un delay buffer e la modulazione del tempo di delay.
+        # Es: Chorus: breve delay modulato, mixato con dry
+        # Flanger: delay ancora più breve, con feedback e modulazione profonda
+        # Phaser: filtro all-pass con fase modulata (più complesso)
+        else:
+            status_text.warning(f"Effetto di modulazione '{effect_type}' non implementato.")
+
+        progress_bar.progress(1.0)
+        status_text.text(f"Applicazione Modulazione: 100% completata.")
+
+        return np.clip(modulated_audio, -1.0, 1.0)
+
 
     def apply_stereo_panning(self, audio_data: np.ndarray, horizontal_center_data: np.ndarray) -> np.ndarray:
-        """Applica il panning stereo basato sul centro di massa orizzontale."""
-        # Se l'audio è mono, lo convertiamo in stereo
-        if audio_data.ndim == 1:
-            stereo_audio = np.zeros((len(audio_data), 2), dtype=np.float32)
-            stereo_audio[:, 0] = audio_data # Inizialmente entrambi i canali hanno lo stesso audio
-            stereo_audio[:, 1] = audio_data
-        else:
-            stereo_audio = np.copy(audio_data)
+        """Applica un panning stereo dinamico all'audio."""
+        # Se l'audio è già stereo, convertilo a mono prima di riapplicare il panning
+        if audio_data.ndim > 1:
+            audio_data = audio_data.mean(axis=1)
 
-        horizontal_center_interp = np.interp(np.arange(len(audio_data)),
-                                             np.arange(len(horizontal_center_data)) * (self.sample_rate / self.video_fps),
-                                             horizontal_center_data)
+        num_samples = len(audio_data)
+        num_frames = len(horizontal_center_data)
 
-        # Modifica l'ampiezza di ciascun canale in base al panning
-        for i in range(len(stereo_audio)):
-            pan_norm = horizontal_center_interp[i] # 0.0 (sinistra) a 1.0 (destra)
-            
-            # Metodo di panning a potenza costante (più naturale)
-            gain_left = np.sqrt(1 - pan_norm)
-            gain_right = np.sqrt(pan_norm)
+        # Interpola i dati di panning per ogni sample
+        frames_indices = np.arange(num_frames)
+        audio_indices = np.linspace(0, num_frames - 1, num_samples)
+        panning_interp = np.interp(audio_indices, frames_indices, horizontal_center_data)
 
-            stereo_audio[i, 0] *= gain_left
-            stereo_audio[i, 1] *= gain_right
+        # Variazione dei coefficienti di gain per i canali sinistro e destro
+        # 0.0 = sinistra, 0.5 = centro, 1.0 = destra
+        # Per la legge di potenza (-3dB pan law), gain = cos(angle), sin(angle)
+        # angle = panning_interp * pi / 2 (0 a pi/2)
+        angle = panning_interp * (np.pi / 2)
+        left_gain = np.cos(angle)
+        right_gain = np.sin(angle)
+
+        # Crea un array stereo vuoto
+        stereo_audio = np.zeros((num_samples, 2), dtype=np.float32)
+
+        stereo_audio[:, 0] = audio_data * left_gain
+        stereo_audio[:, 1] = audio_data * right_gain
 
         return stereo_audio
 
-    def normalize_audio(self, audio_data: np.ndarray) -> np.ndarray:
-        """Normalizza l'audio al livello di picco."""
-        max_abs_val = np.max(np.abs(audio_data))
-        if max_abs_val > 0:
-            return audio_data / max_abs_val
-        return audio_data
+    def normalize_audio(self, audio_data: np.ndarray, target_peak: float = 0.95) -> np.ndarray:
+        """Normalizza l'audio al picco desiderato."""
+        if audio_data.size == 0:
+            return audio_data
 
-# --- FUNZIONE PRINCIPALE STREAMLIT ---
+        abs_max = np.max(np.abs(audio_data))
+        if abs_max == 0:
+            return audio_data # Evita divisione per zero se l'audio è silenzioso
+        
+        normalized_audio = audio_data * (target_peak / abs_max)
+        return np.clip(normalized_audio, -1.0, 1.0) # Clipa per sicurezza
 
+# --- Funzione Main di Streamlit ---
 def main():
     st.set_page_config(page_title="🎵 VideoSound Gen - Sperimentale", layout="centered")
     st.title("🎬 VideoSound Gen - Sperimentale")
@@ -723,12 +1101,20 @@ def main():
         start_brightness = st.slider("Luminosità Iniziale (0.0=scuro, 1.0=chiaro)", 0.0, 1.0, 0.2, 0.05, key="sb")
         end_brightness = st.slider("Luminosità Finale (0.0=scuro, 1.0=chiaro)", 0.0, 1.0, 0.8, 0.05, key="eb")
         brightness_data = np.linspace(start_brightness, end_brightness, num_virtual_frames)
+        # Assicurati che i dati siano finiti
+        if not np.all(np.isfinite(brightness_data)):
+            st.error("❌ Errore: I dati di luminosità virtuali contengono valori non finiti. Impostazione a zero.")
+            brightness_data[~np.isfinite(brightness_data)] = 0.0
 
         st.markdown("---")
         st.markdown("**Andamento Dettaglio/Contrasto (controlla risonanza, modulator FM, noise, ecc.)**")
         start_detail = st.slider("Dettaglio Iniziale (0.0=sfocato, 1.0=nitido)", 0.0, 1.0, 0.8, 0.05, key="sd")
         end_detail = st.slider("Dettaglio Finale (0.0=sfocato, 1.0=nitido)", 0.0, 1.0, 0.2, 0.05, key="ed")
         detail_data = np.linspace(start_detail, end_detail, num_virtual_frames)
+        # Assicurati che i dati siano finiti
+        if not np.all(np.isfinite(detail_data)):
+            st.error("❌ Errore: I dati di dettaglio virtuali contengono valori non finiti. Impostazione a zero.")
+            detail_data[~np.isfinite(detail_data)] = 0.0
 
         st.markdown("---")
         st.markdown("**Andamento Movimento (controlla glitch, delay, densità granulare, ecc.)**")
@@ -737,12 +1123,23 @@ def main():
         movement_data = base_movement + (np.random.rand(num_virtual_frames) - 0.5) * random_movement_factor
         movement_data = np.clip(movement_data, 0.0, 1.0) # Assicura che i valori rimangano tra 0 e 1
         variation_movement_data = np.abs(np.diff(movement_data, prepend=movement_data[0]))
-        
+        # Assicurati che i dati siano finiti
+        if not np.all(np.isfinite(movement_data)):
+            st.error("❌ Errore: I dati di movimento virtuali contengono valori non finiti. Impostazione a zero.")
+            movement_data[~np.isfinite(movement_data)] = 0.0
+        if not np.all(np.isfinite(variation_movement_data)):
+            st.error("❌ Errore: I dati di variazione movimento virtuali contengono valori non finiti. Impostazione a zero.")
+            variation_movement_data[~np.isfinite(variation_movement_data)] = 0.0
+
         st.markdown("---")
         st.markdown("**Andamento Panning Orizzontale (controlla il bilanciamento stereo)**")
         start_pan = st.slider("Panning Iniziale (0.0=sinistra, 0.5=centro, 1.0=destra)", 0.0, 1.0, 0.5, 0.05, key="sp")
         end_pan = st.slider("Panning Finale (0.0=sinistra, 0.5=centro, 1.0=destra)", 0.0, 1.0, 0.5, 0.05, key="ep")
         horizontal_center_data = np.linspace(start_pan, end_pan, num_virtual_frames)
+        # Assicurati che i dati siano finiti
+        if not np.all(np.isfinite(horizontal_center_data)):
+            st.error("❌ Errore: I dati di panning virtuali contengono valori non finiti. Impostazione a centro.")
+            horizontal_center_data[~np.isfinite(horizontal_center_data)] = 0.5
 
         # Imposta i valori per il resto del codice, come se venissero da un video
         video_duration = float(virtual_duration)
@@ -892,7 +1289,7 @@ def main():
         st.markdown("#### Effetto di Modulazione (Chorus/Flanger/Tremolo)")
         modulation_effect_type = st.selectbox(
             "Tipo di Modulazione:",
-            ("none", "tremolo", "chorus", "flanger", "phaser"), # Chorus/Flanger/Phaser sono placeholder
+            ("none", "tremolo"), # Chorus/Flanger/Phaser sono placeholder nel tuo codice precedente
             key="mod_type",
             disabled=not enable_dynamic_effects
         )
@@ -962,6 +1359,10 @@ def main():
             st.info("🎵 Generazione dell'onda base (Sintesi Sottrattiva)...")
             subtractive_layer = audio_gen.generate_subtractive_waveform(total_samples, waveform_type_user)
             combined_audio_layers = subtractive_layer
+            # Controllo: Sintesi Sottrattiva
+            if not np.all(np.isfinite(combined_audio_layers)):
+                st.error("❌ Errore: la sintesi sottrattiva ha prodotto valori non finiti. Sostituzione con zeri.")
+                combined_audio_layers[~np.isfinite(combined_audio_layers)] = 0.0 # Sostituisci non-finiti con zero
             st.success("✅ Strato Sintesi Sottrattiva generato!")
         else:
             combined_audio_layers = np.zeros(total_samples, dtype=np.float32) # Assicura che sia inizializzato
@@ -970,6 +1371,7 @@ def main():
 
         # --- Aggiungi lo strato FM se abilitato ---
         if enable_fm_synthesis:
+            st.info("🎵 Generazione dello strato FM...")
             fm_layer = audio_gen.generate_fm_layer(
                 total_samples,
                 brightness_data,
@@ -980,11 +1382,18 @@ def main():
                 progress_bar=audio_progress_bar,
                 status_text=audio_status_text
             )
+            # Clip per prevenire overflow prima di aggiungere
+            fm_layer = np.clip(fm_layer, -1.0, 1.0)
             combined_audio_layers += fm_layer * 0.5 # Aggiunge con un certo mix
+            # Controllo: Aggiunta FM
+            if not np.all(np.isfinite(combined_audio_layers)):
+                st.error("❌ Errore: l'aggiunta del layer FM ha introdotto valori non finiti. Sostituzione con zeri.")
+                combined_audio_layers[~np.isfinite(combined_audio_layers)] = 0.0
             st.success("✅ Strato FM generato e combinato!")
 
         # --- Aggiungi lo strato Granulare se abilitato ---
         if enable_granular_synthesis:
+            st.info("🎵 Generazione dello strato Granulare...")
             granular_layer = audio_gen.generate_granular_layer(
                 total_samples,
                 brightness_data,
@@ -996,11 +1405,18 @@ def main():
                 progress_bar=audio_progress_bar,
                 status_text=audio_status_text
             )
+            # Clip per prevenire overflow prima di aggiungere
+            granular_layer = np.clip(granular_layer, -1.0, 1.0)
             combined_audio_layers += granular_layer * 0.5 # Aggiunge con un certo mix
+            # Controllo: Aggiunta Granulare
+            if not np.all(np.isfinite(combined_audio_layers)):
+                st.error("❌ Errore: l'aggiunta del layer Granulare ha introdotto valori non finiti. Sostituzione con zeri.")
+                combined_audio_layers[~np.isfinite(combined_audio_layers)] = 0.0
             st.success("✅ Strato Granulare generato e combinato!")
 
         # --- Aggiungi il layer di Rumore se abilitato ---
         if enable_noise_effect:
+            st.info("🎵 Aggiunta del layer Rumore...")
             combined_audio_layers = audio_gen.add_noise_layer(
                 combined_audio_layers,
                 detail_data,
@@ -1009,10 +1425,15 @@ def main():
                 progress_bar=audio_progress_bar,
                 status_text=audio_status_text
             )
+            # Controllo: Aggiunta Rumore
+            if not np.all(np.isfinite(combined_audio_layers)):
+                st.error("❌ Errore: l'aggiunta del layer Rumore ha introdotto valori non finiti. Sostituzione con zeri.")
+                combined_audio_layers[~np.isfinite(combined_audio_layers)] = 0.0
             st.success("✅ Strato Rumore aggiunto!")
 
         # --- Applica effetti Glitch se abilitati ---
         if enable_glitch_effect:
+            st.info("👾 Applicazione effetti Glitch...")
             combined_audio_layers = audio_gen.apply_glitch_effect(
                 combined_audio_layers,
                 variation_movement_data,
@@ -1022,14 +1443,25 @@ def main():
                 progress_bar=audio_progress_bar,
                 status_text=audio_status_text
             )
+            # Controllo: Applicazione Glitch
+            if not np.all(np.isfinite(combined_audio_layers)):
+                st.error("❌ Errore: l'applicazione del Glitch ha introdotto valori non finiti. Sostituzione con zeri.")
+                combined_audio_layers[~np.isfinite(combined_audio_layers)] = 0.0
             st.success("✅ Effetti Glitch applicati!")
 
         # --- Processamento degli effetti dinamici (filtro, pitch, time stretch) ---
         with st.spinner("🎧 Applicazione effetti dinamici all'audio generato..."):
             processed_audio = combined_audio_layers # Inizia con l'audio base/combinato
+            
+            # Controllo di integrità prima di iniziare la catena di effetti
+            if not np.all(np.isfinite(processed_audio)):
+                st.error("❌ Errore critico: L'audio combinato contiene valori non finiti prima di applicare gli effetti dinamici. Questo potrebbe indicare un problema con i layer precedenti.")
+                processed_audio[~np.isfinite(processed_audio)] = 0.0
+
 
             # Applica Pitch Shifting e Time Stretching
             if enable_pitch_time_stretch:
+                st.info("⏱️ Applicazione Pitch Shifting e Time Stretching...")
                 processed_audio = audio_gen.apply_pitch_time_stretch(
                     processed_audio,
                     brightness_data,
@@ -1038,9 +1470,12 @@ def main():
                     max_pitch_shift_semitones=max_pitch_shift_semitones,
                     min_time_stretch_rate=min_time_stretch_rate,
                     max_time_stretch_rate=max_time_stretch_rate,
-                    progress_bar=audio_progress_bar,
-                    status_text=audio_status_text
+                    status_text=audio_status_text # Rimosso progress_bar per Pitch/Time Stretch perché la funzione librosa non lo supporta direttamente
                 )
+                # Controllo: Pitch/Time Stretch
+                if not np.all(np.isfinite(processed_audio)):
+                    st.error("❌ Errore: Pitch Shift / Time Stretch ha introdotto valori non finiti. Sostituzione con zeri.")
+                    processed_audio[~np.isfinite(processed_audio)] = 0.0
                 st.success("✅ Effetti pitch e stretch applicati!")
             else:
                 st.info("🎶 Pitch Shifting / Time Stretching disabilitato.")
@@ -1049,6 +1484,7 @@ def main():
             # --- Applicazione Effetti Sonori Dinamici unificati ---
             if enable_dynamic_effects:
                 # Applica Filtro Avanzato
+                st.info("⚙️ Applicazione Filtro Avanzato...")
                 processed_audio = audio_gen.apply_dynamic_filter(
                     processed_audio,
                     brightness_data,
@@ -1061,22 +1497,36 @@ def main():
                     status_text=audio_status_text,
                     filter_type=filter_type_user
                 )
+                # Controllo: Filtro Avanzato
+                if not np.all(np.isfinite(processed_audio)):
+                    st.error("❌ Errore: I filtri avanzati hanno introdotto valori non finiti. Sostituzione con zeri.")
+                    processed_audio[~np.isfinite(processed_audio)] = 0.0
                 st.success("✅ Filtri avanzati applicati!")
 
-                # Applica Effetto di Modulazione (Chorus/Flanger/Phaser)
-                processed_audio = audio_gen.apply_modulation_effect(
-                    processed_audio,
-                    variation_movement_data,
-                    detail_data,
-                    progress_bar=audio_progress_bar,
-                    status_text=audio_status_text,
-                    effect_type=modulation_effect_type,
-                    intensity=modulation_intensity,
-                    rate=modulation_rate
-                )
-                st.success(f"✅ Effetto di Modulazione '{modulation_effect_type}' applicato!")
+                # Applica Effetto di Modulazione (Chorus/Flanger/Tremolo)
+                if modulation_effect_type != "none":
+                    st.info(f"🌀 Applicazione Effetto di Modulazione ({modulation_effect_type})...")
+                    processed_audio = audio_gen.apply_modulation_effect(
+                        processed_audio,
+                        variation_movement_data,
+                        detail_data,
+                        progress_bar=audio_progress_bar,
+                        status_text=audio_status_text,
+                        effect_type=modulation_effect_type,
+                        intensity=modulation_intensity,
+                        rate=modulation_rate
+                    )
+                    # Controllo: Modulazione
+                    if not np.all(np.isfinite(processed_audio)):
+                        st.error("❌ Errore: L'effetto di modulazione ha introdotto valori non finiti. Sostituzione con zeri.")
+                        processed_audio[~np.isfinite(processed_audio)] = 0.0
+                    st.success(f"✅ Effetto di Modulazione '{modulation_effect_type}' applicato!")
+                else:
+                    st.info("🎶 Effetto di Modulazione disabilitato.")
+
 
                 # Applica Delay
+                st.info(" echoes ⏰ Applicazione Delay...")
                 processed_audio = audio_gen.apply_delay_effect(
                     processed_audio,
                     movement_data,
@@ -1086,9 +1536,14 @@ def main():
                     progress_bar=audio_progress_bar,
                     status_text=audio_status_text
                 )
+                # Controllo: Delay
+                if not np.all(np.isfinite(processed_audio)):
+                    st.error("❌ Errore: L'effetto Delay ha introdotto valori non finiti. Sostituzione con zeri.")
+                    processed_audio[~np.isfinite(processed_audio)] = 0.0
                 st.success("✅ Effetto Delay applicato!")
 
                 # Applica Riverbero
+                st.info("✨ Applicazione Riverbero...")
                 processed_audio = audio_gen.apply_reverb_effect(
                     processed_audio,
                     detail_data,
@@ -1098,21 +1553,39 @@ def main():
                     progress_bar=audio_progress_bar,
                     status_text=audio_status_text
                 )
+                # Controllo: Riverbero
+                if not np.all(np.isfinite(processed_audio)):
+                    st.error("❌ Errore: L'effetto Riverbero ha introdotto valori non finiti. Sostituzione con zeri.")
+                    processed_audio[~np.isfinite(processed_audio)] = 0.0
                 st.success("✅ Effetto Riverbero applicato!")
             else:
                 st.info("🎶 Effetti Dinamici Avanzati disabilitati.")
             
             # --- Panning Stereo ---
+            st.info("↔️ Applicazione Panning Stereo...")
             processed_audio_stereo = audio_gen.apply_stereo_panning(processed_audio, horizontal_center_data)
+            # Controllo: Panning Stereo
+            if not np.all(np.isfinite(processed_audio_stereo)):
+                st.error("❌ Errore: Panning stereo ha introdotto valori non finiti. Sostituzione con zeri.")
+                # Per audio stereo, dobbiamo pulire entrambi i canali
+                processed_audio_stereo[~np.isfinite(processed_audio_stereo)] = 0.0
             st.success("✅ Panning stereo applicato!")
 
             # --- Normalizzazione finale ---
+            st.info("🔊 Normalizzazione audio finale...")
             final_audio = audio_gen.normalize_audio(processed_audio_stereo)
+            # Controllo: Normalizzazione Finale
+            if not np.all(np.isfinite(final_audio)):
+                st.error("❌ Errore critico: L'audio normalizzato contiene valori non finiti. L'audio finale potrebbe essere corrotto. Sostituzione con zeri.")
+                final_audio[~np.isfinite(final_audio)] = 0.0
             st.success("✅ Audio normalizzato!")
 
         # --- Salvataggio audio ---
         st.info(f"💾 Salvataggio audio in '{audio_output_path}'...")
         try:
+            # Assicurati che l'audio sia nel formato corretto per soundfile (mono o stereo float32)
+            if final_audio.ndim == 2 and final_audio.shape[1] == 1: # Se è stereo con una sola colonna, rendilo mono
+                final_audio = final_audio[:, 0]
             sf.write(audio_output_path, final_audio, AUDIO_SAMPLE_RATE)
             st.success("✅ Audio salvato correttamente!")
             st.audio(audio_output_path, format="audio/wav", start_time=0) # Permette all'utente di ascoltare subito
@@ -1120,180 +1593,104 @@ def main():
             st.error(f"❌ Errore durante il salvataggio dell'audio: {e}")
             return
 
-        # --- Inizio Sezione Resoconto di Generazione del Suono ---
-        # Costruisci il testo del resoconto in modo programmatico
-        report_text = """
----
-## 📝 Resoconto di Generazione del Suono
-Il suono che hai appena generato è il risultato di un'interazione dinamica tra le impostazioni che hai scelto e i dati estratti dal video (o definiti manualmente).
-Questo soundscape è stato creato con **VideoSound Gen by Loop507**.
+        report_text = f"""
+        ### Resoconto Generazione Suono
 
-### 🚀 Riepilogo Generale
-- **Sorgente Input:** `{input_mode}`
-""".format(input_mode=input_mode)
+        **Durata Audio:** {video_duration:.2f} secondi
+        **Sample Rate:** {AUDIO_SAMPLE_RATE} Hz
+        **FPS Base:** {fps:.2f}
 
-        if input_mode == "Carica un Video" and uploaded_file is not None:
-            report_text += f"- **Video Originale:** `{uploaded_file.name}`\n"
-        
-        report_text += f"""
-- **Durata Audio Generato:** `{video_duration:.2f}` secondi
-- **Frequenza di Campionamento Audio:** `{AUDIO_SAMPLE_RATE}` Hz
-- **Frame Rate di Analisi/Virtuale:** `{fps:.2f}` FPS
+        **Layer Abilitati:**
+        - Sintesi Sottrattiva: {'Sì' if enable_subtractive_synthesis else 'No'}
+        - Sintesi FM: {'Sì' if enable_fm_synthesis else 'No'}
+        - Sintesi Granulare: {'Sì' if enable_granular_synthesis else 'No'}
+        - Rumore: {'Sì' if enable_noise_effect else 'No'}
+        - Glitch: {'Sì' if enable_glitch_effect else 'No'}
 
-### 🎶 Effetti e Modulazioni Applicati
-"""
+        **Effetti Dinamici Abilitati:**
+        - Pitch Shifting / Time Stretching: {'Sì' if enable_pitch_time_stretch else 'No'}
+        - Filtro Avanzato: {'Sì' if enable_dynamic_effects else 'No'}
+        - Modulazione ({modulation_effect_type.capitalize()}): {'Sì' if enable_dynamic_effects and modulation_effect_type != 'none' else 'No'}
+        - Delay: {'Sì' if enable_dynamic_effects else 'No'}
+        - Riverbero: {'Sì' if enable_dynamic_effects else 'No'}
 
-        if enable_subtractive_synthesis:
-            report_text += f"""
-##### Sintesi Sottrattiva (Suono Base)
-- **Forma d'Onda:** `{waveform_type_user}`
-- **Frequenza di Taglio Filtro:** Modulata dalla **Luminosità** del video/input, variando tra `{min_cutoff_user}` Hz (luminosità bassa) e `{max_cutoff_user}` Hz (luminosità alta).
-- **Risonanza Filtro:** Modulata dal **Dettaglio/Contrasto** del video/input, variando tra `{min_resonance_user:.1f}` Q (dettaglio basso) e `{max_resonance_user:.1f}` Q (dettaglio alto).
-* Andamento Luminosità Media: `{np.mean(brightness_data):.2f}`. Andamento Dettaglio Medio: `{np.mean(detail_data):.2f}`.
-* *Note:* Un aumento della luminosità tenderà ad aprire il filtro rendendo il suono più brillante. Un maggiore dettaglio aumenterà la risonanza, rendendo il suono più "aggressivo" o "tagliente".
-"""
-
-        if enable_fm_synthesis:
-            report_text += f"""
-##### Sintesi FM (Frequenza Modulata)
-- **Frequenza Carrier:** Modulata dalla **Luminosità**, variando tra `{min_carrier_freq_user}` Hz e `{max_carrier_freq_user}` Hz.
-- **Frequenza Modulatore:** Modulata dal **Movimento**, variando tra `{min_modulator_freq_user}` Hz e `{max_modulator_freq_user}` Hz.
-- **Indice di Modulazione:** Modulato dal **Dettaglio/Contrasto**, variando tra `{min_mod_index_user:.1f}` e `{max_mod_index_user:.1f}`.
-* Andamento Movimento Medio: `{np.mean(movement_data):.2f}`. Andamento Dettaglio Medio: `{np.mean(detail_data):.2f}`.
-* *Note:* L'FM crea timbri complessi e spesso metallici. Maggiore movimento o dettaglio amplifica la modulazione, producendo suoni più ricchi e dissonanti.
-"""
-
-        if enable_granular_synthesis:
-            report_text += f"""
-##### Sintesi Granulare
-- **Frequenza Grani:** Modulata dalla **Luminosità** (min: `{min_grain_freq}` Hz, max: `{max_grain_freq}` Hz).
-- **Densità Grani:** Modulata dal **Movimento** (min: `{min_grain_density:.1f}`, max: `{max_grain_density:.1f}`).
-- **Durata Grani:** Modulata dal **Dettaglio/Contrasto** (min: `{min_grain_duration:.3f}`s, max: `{max_grain_duration:.3f}`s).
-* *Note:* La sintesi granulare 'scompone' il suono in piccole particelle (grani). Maggiore movimento e luminosità tendono a creare una texture più densa e rapida.
-"""
-
-        if enable_noise_effect:
-            report_text += f"""
-##### Effetto Rumore
-- **Ampiezza Rumore:** Modulata dal **Dettaglio/Contrasto**, variando tra `{min_noise_amp_user:.2f}` e `{max_noise_amp_user:.2f}`.
-* *Note:* L'aggiunta di rumore può simulare texture sabbiose o atmosferiche. Un maggiore dettaglio porta a un rumore più evidente.
-"""
-
-        if enable_glitch_effect:
-            report_text += f"""
-##### Effetto Glitch
-- **Soglia Glitch:** `{glitch_threshold_user:.2f}` (variazione movimento oltre cui scatta il glitch).
-- **Durata Glitch:** `{glitch_duration_frames_user}` frame.
-- **Intensità Glitch:** `{glitch_intensity_user:.2f}`.
-* Andamento Variazione Movimento Media: `{np.mean(variation_movement_data):.2f}`.
-* *Note:* I glitch sono attivati da cambiamenti rapidi nel movimento del video/input, creando interruzioni o distorsioni nel suono.
-"""
-        
-        if enable_pitch_time_stretch:
-            report_text += f"""
-##### Pitch Shifting e Time Stretching
-- **Pitch Shift:** Modulato dalla **Luminosità**, variando tra `{min_pitch_shift_semitones}` e `{max_pitch_shift_semitones}` semitoni.
-- **Time Stretch:** Modulato dal **Dettaglio/Contrasto**, variando tra `{min_time_stretch_rate:.2f}` (più lento) e `{max_time_stretch_rate:.2f}` (più veloce).
-* *Note:* La luminosità può alzare o abbassare l'intonazione, mentre il dettaglio può rallentare o accelerare il tempo, alterando la percezione della durata.
-"""
-
-        if enable_dynamic_effects:
-            report_text += f"""
-##### Effetti Dinamici Avanzati
-- **Filtro Avanzato:** `Abilitato` ({filter_type_user})
-* Cutoff da **Luminosità** ({min_cutoff_adv} Hz - {max_cutoff_adv} Hz). Risonanza da **Dettaglio** ({min_resonance_adv:.1f} Q - {max_resonance_adv:.1f} Q).
-- **Effetto di Modulazione:** `{modulation_effect_type}` (Intensità: `{modulation_intensity:.2f}`, Rate: `{modulation_rate:.2f}` Hz)
-* Modulato da **Variazione Movimento** e **Dettaglio**.
-- **Delay:** `Abilitato` (Max Tempo: `{max_delay_time_user:.2f}` s, Max Feedback: `{max_delay_feedback_user:.2f}`)
-* Modulato da **Movimento** e **Dettaglio**.
-- **Riverbero:** `Abilitato` (Max Decay: `{max_reverb_decay_user:.2f}` s, Max Wet: `{max_reverb_wet_user:.2f}`)
-* Modulato da **Dettaglio** e **Luminosità**.
-"""
-
-        report_text += f"""
-##### Panning Stereo
-- L'audio è stato panoramizzato tra sinistra e destra in base alla posizione del **Centro di Massa Orizzontale** del video/input.
-* Andamento Centro Orizzontale Medio: `{np.mean(horizontal_center_data):.2f}` (0.0=sinistra, 1.0=destra).
-
----
-Speriamo che questo resoconto ti aiuti a comprendere meglio il processo creativo e il legame tra le immagini (o i tuoi parametri) e il suono generato!
----
-"""
-        # Ora passa la stringa completa a st.markdown
+        **Percorso File Audio:** `{audio_output_path}`
+        """
         st.markdown(report_text)
 
-        # --- Sezione Download ---
-        if download_option == "Solo Audio":
-            with open(audio_output_path, "rb") as f:
-                st.download_button(
-                    "⬇️ Scarica Solo Audio (WAV)",
-                    f,
-                    file_name=f"videosound_generato_audio_{base_name_output}.wav",
-                    mime="audio/wav"
-                )
-            # Pulizia file temporanei
-            if os.path.exists(audio_output_path):
-                os.remove(audio_output_path)
-            if video_input_path and os.path.exists(video_input_path): # Pulisci video input solo se esiste
-                os.remove(video_input_path)
-            st.info("🗑️ File temporanei puliti.")
+        # --- Opzioni di Download ---
+        st.subheader("Scarica il tuo risultato!")
+        with open(audio_output_path, "rb") as file:
+            st.download_button(
+                label="⬇️ Scarica Solo Audio (.wav)",
+                data=file.read(),
+                file_name=f"{base_name_output}_{unique_id_audio}_generated_audio.wav",
+                mime="audio/wav"
+            )
 
-        elif download_option == "Video con Audio" and input_mode == "Carica un Video": # Questa opzione è disponibile solo con un video caricato
-            if check_ffmpeg():
-                with st.spinner("🔗 Unione e ricodifica video/audio con FFmpeg (potrebbe richiedere tempo)..."):
+        if download_option == "Video con Audio" and input_mode == "Carica un Video" and video_input_path:
+            st.info("🎬 Unione audio e video in corso...")
+            video_status_text = st.empty()
+            try:
+                # Determina la risoluzione di output
+                target_width, target_height = width, height # Default: originale
+                if output_resolution_choice != "Originale":
                     target_width, target_height = FORMAT_RESOLUTIONS[output_resolution_choice]
 
-                    if output_resolution_choice == "Originale":
-                        target_width = width
-                        target_height = height
-
-                    vf_complex = f"scale='min({target_width},iw*({target_height}/ih)):min({target_height},ih*({target_width}/iw))',pad={target_width}:{target_height}:(ow-iw)/2:(oh-ih)/2:color=black"
-
-                    try:
-                        subprocess.run([
-                            "ffmpeg", "-y",
-                            "-i", video_input_path,
-                            "-i", audio_output_path,
-                            "-c:v", "libx264",
-                            "-preset", "medium",
-                            "-crf", "23",
-                            "-vf", vf_complex,
-                            "-c:a", "aac", "-b:a", "192k",
-                            "-map", "0:v:0", "-map", "1:a:0",
-                            "-shortest",
-                            final_video_path
-                        ], capture_output=True, check=True)
-                        st.success(f"✅ Video finale con audio salvato in '{final_video_path}'")
-
-                        with open(final_video_path, "rb") as f:
-                            st.download_button(
-                                "⬇️ Scarica il Video con Audio",
-                                f,
-                                file_name=f"videosound_generato_{base_name_output}_{output_resolution_choice.replace(' ', '_')}.mp4",
-                                mime="video/mp4"
-                            )
-
-                        for temp_f in [video_input_path, audio_output_path, final_video_path]:
-                            if os.path.exists(temp_f):
-                                os.remove(temp_f)
-                        st.info("🗑️ File temporanei puliti.")
-
-                    except subprocess.CalledProcessError as e:
-                        st.error(f"❌ Errore FFmpeg durante l'unione/ricodifica: {e.stderr.decode()}")
-                        st.code(e.stdout.decode() + e.stderr.decode())
-                    except Exception as e:
-                        st.error(f"❌ Errore generico durante l'unione/ricodifica: {str(e)}")
-            else:
-                st.warning(f"⚠️ FFmpeg non trovato. Il video con audio non può essere unito o ricodificato. L'audio generato è disponibile in '{audio_output_path}'.")
-                with open(audio_output_path, "rb") as f:
-                    st.download_button(
-                        "⬇️ Scarica Solo Audio (WAV temporaneo)",
-                        f,
-                        file_name=f"videosound_generato_audio_{base_name_output}.wav",
-                        mime="audio/wav"
-                    )
-        elif download_option == "Video con Audio" and input_mode == "Genera Suono Senza Video (Parametri Manuali)":
-            st.error("❌ Non puoi scaricare un 'Video con Audio' se hai scelto di generare il suono senza caricare un video. Seleziona 'Solo Audio'.")
+                # Comando FFmpeg per unire audio e video e ricodificare a risoluzione desiderata
+                command = [
+                    FFMPEG_PATH,
+                    "-i", video_input_path,
+                    "-i", audio_output_path,
+                    "-c:v", "libx264", # Codec video
+                    "-preset", "fast", # Velocità di codifica (fast, medium, slow)
+                    "-crf", "23", # Qualità (0-51, 0 lossless, 23 default, 51 peggiore)
+                    "-vf", f"scale={target_width}:{target_height}", # Scala la risoluzione
+                    "-c:a", "aac", # Codec audio
+                    "-b:a", "192k", # Bitrate audio
+                    "-pix_fmt", "yuv420p", # Formato pixel per compatibilità
+                    final_video_path
+                ]
+                
+                # Esegui il comando FFmpeg
+                process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                
+                # Leggi l'output di stderr per il progresso
+                while True:
+                    line = process.stderr.readline()
+                    if not line:
+                        break
+                    if "frame=" in line:
+                        video_status_text.text(f"Unione Video: {line.strip()}")
+                
+                process.wait()
+                
+                if process.returncode == 0:
+                    st.success(f"✅ Video con audio salvato in '{final_video_path}'")
+                    with open(final_video_path, "rb") as file:
+                        st.download_button(
+                            label="⬇️ Scarica Video con Audio (.mp4)",
+                            data=file.read(),
+                            file_name=f"{base_name_output}_{unique_id_audio}_final_videosound.mp4",
+                            mime="video/mp4"
+                        )
+                else:
+                    st.error(f"❌ Errore durante l'unione del video e dell'audio. FFmpeg Code: {process.returncode}")
+                    st.code(process.stderr.read()) # Mostra l'output di errore di FFmpeg
+            except Exception as e:
+                st.error(f"❌ Errore imprevisto durante l'unione del video: {e}")
+        
+        # Pulizia dei file temporanei
+        if os.path.exists("temp"):
+            st.info("🗑️ Pulizia dei file temporanei...")
+            try:
+                shutil.rmtree("temp")
+                st.success("✅ File temporanei rimossi.")
+            except Exception as e:
+                st.warning(f"⚠️ Impossibile rimuovere i file temporanei: {e}")
+        
+        # Forza la garbage collection per liberare memoria
+        gc.collect()
 
 if __name__ == "__main__":
     main()
