@@ -152,7 +152,7 @@ class AudioGenerator:
         if len(data_per_frame) == 0:
             return np.zeros(self.total_samples)
         
-        # Crea un array di indici temporali per i dati dei frame (es. 0, 1, 2... per ogni frame)
+        # Crea un array di indici temporali per i dati dei frames (es. 0, 1, 2... per ogni frame)
         # Li mappiamo alla durata totale in secondi
         original_time_points = np.linspace(0, self.total_duration_seconds, len(data_per_frame), endpoint=True)
         
@@ -237,7 +237,7 @@ class AudioGenerator:
             grain_dur_samples = int(current_grain_dur_seconds * self.sample_rate)
             grain_dur_samples = max(10, grain_dur_samples) # Minimo 10 campioni per grano
 
-            for _ in range(num_grains_in_gamesegment):
+            for _ in range(num_grains_in_segment): # Correzione qui: da num_grains_in_gamesegment a num_grains_in_segment
                 # Posizione casuale del grano all'interno del segmento corrente
                 start_sample_segment = i * samples_per_virtual_frame
                 end_sample_segment = min((i + 1) * samples_per_virtual_frame, self.total_samples)
