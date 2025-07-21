@@ -148,7 +148,8 @@ class AudioGenerator:
 
     def _interp_data_to_audio_length(self, data_per_frame: list) -> np.ndarray:
         """Interpola i dati per frame alla lunghezza dell'array audio."""
-        if not data_per_frame:
+        # Correzione: usare len() per verificare se l'array/lista è vuoto
+        if len(data_per_frame) == 0:
             return np.zeros(self.total_samples)
         
         # Crea un array di indici temporali per i dati dei frame (es. 0, 1, 2... per ogni frame)
@@ -221,7 +222,7 @@ class AudioGenerator:
         # Oppure, per maggiore controllo, generare grani a intervalli specifici.
 
         # Generiamo grani per ogni "frame" logico, ma distribuiti sulla base temporale
-        samples_per_virtual_frame = int(self.total_samples / len(density_data))
+        samples_per_virtual_frame = int(self.total_samples / len(density_data)) if len(density_data) > 0 else self.total_samples # Evita divisione per zero
         
         for i in range(len(density_data)):
             current_density = density_interp[i * samples_per_virtual_frame] if i * samples_per_virtual_frame < self.total_samples else density_interp[-1]
@@ -236,7 +237,7 @@ class AudioGenerator:
             grain_dur_samples = int(current_grain_dur_seconds * self.sample_rate)
             grain_dur_samples = max(10, grain_dur_samples) # Minimo 10 campioni per grano
 
-            for _ in range(num_grains_in_segment):
+            for _ in range(num_grains_in_gamesegment):
                 # Posizione casuale del grano all'interno del segmento corrente
                 start_sample_segment = i * samples_per_virtual_frame
                 end_sample_segment = min((i + 1) * samples_per_virtual_frame, self.total_samples)
@@ -287,7 +288,7 @@ class AudioGenerator:
         while i < self.total_samples:
             current_time_idx = min(i, self.total_samples - 1)
             
-            if np.random.rand() < glitch_factor_interp[current_time_idx]:
+            if len(glitch_factor_interp) > current_time_idx and np.random.rand() < glitch_factor_interp[current_time_idx]:
                 glitch_intensity = glitch_intensity_interp[current_time_idx]
                 
                 # Durata del glitch basata sull'intensità
@@ -774,24 +775,28 @@ def main():
                 audio_layers = []
 
                 if enable_subtractive:
-                    freq_subtractive = np.interp(luminosity_data, [0, 1], [base_freq_subtractive, base_freq_subtractive * max_freq_multiplier_subtractive])
+                    freq_subtractive = np.interp(np.array(luminosity_data), [0, 1], [base_freq_subtractive, base_freq_subtractive * max_freq_multiplier_subtractive])
+                    # Assicurati che il secondo argomento sia un array numpy o una lista della lunghezza corretta
+                    amp_subtractive_data = np.full(duration_frames, amplitude_subtractive)
                     audio_layers.append(audio_generator.generate_subtractive_waveform(
-                        freq_subtractive, [amplitude_subtractive] * duration_frames, waveform_type=subtractive_waveform
+                        freq_subtractive, amp_subtractive_data, waveform_type=subtractive_waveform
                     ))
 
                 if enable_fm:
-                    carrier_freq_fm = np.interp(luminosity_data, [0, 1], [base_carrier_freq_fm, base_carrier_freq_fm * 2])
-                    mod_freq_fm = np.interp(movement_data, [0, 1], [10, max_mod_freq_fm])
-                    mod_idx_fm = np.interp(detail_data, [0, 1], [0.0, max_mod_idx_fm])
+                    carrier_freq_fm = np.interp(np.array(luminosity_data), [0, 1], [base_carrier_freq_fm, base_carrier_freq_fm * 2])
+                    mod_freq_fm = np.interp(np.array(movement_data), [0, 1], [10, max_mod_freq_fm])
+                    mod_idx_fm = np.interp(np.array(detail_data), [0, 1], [0.0, max_mod_idx_fm])
+                    amp_fm_data = np.full(duration_frames, amplitude_fm)
                     audio_layers.append(audio_generator.generate_fm_layer(
-                        carrier_freq_fm, mod_freq_fm, mod_idx_fm, [amplitude_fm] * duration_frames
+                        carrier_freq_fm, mod_freq_fm, mod_idx_fm, amp_fm_data
                     ))
 
                 if enable_granular:
-                    density_granular = np.interp(movement_data, [0, 1], [base_density_granular, base_density_granular * 5])
-                    grain_duration_granular = np.interp(detail_data, [0, 1], [max_grain_duration, min_grain_duration])
+                    density_granular = np.interp(np.array(movement_data), [0, 1], [base_density_granular, base_density_granular * 5])
+                    grain_duration_granular = np.interp(np.array(detail_data), [0, 1], [max_grain_duration, min_grain_duration])
+                    amp_granular_data = np.full(duration_frames, amplitude_granular)
                     audio_layers.append(audio_generator.generate_granular_layer(
-                        density_granular, grain_duration_granular, [amplitude_granular] * duration_frames
+                        density_granular, grain_duration_granular, amp_granular_data
                     ))
 
                 
@@ -817,7 +822,7 @@ def main():
 
 
                 if enable_noise:
-                    noise_amp = np.interp(luminosity_data, [0, 1], [min_noise_amp, max_noise_amp])
+                    noise_amp = np.interp(np.array(luminosity_data), [0, 1], [min_noise_amp, max_noise_amp])
                     combined_audio = audio_generator.add_noise_layer(combined_audio, noise_amp)
 
                 # Applicazione degli effetti avanzati
@@ -825,39 +830,39 @@ def main():
                     st.info("✨ Applicazione effetti dinamici avanzati...")
 
                     if enable_filter:
-                        cutoff_freq_data = np.interp(luminosity_data, [0, 1], [min_cutoff_adv, max_cutoff_adv])
-                        resonance_data = np.interp(detail_data, [0, 1], [min_resonance_adv, max_resonance_adv])
+                        cutoff_freq_data = np.interp(np.array(luminosity_data), [0, 1], [min_cutoff_adv, max_cutoff_adv])
+                        resonance_data = np.interp(np.array(detail_data), [0, 1], [min_resonance_adv, max_resonance_adv])
                         combined_audio = audio_generator.apply_dynamic_filter(combined_audio, cutoff_freq_data, resonance_data)
                     
                     if enable_glitch:
                         # Normalizza variation_movement_data per l'interpolazione
                         max_var_mov = np.max(variation_movement_data)
                         if max_var_mov == 0:
-                            glitch_factor_scaled = np.full_like(variation_movement_data, min_glitch_factor)
+                            glitch_factor_scaled = np.full_like(np.array(variation_movement_data), min_glitch_factor)
                         else:
-                            glitch_factor_scaled = np.interp(variation_movement_data, [0, max_var_mov], [min_glitch_factor, max_glitch_factor])
+                            glitch_factor_scaled = np.interp(np.array(variation_movement_data), [0, max_var_mov], [min_glitch_factor, max_glitch_factor])
                         
-                        glitch_intensity_data = np.interp(movement_data, [0, 1], [min_glitch_intensity, max_glitch_intensity])
+                        glitch_intensity_data = np.interp(np.array(movement_data), [0, 1], [min_glitch_intensity, max_glitch_intensity])
                         combined_audio = audio_generator.apply_glitch_effect(combined_audio, glitch_factor_scaled, glitch_intensity_data)
 
                     if enable_delay:
-                        delay_time_data = np.interp(movement_data, [0, 1], [max_delay_time, min_delay_time]) # Movimento alto = delay più corto
-                        feedback_data = np.interp(detail_data, [0, 1], [min_feedback, max_feedback])
+                        delay_time_data = np.interp(np.array(movement_data), [0, 1], [max_delay_time, min_delay_time]) # Movimento alto = delay più corto
+                        feedback_data = np.interp(np.array(detail_data), [0, 1], [min_feedback, max_feedback])
                         combined_audio = audio_generator.apply_delay_effect(combined_audio, delay_time_data, feedback_data)
 
                     if enable_reverb:
-                        decay_time_data = np.interp(luminosity_data, [0, 1], [min_decay_time, max_decay_time])
-                        mix_data = np.interp(detail_data, [0, 1], [min_reverb_mix, max_reverb_mix])
+                        decay_time_data = np.interp(np.array(luminosity_data), [0, 1], [min_decay_time, max_decay_time])
+                        mix_data = np.interp(np.array(detail_data), [0, 1], [min_reverb_mix, max_reverb_mix])
                         combined_audio = audio_generator.apply_reverb_effect(combined_audio, decay_time_data, mix_data)
                     
                     if enable_pitch_stretch:
-                        pitch_shift_data = np.interp(luminosity_data, [0, 1], [min_pitch_shift, max_pitch_shift])
-                        time_stretch_data = np.interp(movement_data, [0, 1], [min_time_stretch, max_time_stretch])
+                        pitch_shift_data = np.interp(np.array(luminosity_data), [0, 1], [min_pitch_shift, max_pitch_shift])
+                        time_stretch_data = np.interp(np.array(movement_data), [0, 1], [min_time_stretch, max_time_stretch])
                         combined_audio = audio_generator.apply_pitch_time_stretch(combined_audio, pitch_shift_data, time_stretch_data)
                     
                     if enable_modulation:
-                        modulation_depth_data = np.interp(detail_data, [0, 1], [min_mod_depth, max_mod_depth])
-                        modulation_rate_data = np.interp(movement_data, [0, 1], [min_mod_rate, max_mod_rate])
+                        modulation_depth_data = np.interp(np.array(detail_data), [0, 1], [min_mod_depth, max_mod_depth])
+                        modulation_rate_data = np.interp(np.array(movement_data), [0, 1], [min_mod_rate, max_mod_rate])
                         combined_audio = audio_generator.apply_modulation_effect(combined_audio, modulation_depth_data, modulation_rate_data)
 
                 # Applica il panning dinamico
