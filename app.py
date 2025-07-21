@@ -10,6 +10,7 @@ import soundfile as sf
 from scipy.signal import butter, lfilter
 import librosa
 import librosa.display
+import re # Spostato qui per assicurare che sia importato all'inizio del modulo
 
 # Costanti globali (puoi modificarle)
 MAX_DURATION = 300  # Durata massima del video in secondi
@@ -562,6 +563,9 @@ def main():
                 # Normalizza e scala i dati delle sorgenti
                 sub_freq_scaled = np.interp(sub_freq_data_raw, (min(sub_freq_data_raw) if sub_freq_data_raw else 0, max(sub_freq_data_raw) if sub_freq_data_raw else 1), (sub_freq_min, sub_freq_max)).tolist()
                 sub_amp_scaled = np.interp(sub_amp_data_raw, (min(sub_amp_data_raw) if sub_amp_data_raw else 0, max(sub_amp_data_raw) if sub_amp_data_raw else 1), (sub_amp_min, sub_amp_max)).tolist()
+            else: # Aggiunto else per gestire i casi in cui i dati non sono scalati
+                sub_freq_scaled = []
+                sub_amp_scaled = []
 
         # Layer 2: Sintesi FM (Basato su Variazione Movimento e Centro di Massa Orizzontale)
         with tab_fm:
@@ -621,6 +625,11 @@ def main():
                 fm_mod_scaled = np.interp(fm_mod_data_raw, (min(fm_mod_data_raw) if fm_mod_data_raw else 0, max(fm_mod_data_raw) if fm_mod_data_raw else 1), (fm_mod_min, fm_mod_max)).tolist()
                 fm_mod_idx_scaled = np.interp(fm_mod_idx_data_raw, (min(fm_mod_idx_data_raw) if fm_mod_idx_data_raw else 0, max(fm_mod_idx_data_raw) if fm_mod_idx_data_raw else 1), (fm_mod_idx_min, fm_mod_idx_max)).tolist()
                 fm_amp_scaled = np.interp(fm_amp_data_raw, (min(fm_amp_data_raw) if fm_amp_data_raw else 0, max(fm_amp_data_raw) if fm_amp_data_raw else 1), (fm_amp_min, fm_amp_max)).tolist()
+            else: # Aggiunto else per gestire i casi in cui i dati non sono scalati
+                fm_carrier_scaled = []
+                fm_mod_scaled = []
+                fm_mod_idx_scaled = []
+                fm_amp_scaled = []
 
         # Layer 3: Sintesi Granulare (Basato su Dettaglio e Movimento)
         with tab_gran:
@@ -664,6 +673,11 @@ def main():
                 gran_density_scaled = np.interp(gran_density_data_raw, (min(gran_density_data_raw) if gran_density_data_raw else 0, max(gran_density_data_raw) if gran_density_data_raw else 1), (gran_density_min, gran_density_max)).tolist()
                 gran_duration_scaled = np.interp(gran_duration_data_raw, (min(gran_duration_data_raw) if gran_duration_data_raw else 0, max(gran_duration_data_raw) if gran_duration_data_raw else 1), (gran_duration_min, gran_duration_max)).tolist()
                 gran_amp_scaled = np.interp(gran_amp_data_raw, (min(gran_amp_data_raw) if gran_amp_data_raw else 0, max(gran_amp_data_raw) if gran_amp_data_raw else 1), (gran_amp_min, gran_amp_max)).tolist()
+            else: # Aggiunto else per gestire i casi in cui i dati non sono scalati
+                gran_density_scaled = []
+                gran_duration_scaled = []
+                gran_amp_scaled = []
+
 
         # Layer 4: Rumore (Basato su Variazione Movimento)
         with tab_noise:
@@ -684,6 +698,8 @@ def main():
                 elif noise_amp_source == "Dettaglio": noise_amp_data_raw = detail_data
 
                 noise_amp_scaled = np.interp(noise_amp_data_raw, (min(noise_amp_data_raw) if noise_amp_data_raw else 0, max(noise_amp_data_raw) if noise_amp_data_raw else 1), (noise_amp_min, noise_amp_max)).tolist()
+            else: # Aggiunto else per gestire i casi in cui i dati non sono scalati
+                noise_amp_scaled = []
 
 
         # Effetti Audio (Glitch, Delay, Reverb)
@@ -720,6 +736,9 @@ def main():
 
                 glitch_factor_scaled = np.interp(glitch_factor_data_raw, (min(glitch_factor_data_raw) if glitch_factor_data_raw else 0, max(glitch_factor_data_raw) if glitch_factor_data_raw else 1), (glitch_factor_min, glitch_factor_max)).tolist()
                 glitch_intensity_data = np.interp(glitch_intensity_data_raw, (min(glitch_intensity_data_raw) if glitch_intensity_data_raw else 0, max(glitch_intensity_data_raw) if glitch_intensity_data_raw else 1), (glitch_intensity_min, glitch_intensity_max)).tolist()
+            else: # Aggiunto else per gestire i casi in cui i dati non sono scalati
+                glitch_factor_scaled = []
+                glitch_intensity_data = []
 
             # Delay
             st.subheader("Delay")
@@ -751,6 +770,10 @@ def main():
 
                 delay_time_scaled = np.interp(delay_time_data_raw, (min(delay_time_data_raw) if delay_time_data_raw else 0, max(delay_time_data_raw) if delay_time_data_raw else 1), (delay_time_min, delay_time_max)).tolist()
                 delay_feedback_scaled = np.interp(delay_feedback_data_raw, (min(delay_feedback_data_raw) if delay_feedback_data_raw else 0, max(delay_feedback_data_raw) if delay_feedback_data_raw else 1), (delay_feedback_min, delay_feedback_max)).tolist()
+            else: # Aggiunto else per gestire i casi in cui i dati non sono scalati
+                delay_time_scaled = []
+                delay_feedback_scaled = []
+
 
             # Reverb
             st.subheader("Riverbero")
@@ -782,6 +805,10 @@ def main():
 
                 reverb_decay_scaled = np.interp(reverb_decay_data_raw, (min(reverb_decay_data_raw) if reverb_decay_data_raw else 0, max(reverb_decay_data_raw) if reverb_decay_data_raw else 1), (reverb_decay_min, reverb_decay_max)).tolist()
                 reverb_mix_scaled = np.interp(reverb_mix_data_raw, (min(reverb_mix_data_raw) if reverb_mix_data_raw else 0, max(reverb_mix_data_raw) if reverb_mix_data_raw else 1), (reverb_mix_min, reverb_mix_max)).tolist()
+            else: # Aggiunto else per gestire i casi in cui i dati non sono scalati
+                reverb_decay_scaled = []
+                reverb_mix_scaled = []
+
 
         # Equalizzatore Dinamico
         with tab_eq:
@@ -819,6 +846,11 @@ def main():
                 eq_low_scaled = np.interp(eq_low_data_raw, (min(eq_low_data_raw) if eq_low_data_raw else 0, max(eq_low_data_raw) if eq_low_data_raw else 1), (eq_gain_min, eq_gain_max)).tolist()
                 eq_mid_scaled = np.interp(eq_mid_data_raw, (min(eq_mid_data_raw) if eq_mid_data_raw else 0, max(eq_mid_data_raw) if eq_mid_data_raw else 1), (eq_gain_min, eq_gain_max)).tolist()
                 eq_high_scaled = np.interp(eq_high_data_raw, (min(eq_high_data_raw) if eq_high_data_raw else 0, max(eq_high_data_raw) if eq_high_data_raw else 1), (eq_gain_min, eq_gain_max)).tolist()
+            else: # Aggiunto else per gestire i casi in cui i dati non sono scalati
+                eq_low_scaled = []
+                eq_mid_scaled = []
+                eq_high_scaled = []
+
 
         st.subheader("Impostazioni Output Video")
         output_resolution_choice = st.selectbox("Formato Video Output", list(FORMAT_RESOLUTIONS.keys()))
@@ -1008,17 +1040,19 @@ def main():
                     st.code(e.stdout.decode() + e.stderr.decode())
                 except Exception as e:
                     st.error(f"❌ Errore generico durante l'unione/ricodifica: {str(e)}")
-            else:
-                st.warning(f"⚠️ FFmpeg non trovato. Il video con audio non può essere unito o ricodificato. L'audio generato è disponibile in '{audio_output_path}'.")
-                with open(audio_output_path, "rb") as f:
-                    st.download_button(
-                        "⬇️ Scarica Solo Audio (WAV temporaneo)",
-                        f,
-                        file_name=f"videosound_generato_audio_{base_name_output}.wav",
-                        mime="audio/wav"
-                    )
+        else: # Questo else è correttamente allineato con if st.button
+            st.warning(f"⚠️ FFmpeg non trovato. Il video con audio non può essere unito o ricodificato. L'audio generato è disponibile in '{audio_output_path}'.")
+            with open(audio_output_path, "rb") as f:
+                st.download_button(
+                    "⬇️ Scarica Solo Audio (WAV temporaneo)",
+                    f,
+                    file_name=f"videosound_generato_audio_{base_name_output}.wav",
+                    mime="audio/wav"
+                )
 
         # Modifica 2: Descrizione del brano alla fine con tutti i parametri
+        # Questa sezione è volutamente fuori dal blocco if/else del pulsante,
+        # ma all'interno dell'if uploaded_file is not None.
         st.markdown("---")
         with st.expander("✨ Descrizione del Brano Generato"):
             st.write("Questa è una descrizione dettagliata dei parametri usati per generare il tuo brano:")
@@ -1093,9 +1127,7 @@ def main():
             else:
                 st.write("##### Equalizzatore Dinamico: Disabilitato")
 
-    gc.collect()
-
+    gc.collect() # Questa riga è ora all'interno del blocco `if uploaded_file is not None`
 
 if __name__ == "__main__":
-    import re # Importa re qui per l'uso nel main
     main()
