@@ -218,7 +218,16 @@ class AudioGenerator:
 
         for i in range(duration_frames):
             density = density_data[i] # Numero di grani per frame
-            grain_dur_samples = int(np.clip(grain_duration_data[i] * self.sample_rate, 0.005 * self.sample_rate, 0.1 * self.sample_rate)) # Durata del grano in campioni (es. 5ms-100ms)
+            
+            # --- CORREZIONE QUI ---
+            # Assicurati che grain_dur_samples sia sempre minore di samples_per_frame
+            max_allowed_grain_samples = self.samples_per_frame - 1
+            if max_allowed_grain_samples <= 0: # Evita problemi se samples_per_frame è troppo piccolo (non dovrebbe accadere con FPS 30)
+                max_allowed_grain_samples = 1 
+                
+            grain_dur_samples = int(np.clip(grain_duration_data[i] * self.sample_rate, 0.005 * self.sample_rate, max_allowed_grain_samples)) 
+            # ---------------------
+            
             amp = amp_data[i]
 
             current_frame_start_sample = i * self.samples_per_frame
@@ -226,6 +235,7 @@ class AudioGenerator:
 
             for _ in range(int(density)):
                 # Posizione casuale del grano all'interno del frame
+                # L'upper bound del randint è ora garantito > 0
                 start_grain_sample = current_frame_start_sample + np.random.randint(0, self.samples_per_frame - grain_dur_samples)
 
                 # Genera un grano (onda sinusoidale casuale) con inviluppo Hanning
@@ -570,6 +580,45 @@ class AudioGenerator:
             return audio_array / max_abs
         return audio_array
 
+def analyze_audio_features(audio_data: np.ndarray, sample_rate: int) -> dict:
+    """
+    Analizza le caratteristiche di base di un segnale audio.
+    
+    Args:
+        audio_data (np.ndarray): L'array numpy del segnale audio (mono).
+        sample_rate (int): La frequenza di campionamento dell'audio.
+        
+    Returns:
+        dict: Un dizionario contenente le caratteristiche analizzate.
+    """
+    if audio_data.ndim > 1:
+        # Se l'audio è stereo, convertilo in mono per l'analisi
+        audio_data = librosa.to_mono(audio_data.T) # Assumi che i canali siano nell'ultima dimensione se 2D
+
+    # Durata
+    duration = librosa.get_duration(y=audio_data, sr=sample_rate)
+
+    # Loudness (RMS - Root Mean Square)
+    # Calcoliamo il loudness su finestre per avere una media più rappresentativa
+    rms = librosa.feature.rms(y=audio_data, frame_length=2048, hop_length=512)[0]
+    avg_rms_db = librosa.amplitude_to_db(np.mean(rms), ref=1.0) # Converti a dB
+
+    # Spectral Centroid (indica la "brillantezza")
+    # Calcolato su finestre
+    cent = librosa.feature.spectral_centroid(y=audio_data, sr=sample_rate, n_fft=2048, hop_length=512)[0]
+    avg_spectral_centroid = np.mean(cent)
+
+    # Zero Crossing Rate (misura la velocità con cui il segnale cambia segno, utile per percussività)
+    zcr = librosa.feature.zero_crossing_rate(y=audio_data, frame_length=2048, hop_length=512)[0]
+    avg_zcr = np.mean(zcr)
+
+    return {
+        "Durata (secondi)": f"{duration:.2f}",
+        "Loudness medio (dB)": f"{avg_rms_db:.2f}",
+        "Centroid Spettrale medio (Hz)": f"{avg_spectral_centroid:.2f}",
+        "Zero Crossing Rate medio": f"{avg_zcr:.4f}"
+    }
+
 
 def main():
     st.set_page_config(
@@ -620,7 +669,7 @@ def main():
         enable_granular = st.checkbox("Abilita Granular Synth", value=False)
         base_density_granular = st.slider("Densità Base Grani", 0.0, 20.0, 5.0, 0.1, disabled=not enable_granular)
         min_grain_duration = st.slider("Durata Min Grano (s)", 0.001, 0.1, 0.01, 0.001, disabled=not enable_granular)
-        max_grain_duration = st.slider("Durata Max Grano (s)", 0.1, 0.5, 0.2, 0.01, disabled=not enable_granular)
+        max_grain_duration = st.slider("Durata Max Grano (s)", 0.1, 0.5, 0.2, 0.01, disabled=not enable_granular) # Slider range still allows > samples_per_frame / sample_rate, but np.clip handles it.
         amplitude_granular = st.slider("Ampiezza Granular", 0.0, 1.0, 0.1, 0.01, disabled=not enable_granular)
 
         st.markdown("---")
@@ -715,7 +764,8 @@ def main():
             with open(video_input_path, "wb") as f:
                 f.write(uploaded_file.getbuffer())
 
-            st.video(video_input_path, format="video/mp4", start_time=0)
+            # # Rimosso: st.video per la preview
+            # st.video(video_input_path, format="video/mp4", start_time=0) 
 
             # Analizza i frame del video
             (
@@ -828,6 +878,28 @@ def main():
 
                 base_name_output = os.path.splitext(os.path.basename(uploaded_file.name))[0]
 
+                # --- Inizia la nuova funzionalità di analisi audio ---
+                st.subheader("📊 Analisi del Brano Generato")
+                audio_analysis_results = analyze_audio_features(final_audio, AUDIO_SAMPLE_RATE)
+                analysis_text = "--- Analisi del Brano Generato ---\n\n"
+                for key, value in audio_analysis_results.items():
+                    analysis_text += f"{key}: {value}\n"
+                
+                analysis_file_path = os.path.join("/tmp", f"audio_analysis_{base_name_output}.txt")
+                with open(analysis_file_path, "w") as f:
+                    f.write(analysis_text)
+                
+                st.text("Ecco un riepilogo delle caratteristiche audio:")
+                st.code(analysis_text)
+                st.download_button(
+                    "⬇️ Scarica Analisi Audio (TXT)",
+                    data=analysis_text.encode('utf-8'),
+                    file_name=f"audio_analysis_{base_name_output}.txt",
+                    mime="text/plain"
+                )
+                # --- Fine della nuova funzionalità di analisi audio ---
+
+
                 if download_audio_only:
                     with open(audio_output_path, "rb") as f:
                         st.download_button(
@@ -883,7 +955,7 @@ def main():
                             st.error(f"❌ Errore generico durante l'unione/ricodifica: {str(e)}")
                         finally: # Questo blocco viene sempre eseguito
                             # Pulizia:
-                            for temp_f in [video_input_path, audio_output_path, final_video_path]:
+                            for temp_f in [video_input_path, audio_output_path, final_video_path, analysis_file_path]:
                                 if os.path.exists(temp_f):
                                     os.remove(temp_f)
                             st.info("🗑️ File temporanei puliti.")
