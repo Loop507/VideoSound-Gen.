@@ -949,8 +949,9 @@ def main():
                                     mime="video/mp4"
                                 )
                         except subprocess.CalledProcessError as e:
-                            st.error(f"❌ Errore FFmpeg durante l'unione/ricodifica: {e.stderr.decode()}")
-                            st.code(e.stdout.decode() + e.stderr.decode()) 
+                            # CORREZIONE: Rimosso .decode() perché l'output è già una stringa con text=True
+                            st.error(f"❌ Errore FFmpeg durante l'unione/ricodifica: {e.stderr}")
+                            st.code(e.stdout + e.stderr) 
                         except Exception as e:
                             st.error(f"❌ Errore generico durante l'unione/ricodifica: {str(e)}")
                         finally: # Questo blocco viene sempre eseguito
