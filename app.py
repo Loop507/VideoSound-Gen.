@@ -237,7 +237,7 @@ class AudioGenerator:
             grain_dur_samples = int(current_grain_dur_seconds * self.sample_rate)
             grain_dur_samples = max(10, grain_dur_samples) # Minimo 10 campioni per grano
 
-            for _ in range(num_grains_in_segment): # Correzione qui: da num_grains_in_gamesegment a num_grains_in_segment
+            for _ in range(num_grains_in_segment):
                 # Posizione casuale del grano all'interno del segmento corrente
                 start_sample_segment = i * samples_per_virtual_frame
                 end_sample_segment = min((i + 1) * samples_per_virtual_frame, self.total_samples)
@@ -724,7 +724,7 @@ def main():
             min_delay_time = st.slider("Min Tempo Delay (s)", 0.01, 0.5, 0.05, 0.01, disabled=not enable_delay)
             max_delay_time = st.slider("Max Tempo Delay (s)", 0.01, 0.5, 0.3, 0.01, disabled=not enable_delay)
             min_feedback = st.slider("Min Feedback Delay (0-1)", 0.0, 0.9, 0.2, 0.01, disabled=not enable_delay)
-            max_feedback = st.slider("Max Feedback Delay (0-1)", 0.0, 0.9, 0.7, 0.01, disabled=not enable_delay)
+            max_feedback = st.slider("Max Feedback Delay (0.0-0.95)", 0.0, 0.95, 0.7, 0.01, disabled=not enable_delay)
 
         with st.expander("Effetto Riverbero"):
             enable_reverb = st.checkbox("Applica Riverbero", value=False, disabled=not enable_dynamic_effects)
@@ -928,6 +928,14 @@ def main():
                         st.info("🎥 Unione video e audio con FFmpeg in corso...")
                         final_video_path = os.path.join("/tmp", f"final_video_with_audio_{base_name_output}.mp4")
 
+                        # CONTROLLO AGGIUNTIVO: Verifica che i file esistano prima di chiamare FFmpeg
+                        if not os.path.exists(video_input_path):
+                            st.error(f"❌ Errore: Il file video di input non è stato trovato a '{video_input_path}'.")
+                            return
+                        if not os.path.exists(audio_output_path):
+                            st.error(f"❌ Errore: Il file audio generato non è stato trovato a '{audio_output_path}'.")
+                            return
+
                         # Ottieni la risoluzione desiderata
                         target_width, target_height = FORMAT_RESOLUTIONS[output_resolution_choice]
 
@@ -953,7 +961,7 @@ def main():
 
                         try:
                             # Esegui il comando FFmpeg
-                            subprocess.run(ffmpeg_command, check=True, capture_output=True, text=True)
+                            process = subprocess.run(ffmpeg_command, check=True, capture_output=True, text=True) # text=True decodifica stdout/stderr
                             
                             st.success("✅ Video con audio generato con successo!")
                             with open(final_video_path, "rb") as f:
@@ -964,8 +972,8 @@ def main():
                                     mime="video/mp4"
                                 )
                         except subprocess.CalledProcessError as e:
-                            st.error(f"❌ Errore FFmpeg durante l'unione/ricodifica: {e.stderr}")
-                            st.code(e.stdout + e.stderr) 
+                            st.error(f"❌ Errore FFmpeg durante l'unione/ricodifica:")
+                            st.code(f"STDOUT:\n{e.stdout}\nSTDERR:\n{e.stderr}")
                         except Exception as e:
                             st.error(f"❌ Errore generico durante l'unione/ricodifica: {str(e)}")
                         finally: # Questo blocco viene sempre eseguito
