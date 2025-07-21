@@ -226,37 +226,19 @@ class AudioGenerator:
 
             # Genera grani all'interno del frame corrente
             for _ in range(grain_density):
-                if grain_duration_samples == 0:
-                    continue
+                if grain_duration_samples == 0: continue
 
-                # Assicurati che la durata del grano non superi la durata del frame
-                actual_grain_duration_samples = min(grain_duration_samples, self.samples_per_frame)
-                
-                # Calcola il massimo offset di partenza possibile per il grano all'interno del frame corrente.
-                # Questo assicura che il grano (della lunghezza actual_grain_duration_samples)
-                # non si estenda oltre il segmento audio del frame corrente.
-                max_start_offset_in_frame = self.samples_per_frame - actual_grain_duration_samples
-                
-                # Assicurati che l'offset massimo sia non negativo
-                max_start_offset_in_frame = max(0, max_start_offset_in_frame)
+                grain_start = frame_start_sample + np.random.randint(0, self.samples_per_frame - grain_duration_samples + 1)
+                grain_end = grain_start + grain_duration_samples
 
-                # Genera un offset casuale per la partenza del grano all'interno del segmento del frame
-                grain_start_offset_within_frame = np.random.randint(0, max_start_offset_in_frame + 1)
-                
-                # Calcola il punto di partenza assoluto del grano nell'audio totale
-                grain_start = frame_start_sample + grain_start_offset_within_frame
-                grain_end = grain_start + actual_grain_duration_samples
-
-                # Se il grano esce dalla durata totale dell'audio, tronca
                 if grain_end > total_samples:
                     grain_end = total_samples
-                    actual_grain_duration_samples = grain_end - grain_start
-                    if actual_grain_duration_samples <= 0:
-                        continue # Salta questo grano se la sua durata effettiva è zero o negativa
+                    grain_duration_samples = grain_end - grain_start
+                    if grain_duration_samples <= 0: continue
 
-                t_grain = np.linspace(0, actual_grain_duration_samples / self.sample_rate, actual_grain_duration_samples, endpoint=False)
+                t_grain = np.linspace(0, grain_duration_samples / self.sample_rate, grain_duration_samples, endpoint=False)
                 # Semplice onda sinusoidale per il grano con inviluppo hanning
-                grain = np.sin(2 * np.pi * grain_freq * t_grain) * np.hanning(actual_grain_duration_samples)
+                grain = np.sin(2 * np.pi * grain_freq * t_grain) * np.hanning(grain_duration_samples)
 
                 granular_audio_layer[grain_start:grain_end] += grain
 
