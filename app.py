@@ -5,7 +5,7 @@ import os
 import subprocess
 import gc
 import shutil
-from typing import Tuple, Optional
+from typing import Tuple, Optional, Union
 import soundfile as sf
 from scipy.signal import butter, lfilter
 import librosa
@@ -37,21 +37,29 @@ def check_ffmpeg():
         return False
 
 def _map_value(
-    value: float,
+    value: Union[float, np.ndarray], # Accetta sia float che ndarray
     old_min: float,
     old_max: float,
     new_min: float,
     new_max: float
-) -> float:
-    """Mappa un valore da un intervallo a un altro, con clipping."""
+) -> Union[float, np.ndarray]:
+    """Mappa un valore o un array di valori da un intervallo a un altro, con clipping."""
     if old_max == old_min:
-        return new_min # Evita divisione per zero se l'intervallo è piatto
+        if isinstance(value, np.ndarray):
+            return np.full_like(value, new_min, dtype=np.float32)
+        else:
+            return new_min # Evita divisione per zero se l'intervallo è piatto
     
     # Clipa il valore all'interno del vecchio intervallo prima di mapparlo
     clipped_value = np.clip(value, old_min, old_max)
     
     mapped_value = new_min + (clipped_value - old_min) * (new_max - new_min) / (old_max - old_min)
-    return float(mapped_value) # Converti a float nativo per compatibilità
+    
+    # Se l'input era un array, ritorna un array. Altrimenti, un float.
+    if isinstance(value, np.ndarray):
+        return mapped_value.astype(np.float32)
+    else:
+        return float(mapped_value) # Converti a float nativo per compatibilità
 
 def validate_video_file(uploaded_file):
     """Controlla la dimensione del file video e il tipo."""
@@ -104,7 +112,7 @@ def analyze_video_frames(video_path: str, progress_bar, status_text) -> Tuple[
         # Luminosità (media dei pixel in scala di grigi)
         brightness_values.append(np.mean(gray_frame) / 255.0)
 
-        # Dettaglio/Contrasto (varianza di Laplacian)
+        # Dettaglio/Contrasto (varienza di Laplacian)
         # La varianza del Laplaciano è un buon indicatore di nitidezza/dettaglio
         laplacian_var = cv2.Laplacian(gray_frame, cv2.CV_64F).var()
         detail_values.append(laplacian_var)
@@ -298,7 +306,7 @@ class AudioGenerator:
             # Tuttavia, scrivi un filtro a stato variabile è complesso.
             # Per semplicità, useremo `librosa.effects.band_biquad` o filtri Butterworth
             # `librosa` non ha filtri dinamici per Q, quindi simuliamo con Butterworth o lo escludiamo.
-
+            
             # Per questo esempio, usiamo Butterworth con una frequenza di taglio variabile.
             # La risonanza Q non è direttamente un parametro del filtro Butterworth standard in scipy.
             # Se la risonanza è cruciale, si dovrebbe usare un filtro biquad dinamico o un SVF.
@@ -309,9 +317,6 @@ class AudioGenerator:
             # Richiede l'intero audio per volta, quindi dobbiamo ricalcolare a ogni chiamata
             # OPPURE lo applichiamo in batch più piccoli, ma è più complesso
             # L'approccio più semplice è calcolare i parametri per ogni frame e applicare un filtro statico.
-            
-            # Per Streamlit e Librosa, la strategia migliore è applicare i filtri su blocchi audio
-            # calcolando i parametri del filtro per ogni blocco.
             
             # Numero di campioni per blocco (corrisponde a un "frame" audio)
             samples_per_block = int(self.sample_rate / self.fps)
@@ -352,6 +357,7 @@ class AudioGenerator:
             if len(block) == 0:
                 continue
 
+            # Applica _map_value solo al singolo valore interpolato, non all'array
             current_cutoff = _map_value(brightness_interp[start_sample], 0.0, 1.0, min_cutoff, max_cutoff)
             current_resonance = _map_value(detail_interp[start_sample], 0.0, 1.0, min_res, max_res)
 
@@ -433,6 +439,7 @@ class AudioGenerator:
         modulator_freq_interp = np.interp(audio_indices, frames_indices, movement_data)
         mod_index_interp = np.interp(audio_indices, frames_indices, detail_data) # Usiamo detail per l'indice
 
+        # Applica _map_value a tutti gli array interpolati
         carrier_freq_interp = _map_value(carrier_freq_interp, 0.0, 1.0, min_carrier_freq, max_carrier_freq)
         modulator_freq_interp = _map_value(modulator_freq_interp, 0.0, 1.0, min_modulator_freq, max_modulator_freq)
         mod_index_interp = _map_value(mod_index_interp, 0.0, 1.0, min_mod_index, max_mod_index)
@@ -507,6 +514,7 @@ class AudioGenerator:
         grain_density_interp = np.interp(audio_indices, frames_indices, movement_data)
         grain_duration_interp = np.interp(audio_indices, frames_indices, detail_data)
 
+        # Applica _map_value a tutti gli array interpolati
         grain_freq_interp = _map_value(grain_freq_interp, 0.0, 1.0, min_grain_freq, max_grain_freq)
         grain_density_interp = _map_value(grain_density_interp, 0.0, 1.0, min_grain_density, max_grain_density)
         grain_duration_interp = _map_value(grain_duration_interp, 0.0, 1.0, min_grain_duration, max_grain_duration)
@@ -581,8 +589,14 @@ class AudioGenerator:
         audio_indices = np.linspace(0, num_frames - 1, len(audio_data))
 
         noise_amp_interp = np.interp(audio_indices, frames_indices, detail_data)
-        noise_amp_interp = _map_value(noise_amp_interp, 0.0, 1.0, min_noise_amp, max_noise_amp)
-        noise_amp_interp = np.clip(noise_amp_interp, 0.0, 1.0) # Ampiezza tra 0 e 1
+        
+        # Applicazione vettorializzata della mappatura
+        # Old way: noise_amp_interp = _map_value(noise_amp_interp, 0.0, 1.0, min_noise_amp, max_noise_amp)
+        # New way:
+        clipped_noise_amp_interp = np.clip(noise_amp_interp, 0.0, 1.0)
+        noise_amp_mapped = min_noise_amp + (clipped_noise_amp_interp - 0.0) * \
+                           (max_noise_amp - min_noise_amp) / (1.0 - 0.0)
+        noise_amp_interp = np.clip(noise_amp_mapped, 0.0, 1.0) # Clip finale tra 0 e 1 per ampiezza
 
         noise = np.random.uniform(-1.0, 1.0, len(audio_data)).astype(np.float32)
         modulated_noise = noise * noise_amp_interp
