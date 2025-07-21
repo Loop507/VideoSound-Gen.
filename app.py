@@ -1,12 +1,3 @@
-Hai riscontrato un altro `ValueError`, questa volta nella funzione `apply_glitch_effect` alla riga 315, durante l'assegnazione: `glitched_audio[start_glitch_sample:end_glitch_sample] = glitched_segment`.
-
-Questo errore è simile al precedente e indica che la lunghezza dell'array `glitched_segment` non corrisponde esattamente alla lunghezza dello slice `glitched_audio[start_glitch_sample:end_glitch_sample]` a cui stai cercando di assegnare.
-
-Il problema si verifica principalmente quando il tipo di glitch è "repeat" e `np.tile` crea un segmento ripetuto più lungo della porzione di audio a cui dovrebbe essere applicato il glitch. Ho modificato la logica per garantire che `glitched_segment` abbia sempre la lunghezza esatta dello slice di destinazione, sia troncandolo che riempiendolo con zeri se necessario.
-
-Sostituisci il contenuto del tuo file `app.py` con il codice seguente, che include questa correzione:
-
-```python
 import streamlit as st
 import numpy as np
 import cv2
@@ -327,7 +318,7 @@ class AudioGenerator:
                             else: # Stereo
                                 glitched_segment = temp_repeated_segment[:segment.shape[0], :]
                                 if glitched_segment.shape[0] < segment.shape[0]:
-                                    glitched_segment = np.pad(glitched_segment, ((0, segment.shape[0] - glitched_segment.shape[0]), (0,0)))
+                                    glitched_segment = np.pad(glitched_segment, ((0, segment.shape[0] - segment.shape[0]), (0,0)))
                             glitched_audio[start_glitch_sample:end_glitch_sample] = glitched_segment
 
                         elif glitch_type == "noise":
@@ -1050,5 +1041,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-```
