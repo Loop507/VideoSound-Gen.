@@ -522,9 +522,9 @@ def main():
             st.session_state[key] = val
 
     # === GESTIONE INIZIALE DELLO STATO E DEI PARAMETRI URL ===
-    query_params = st.experimental_get_query_params()
+    query_params = st.query_params
     if 'preset' in query_params:
-        encoded_state = query_params['preset'][0]
+        encoded_state = query_params['preset']
         loaded_state = load_state_from_string(encoded_state)
         if loaded_state:
             for key, value in loaded_state.items():
@@ -909,8 +909,8 @@ def main():
         if st.sidebar.button("🔗 Copia Link con Preset"):
             state_to_save = {key: st.session_state[key] for key in st.session_state.keys() if key not in ['uploaded_file']}
             encoded_state = save_state_to_string(state_to_save)
-            query_params = {'preset': encoded_state}
-            app_url = f"{st.get_app_url()}?{urllib.parse.urlencode(query_params)}"
+            query_params_url = {'preset': encoded_state}
+            app_url = f"{st.get_app_url()}?{urllib.parse.urlencode(query_params_url)}"
             st.sidebar.text_area("Link Condivisibile", app_url, height=50)
             st.sidebar.success("Link copiato! Puoi incollarlo e condividerlo.")
         # =======================================================
