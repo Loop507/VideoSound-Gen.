@@ -10,12 +10,7 @@ import soundfile as sf
 from scipy.signal import butter, lfilter
 import librosa
 import librosa.display
-import re
-import base64
-import json
-import zlib
-import urllib.parse
-import sys
+import re # Spostato qui per assicurare che sia importato all'inizio del modulo
 
 # Costanti globali (puoi modificarle)
 MAX_DURATION = 300  # Durata massima del video in secondi
@@ -30,29 +25,6 @@ FORMAT_RESOLUTIONS = {
     "16:9 (Orizzontale)": (1280, 720),
     "9:16 (Verticale)": (720, 1280)
 }
-
-# === NUOVE FUNZIONI PER SALVARE E CARICARE I PRESET ===
-def save_state_to_string(state: dict) -> str:
-    """Serializza lo stato dell'app in una stringa compressa e codificata in base64."""
-    # Definisce le chiavi da escludere dal salvataggio (es. dati di file caricati, ecc.)
-    keys_to_exclude = ['video_bytes', 'audio_bytes', 'uploaded_file', 'video_placeholder', 'final_video']
-    state_to_save = {k: v for k, v in state.items() if k not in keys_to_exclude}
-    
-    state_json = json.dumps(state_to_save)
-    compressed = zlib.compress(state_json.encode('utf-8'))
-    encoded = base64.b64encode(compressed)
-    return encoded.decode('utf-8')
-
-def load_state_from_string(encoded_state: str) -> Optional[dict]:
-    """Deserializza lo stato da una stringa compressa e codificata."""
-    try:
-        compressed = base64.b64decode(encoded_state)
-        state_json = zlib.decompress(compressed).decode('utf-8')
-        return json.loads(state_json)
-    except Exception as e:
-        st.error(f"❌ Errore nel caricamento del preset: {e}")
-        return None
-# =======================================================
 
 def check_ffmpeg() -> bool:
     """Verifica se FFmpeg è installato e disponibile nel PATH."""
@@ -415,6 +387,7 @@ class AudioGenerator:
         write_indices_reverb = [[0] * num_delay_lines_per_channel for _ in range(num_channels)]
         
         # Tempi di delay fissi per un effetto base di riverbero (in campioni)
+        # Basati sui valori raccomandati per i delay comb filter (Schroeder)
         delay_times_samples = [
             int(0.0297 * self.sample_rate),
             int(0.0371 * self.sample_rate),
@@ -434,16 +407,27 @@ class AudioGenerator:
                     delay_samples = delay_times_samples[dl_idx]
                     read_idx = (write_indices_reverb[c][dl_idx] - delay_samples + self.sample_rate) % self.sample_rate
                     
+                    # Calcola il guadagno di feedback basato sul tempo di decadimento
+                    # Guadagno = 10^(-3 * decay_time_in_seconds / (delay_in_seconds))
+                    # approx_decay_in_seconds = delay_samples / self.sample_rate # Tempo di delay di questa linea
+                    
+                    # Per una stabilità e prevedibilità del riverbero,
+                    # il guadagno di feedback deve essere calcolato in modo che il suono decada entro current_decay_time.
+                    # Un'approssimazione è: feedback_gain = (10**(-3 / (self.sample_rate / delay_samples))) ** (current_decay_time * self.sample_rate / (delay_samples * num_delay_lines_per_channel))
+                    # O più semplicemente, un guadagno fisso dipendente da decay_time che non vada mai sopra 1.0
                     feedback_gain = np.exp(-3 * delay_samples / (self.sample_rate * current_decay_time))
                     feedback_gain = np.clip(feedback_gain, 0.0, 0.99) # Assicurati che non superi 1.0 per stabilità
 
+                    # Output del comb filter
                     delayed_output = delay_lines[c][dl_idx][read_idx]
                     wet_signal += delayed_output
 
+                    # Input del comb filter (dry + feedback)
                     delay_lines[c][dl_idx][write_indices_reverb[c][dl_idx]] = dry_signal + delayed_output * feedback_gain
                     
                     write_indices_reverb[c][dl_idx] = (write_indices_reverb[c][dl_idx] + 1) % self.sample_rate
 
+                # Mix dry e wet (output del riverbero)
                 reverbed_audio[i, c] = dry_signal * (1 - current_mix) + wet_signal * current_mix * 0.2 # Wet attenuato
 
         return reverbed_audio.squeeze() if num_channels == 1 else reverbed_audio
@@ -463,22 +447,36 @@ class AudioGenerator:
 
         nyquist = 0.5 * self.sample_rate
 
+        # Frequenze di taglio per le bande (es. 200 Hz per bassi, 2000 Hz per alti)
         low_cutoff_freq = 200 / nyquist
         high_cutoff_freq = 2000 / nyquist
 
+        # Filtri Butterworth per le bande (questi sono fissi per efficienza)
+        # Basse (passa-basso)
         b_low, a_low = butter(2, low_cutoff_freq, btype='low', analog=False)
+        # Alte (passa-alto)
         b_high, a_high = butter(2, high_cutoff_freq, btype='high', analog=False)
+        # Medie (banda passante, ottenuta sottraendo bassi e alti dal segnale originale)
 
+        # Applica i filtri alle intere tracce per efficienza
+        # Questo non è un EQ parametrico frame-per-frame, ma un EQ globale con gain dinamico.
+        # Per un EQ dinamico più preciso, avremmo bisogno di implementare filtri che possono cambiare coefficienti al volo (difficile con scipy.signal.lfilter)
+        # Alternativa: suddividere l'audio in blocchi e applicare EQ su ogni blocco con i coefficienti attuali.
+
+        # Versione semplificata: applica filtri e poi modula il guadagno delle bande.
         low_band = lfilter(b_low, a_low, eq_audio, axis=0)
         high_band = lfilter(b_high, a_high, eq_audio, axis=0)
 
-        mid_band = eq_audio - low_band - high_band
+        # La banda media è il segnale originale meno le componenti basse e alte (approssimazione)
+        mid_band = eq_audio - low_band - high_band # Potrebbe introdurre artefatti per filtri non ideali
 
+        # Iterazione per applicare il guadagno dinamico
         for i in range(len(eq_audio)):
             current_low_gain_db = low_gain_interp[i]
             current_mid_gain_db = mid_gain_interp[i]
             current_high_gain_db = high_gain_interp[i]
 
+            # Converti dB in fattori lineari
             low_gain_linear = 10**(current_low_gain_db / 20)
             mid_gain_linear = 10**(current_mid_gain_db / 20)
             high_gain_linear = 10**(current_high_gain_db / 20)
@@ -493,76 +491,48 @@ class AudioGenerator:
 
 def main():
     st.set_page_config(layout="wide", page_title="VideoSound Gen. by Loop507", page_icon="🎵")
+
+    # Modifica 1: Titolo con "by Loop507" più piccolo
     st.markdown("# VideoSound Gen. <small>by Loop507</small>", unsafe_allow_html=True)
     st.markdown("Crea colonne sonore uniche dai tuoi video, trasformando i dati visivi in paesaggi sonori dinamici.")
 
-    # Inizializza session_state con valori di default se non esistono
-    for key, val in {
-        'duration': 0, 'fps': 30, 'width': 1920, 'height': 1080, 'channels': 2, 'sample_rate': 44100,
-        'amplitude': 1000, 'subtractive_on': True, 'sub_freq_src': 'Luminosità', 'sub_amp_src': 'Luminosità',
-        'sub_waveform_type': 'sine', 'sub_freq_min': 100, 'sub_freq_max': 800, 'sub_amp_min': 0.1,
-        'sub_amp_max': 0.5, 'fm_on': True, 'fm_carr_src': 'Luminosità', 'fm_mod_src': 'Luminosità',
-        'fm_idx_src': 'Luminosità', 'fm_amp_src': 'Luminosità', 'fm_carr_min': 200, 'fm_carr_max': 1500,
-        'fm_mod_min': 50, 'fm_mod_max': 250, 'fm_idx_min': 0.5, 'fm_idx_max': 5.0, 'fm_amp_min': 0.05,
-        'fm_amp_max': 0.3, 'granular_on': True, 'gran_dens_src': 'Dettaglio', 'gran_dur_src': 'Dettaglio',
-        'gran_amp_src': 'Dettaglio', 'gran_dens_min': 1, 'gran_dens_max': 5, 'gran_dur_min': 0.02,
-        'gran_dur_max': 0.05, 'gran_amp_min': 0.01, 'gran_amp_max': 0.1, 'noise_on': True,
-        'noise_amp_src': 'Variazione Movimento', 'noise_amp_min': 0.0, 'noise_amp_max': 0.1,
-        'glitch_on': False, 'glitch_factor_src': 'Variazione Movimento', 'glitch_intensity_src': 'Variazione Movimento',
-        'glitch_factor_min': 0.01, 'glitch_factor_max': 0.1, 'glitch_intensity_min': 0.1, 'glitch_intensity_max': 0.8,
-        'delay_on': False, 'delay_time_src': 'Movimento', 'delay_feedback_src': 'Movimento',
-        'delay_time_min': 0.1, 'delay_time_max': 0.3, 'delay_feedback_min': 0.3, 'delay_feedback_max': 0.7,
-        'reverb_on': False, 'reverb_decay_src': 'Luminosità', 'reverb_mix_src': 'Luminosità',
-        'reverb_decay_min': 1.0, 'reverb_decay_max': 3.0, 'reverb_mix_min': 0.2, 'reverb_mix_max': 0.6,
-        'eq_on': False, 'eq_low_src': 'Luminosità', 'eq_mid_src': 'Dettaglio', 'eq_high_src': 'Movimento',
-        'eq_gain_min': -10.0, 'eq_gain_max': 10.0, 'output_resolution_choice': '16:9 (Orizzontale)',
-        'normalize_audio': True, 'use_original_audio': False, 'original_audio_mix_level': 0.5
-    }.items():
-        if key not in st.session_state:
-            st.session_state[key] = val
-
-    # === GESTIONE INIZIALE DELLO STATO E DEI PARAMETRI URL ===
-    query_params = st.query_params
-    if 'preset' in query_params:
-        encoded_state = query_params['preset']
-        loaded_state = load_state_from_string(encoded_state)
-        if loaded_state:
-            for key, value in loaded_state.items():
-                st.session_state[key] = value
-            st.info("Preset caricato dall'URL!")
-            # Ricarica l'app per applicare i nuovi valori ai widget
-            st.experimental_rerun()
-    # =======================================================
-    
     st.sidebar.header("Carica Video")
     uploaded_file = st.sidebar.file_uploader("Scegli un file video (MP4, MOV, AVI, ecc.)", type=["mp4", "mov", "avi", "mkv"])
 
+    # Variabili per memorizzare i parametri scelti dall'utente per la descrizione finale
     params = {}
+
+    # Inizializza audio_output_path e base_name_output a None per evitare UnboundLocalError
+    # Saranno sovrascritti se il pulsante viene cliccato e la generazione audio avviene.
     audio_output_path = None
     base_name_output = None
 
     if uploaded_file is not None:
         if not validate_video_file(uploaded_file):
+            # Se la validazione fallisce, pulisci il file caricato e termina
             if os.path.exists(f"temp_input_{uploaded_file.name}"):
                 os.remove(f"temp_input_{uploaded_file.name}")
             return
 
         st.sidebar.success("✅ Video caricato con successo!")
 
+        # Salva il file temporaneamente
         video_input_path = f"temp_input_{uploaded_file.name}"
         with open(video_input_path, "wb") as f:
             f.write(uploaded_file.getbuffer())
 
         luminosity_data, detail_data, movement_data, variation_movement_data, horizontal_mass_center_data, duration_seconds, fps = analyze_video_frames(video_input_path)
 
-        if duration_seconds == 0.0:
+        if duration_seconds == 0.0: # Se l'analisi fallisce o video troppo corto/lungo
             os.remove(video_input_path)
             return
 
+        # base_name_output è ora definito qui, prima dell'uso condizionale
         base_name_output = os.path.splitext(uploaded_file.name)[0]
 
         st.subheader("Generazione Audio")
         
+        # Inizializza AudioGenerator
         audio_generator = AudioGenerator(sample_rate=AUDIO_SAMPLE_RATE, total_duration_seconds=duration_seconds)
 
         # Scheda per i parametri audio
@@ -570,19 +540,20 @@ def main():
             "Sintesi Sottrattiva", "Sintesi FM", "Sintesi Granulare", "Rumore", "Effetti Audio", "Equalizzatore"
         ])
 
+        # Layer 1: Sintesi Sottrattiva (Basato su Luminosità e Dettaglio)
         with tab_sub:
             st.markdown("### Layer: Sintesi Sottrattiva")
-            use_subtractive = st.checkbox("Abilita Sintesi Sottrattiva", value=st.session_state.get('subtractive_on', True), key='subtractive_on')
+            use_subtractive = st.checkbox("Abilita Sintesi Sottrattiva", value=True, key='subtractive_on')
             params['subtractive_enabled'] = use_subtractive
             if use_subtractive:
-                sub_freq_source = st.selectbox("Sorgente Frequenza (Hz)", ["Luminosità", "Dettaglio", "Movimento"], index=["Luminosità", "Dettaglio", "Movimento"].index(st.session_state.get('sub_freq_src', 'Luminosità')), key='sub_freq_src')
-                sub_amp_source = st.selectbox("Sorgente Ampiezza (0-1)", ["Luminosità", "Dettaglio", "Movimento"], index=["Luminosità", "Dettaglio", "Movimento"].index(st.session_state.get('sub_amp_src', 'Luminosità')), key='sub_amp_src')
-                sub_waveform_type = st.selectbox("Tipo di Forma d'Onda", ["sine", "square", "sawtooth"], index=["sine", "square", "sawtooth"].index(st.session_state.get('sub_waveform_type', 'sine')), key='sub_waveform_type')
+                sub_freq_source = st.selectbox("Sorgente Frequenza (Hz)", ["Luminosità", "Dettaglio", "Movimento"], key='sub_freq_src')
+                sub_amp_source = st.selectbox("Sorgente Ampiezza (0-1)", ["Luminosità", "Dettaglio", "Movimento"], key='sub_amp_src')
+                sub_waveform_type = st.selectbox("Tipo di Forma d'Onda", ["sine", "square", "sawtooth"], key='sub_waveform_type')
                 
-                sub_freq_min = st.slider("Frequenza Minima (Hz)", 20, 1000, st.session_state.get('sub_freq_min', 100), key='sub_freq_min')
-                sub_freq_max = st.slider("Frequenza Massima (Hz)", 20, 1000, st.session_state.get('sub_freq_max', 800), key='sub_freq_max')
-                sub_amp_min = st.slider("Ampiezza Minima", 0.0, 1.0, st.session_state.get('sub_amp_min', 0.1), step=0.01, key='sub_amp_min')
-                sub_amp_max = st.slider("Ampiezza Massima", 0.0, 1.0, st.session_state.get('sub_amp_max', 0.5), step=0.01, key='sub_amp_max')
+                sub_freq_min = st.slider("Frequenza Minima (Hz)", 20, 1000, 100, key='sub_freq_min')
+                sub_freq_max = st.slider("Frequenza Massima (Hz)", 20, 1000, 800, key='sub_freq_max')
+                sub_amp_min = st.slider("Ampiezza Minima", 0.0, 1.0, 0.1, step=0.01, key='sub_amp_min')
+                sub_amp_max = st.slider("Ampiezza Massima", 0.0, 1.0, 0.5, step=0.01, key='sub_amp_max')
 
                 params['sub_freq_source'] = sub_freq_source
                 params['sub_amp_source'] = sub_amp_source
@@ -600,30 +571,32 @@ def main():
                 elif sub_amp_source == "Dettaglio": sub_amp_data_raw = detail_data
                 elif sub_amp_source == "Movimento": sub_amp_data_raw = movement_data
                 
+                # Normalizza e scala i dati delle sorgenti
                 sub_freq_scaled = np.interp(sub_freq_data_raw, (min(sub_freq_data_raw) if sub_freq_data_raw else 0, max(sub_freq_data_raw) if sub_freq_data_raw else 1), (sub_freq_min, sub_freq_max)).tolist()
                 sub_amp_scaled = np.interp(sub_amp_data_raw, (min(sub_amp_data_raw) if sub_amp_data_raw else 0, max(sub_amp_data_raw) if sub_amp_data_raw else 1), (sub_amp_min, sub_amp_max)).tolist()
-            else:
+            else: # Aggiunto else per gestire i casi in cui i dati non sono scalati
                 sub_freq_scaled = []
                 sub_amp_scaled = []
 
+        # Layer 2: Sintesi FM (Basato su Variazione Movimento e Centro di Massa Orizzontale)
         with tab_fm:
             st.markdown("### Layer: Sintesi FM")
-            use_fm = st.checkbox("Abilita Sintesi FM", value=st.session_state.get('fm_on', True), key='fm_on')
+            use_fm = st.checkbox("Abilita Sintesi FM", value=True, key='fm_on')
             params['fm_enabled'] = use_fm
             if use_fm:
-                fm_carrier_source = st.selectbox("Sorgente Frequenza Portante (Hz)", ["Luminosità", "Dettaglio", "Movimento", "Variazione Movimento"], index=["Luminosità", "Dettaglio", "Movimento", "Variazione Movimento"].index(st.session_state.get('fm_carr_src', 'Luminosità')), key='fm_carr_src')
-                fm_mod_source = st.selectbox("Sorgente Frequenza Modulatore (Hz)", ["Luminosità", "Dettaglio", "Movimento", "Variazione Movimento"], index=["Luminosità", "Dettaglio", "Movimento", "Variazione Movimento"].index(st.session_state.get('fm_mod_src', 'Luminosità')), key='fm_mod_src')
-                fm_mod_idx_source = st.selectbox("Sorgente Indice Modulazione", ["Luminosità", "Dettaglio", "Movimento", "Variazione Movimento"], index=["Luminosità", "Dettaglio", "Movimento", "Variazione Movimento"].index(st.session_state.get('fm_idx_src', 'Luminosità')), key='fm_idx_src')
-                fm_amp_source = st.selectbox("Sorgente Ampiezza (0-1)", ["Luminosità", "Dettaglio", "Movimento", "Variazione Movimento"], index=["Luminosità", "Dettaglio", "Movimento", "Variazione Movimento"].index(st.session_state.get('fm_amp_src', 'Luminosità')), key='fm_amp_src')
+                fm_carrier_source = st.selectbox("Sorgente Frequenza Portante (Hz)", ["Luminosità", "Dettaglio", "Movimento", "Variazione Movimento"], key='fm_carr_src')
+                fm_mod_source = st.selectbox("Sorgente Frequenza Modulatore (Hz)", ["Luminosità", "Dettaglio", "Movimento", "Variazione Movimento"], key='fm_mod_src')
+                fm_mod_idx_source = st.selectbox("Sorgente Indice Modulazione", ["Luminosità", "Dettaglio", "Movimento", "Variazione Movimento"], key='fm_idx_src')
+                fm_amp_source = st.selectbox("Sorgente Ampiezza (0-1)", ["Luminosità", "Dettaglio", "Movimento", "Variazione Movimento"], key='fm_amp_src')
 
-                fm_carrier_min = st.slider("Portante Minima (Hz)", 50, 2000, st.session_state.get('fm_carr_min', 200), key='fm_carr_min')
-                fm_carrier_max = st.slider("Portante Massima (Hz)", 50, 2000, st.session_state.get('fm_carr_max', 1500), key='fm_carr_max')
-                fm_mod_min = st.slider("Modulatore Minimo (Hz)", 10, 500, st.session_state.get('fm_mod_min', 50), key='fm_mod_min')
-                fm_mod_max = st.slider("Modulatore Massimo (Hz)", 10, 500, st.session_state.get('fm_mod_max', 250), key='fm_mod_max')
-                fm_mod_idx_min = st.slider("Indice Modulazione Minimo", 0.0, 10.0, st.session_state.get('fm_idx_min', 0.5), step=0.1, key='fm_idx_min')
-                fm_mod_idx_max = st.slider("Indice Modulazione Massimo", 0.0, 10.0, st.session_state.get('fm_idx_max', 5.0), step=0.1, key='fm_idx_max')
-                fm_amp_min = st.slider("Ampiezza FM Minima", 0.0, 1.0, st.session_state.get('fm_amp_min', 0.05), step=0.01, key='fm_amp_min')
-                fm_amp_max = st.slider("Ampiezza FM Massima", 0.0, 1.0, st.session_state.get('fm_amp_max', 0.3), step=0.01, key='fm_amp_max')
+                fm_carrier_min = st.slider("Portante Minima (Hz)", 50, 2000, 200, key='fm_carr_min')
+                fm_carrier_max = st.slider("Portante Massima (Hz)", 50, 2000, 1500, key='fm_carr_max')
+                fm_mod_min = st.slider("Modulatore Minimo (Hz)", 10, 500, 50, key='fm_mod_min')
+                fm_mod_max = st.slider("Modulatore Massimo (Hz)", 10, 500, 250, key='fm_mod_max')
+                fm_mod_idx_min = st.slider("Indice Modulazione Minimo", 0.0, 10.0, 0.5, step=0.1, key='fm_idx_min')
+                fm_mod_idx_max = st.slider("Indice Modulazione Massimo", 0.0, 10.0, 5.0, step=0.1, key='fm_idx_max')
+                fm_amp_min = st.slider("Ampiezza FM Minima", 0.0, 1.0, 0.05, step=0.01, key='fm_amp_min')
+                fm_amp_max = st.slider("Ampiezza FM Massima", 0.0, 1.0, 0.3, step=0.01, key='fm_amp_max')
 
                 params['fm_carrier_source'] = fm_carrier_source
                 params['fm_mod_source'] = fm_mod_source
@@ -658,31 +631,33 @@ def main():
                 elif fm_amp_source == "Movimento": fm_amp_data_raw = movement_data
                 elif fm_amp_source == "Variazione Movimento": fm_amp_data_raw = variation_movement_data
 
+
                 fm_carrier_scaled = np.interp(fm_carrier_data_raw, (min(fm_carrier_data_raw) if fm_carrier_data_raw else 0, max(fm_carrier_data_raw) if fm_carrier_data_raw else 1), (fm_carrier_min, fm_carrier_max)).tolist()
                 fm_mod_scaled = np.interp(fm_mod_data_raw, (min(fm_mod_data_raw) if fm_mod_data_raw else 0, max(fm_mod_data_raw) if fm_mod_data_raw else 1), (fm_mod_min, fm_mod_max)).tolist()
                 fm_mod_idx_scaled = np.interp(fm_mod_idx_data_raw, (min(fm_mod_idx_data_raw) if fm_mod_idx_data_raw else 0, max(fm_mod_idx_data_raw) if fm_mod_idx_data_raw else 1), (fm_mod_idx_min, fm_mod_idx_max)).tolist()
                 fm_amp_scaled = np.interp(fm_amp_data_raw, (min(fm_amp_data_raw) if fm_amp_data_raw else 0, max(fm_amp_data_raw) if fm_amp_data_raw else 1), (fm_amp_min, fm_amp_max)).tolist()
-            else:
+            else: # Aggiunto else per gestire i casi in cui i dati non sono scalati
                 fm_carrier_scaled = []
                 fm_mod_scaled = []
                 fm_mod_idx_scaled = []
                 fm_amp_scaled = []
 
+        # Layer 3: Sintesi Granulare (Basato su Dettaglio e Movimento)
         with tab_gran:
             st.markdown("### Layer: Sintesi Granulare")
-            use_granular = st.checkbox("Abilita Sintesi Granulare", value=st.session_state.get('granular_on', True), key='granular_on')
+            use_granular = st.checkbox("Abilita Sintesi Granulare", value=True, key='granular_on')
             params['granular_enabled'] = use_granular
             if use_granular:
-                gran_density_source = st.selectbox("Sorgente Densità Grani", ["Dettaglio", "Movimento", "Variazione Movimento"], index=["Dettaglio", "Movimento", "Variazione Movimento"].index(st.session_state.get('gran_dens_src', 'Dettaglio')), key='gran_dens_src')
-                gran_duration_source = st.selectbox("Sorgente Durata Grani (sec)", ["Dettaglio", "Movimento", "Variazione Movimento"], index=["Dettaglio", "Movimento", "Variazione Movimento"].index(st.session_state.get('gran_dur_src', 'Dettaglio')), key='gran_dur_src')
-                gran_amp_source = st.selectbox("Sorgente Ampiezza Grani (0-1)", ["Dettaglio", "Movimento", "Variazione Movimento"], index=["Dettaglio", "Movimento", "Variazione Movimento"].index(st.session_state.get('gran_amp_src', 'Dettaglio')), key='gran_amp_src')
+                gran_density_source = st.selectbox("Sorgente Densità Grani", ["Dettaglio", "Movimento", "Variazione Movimento"], key='gran_dens_src')
+                gran_duration_source = st.selectbox("Sorgente Durata Grani (sec)", ["Dettaglio", "Movimento", "Variazione Movimento"], key='gran_dur_src')
+                gran_amp_source = st.selectbox("Sorgente Ampiezza Grani (0-1)", ["Dettaglio", "Movimento", "Variazione Movimento"], key='gran_amp_src')
                 
-                gran_density_min = st.slider("Densità Minima Grani", 0, 10, st.session_state.get('gran_dens_min', 1), key='gran_dens_min')
-                gran_density_max = st.slider("Densità Massima Grani", 0, 10, st.session_state.get('gran_dens_max', 5), key='gran_dens_max')
-                gran_duration_min = st.slider("Durata Minima Grani (sec)", 0.01, 0.1, st.session_state.get('gran_dur_min', 0.02), step=0.005, key='gran_dur_min')
-                gran_duration_max = st.slider("Durata Massima Grani (sec)", 0.01, 0.1, st.session_state.get('gran_dur_max', 0.05), step=0.005, key='gran_dur_max')
-                gran_amp_min = st.slider("Ampiezza Grani Minima", 0.0, 1.0, st.session_state.get('gran_amp_min', 0.01), step=0.01, key='gran_amp_min')
-                gran_amp_max = st.slider("Ampiezza Grani Massima", 0.0, 1.0, st.session_state.get('gran_amp_max', 0.1), step=0.01, key='gran_amp_max')
+                gran_density_min = st.slider("Densità Minima Grani", 0, 10, 1, key='gran_dens_min')
+                gran_density_max = st.slider("Densità Massima Grani", 0, 10, 5, key='gran_dens_max')
+                gran_duration_min = st.slider("Durata Minima Grani (sec)", 0.01, 0.1, 0.02, step=0.005, key='gran_dur_min')
+                gran_duration_max = st.slider("Durata Massima Grani (sec)", 0.01, 0.1, 0.05, step=0.005, key='gran_dur_max')
+                gran_amp_min = st.slider("Ampiezza Grani Minima", 0.0, 1.0, 0.01, step=0.01, key='gran_amp_min')
+                gran_amp_max = st.slider("Ampiezza Grani Massima", 0.0, 1.0, 0.1, step=0.01, key='gran_amp_max')
 
                 params['gran_density_source'] = gran_density_source
                 params['gran_duration_source'] = gran_duration_source
@@ -709,19 +684,21 @@ def main():
                 gran_density_scaled = np.interp(gran_density_data_raw, (min(gran_density_data_raw) if gran_density_data_raw else 0, max(gran_density_data_raw) if gran_density_data_raw else 1), (gran_density_min, gran_density_max)).tolist()
                 gran_duration_scaled = np.interp(gran_duration_data_raw, (min(gran_duration_data_raw) if gran_duration_data_raw else 0, max(gran_duration_data_raw) if gran_duration_data_raw else 1), (gran_duration_min, gran_duration_max)).tolist()
                 gran_amp_scaled = np.interp(gran_amp_data_raw, (min(gran_amp_data_raw) if gran_amp_data_raw else 0, max(gran_amp_data_raw) if gran_amp_data_raw else 1), (gran_amp_min, gran_amp_max)).tolist()
-            else:
+            else: # Aggiunto else per gestire i casi in cui i dati non sono scalati
                 gran_density_scaled = []
                 gran_duration_scaled = []
                 gran_amp_scaled = []
 
+
+        # Layer 4: Rumore (Basato su Variazione Movimento)
         with tab_noise:
             st.markdown("### Layer: Rumore")
-            use_noise = st.checkbox("Abilita Rumore", value=st.session_state.get('noise_on', True), key='noise_on')
+            use_noise = st.checkbox("Abilita Rumore", value=True, key='noise_on')
             params['noise_enabled'] = use_noise
             if use_noise:
-                noise_amp_source = st.selectbox("Sorgente Ampiezza Rumore", ["Variazione Movimento", "Movimento", "Dettaglio"], index=["Variazione Movimento", "Movimento", "Dettaglio"].index(st.session_state.get('noise_amp_src', 'Variazione Movimento')), key='noise_amp_src')
-                noise_amp_min = st.slider("Ampiezza Minima Rumore", 0.0, 1.0, st.session_state.get('noise_amp_min', 0.0), step=0.01, key='noise_amp_min')
-                noise_amp_max = st.slider("Ampiezza Massima Rumore", 0.0, 1.0, st.session_state.get('noise_amp_max', 0.1), step=0.01, key='noise_amp_max')
+                noise_amp_source = st.selectbox("Sorgente Ampiezza Rumore", ["Variazione Movimento", "Movimento", "Dettaglio"], key='noise_amp_src')
+                noise_amp_min = st.slider("Ampiezza Minima Rumore", 0.0, 1.0, 0.0, step=0.01, key='noise_amp_min')
+                noise_amp_max = st.slider("Ampiezza Massima Rumore", 0.0, 1.0, 0.1, step=0.01, key='noise_amp_max')
 
                 params['noise_amp_source'] = noise_amp_source
                 params['noise_amp_range'] = (noise_amp_min, noise_amp_max)
@@ -732,23 +709,26 @@ def main():
                 elif noise_amp_source == "Dettaglio": noise_amp_data_raw = detail_data
 
                 noise_amp_scaled = np.interp(noise_amp_data_raw, (min(noise_amp_data_raw) if noise_amp_data_raw else 0, max(noise_amp_data_raw) if noise_amp_data_raw else 1), (noise_amp_min, noise_amp_max)).tolist()
-            else:
+            else: # Aggiunto else per gestire i casi in cui i dati non sono scalati
                 noise_amp_scaled = []
 
+
+        # Effetti Audio (Glitch, Delay, Reverb)
         with tab_fx:
             st.markdown("### Effetti Audio")
             
+            # Glitch
             st.subheader("Glitch")
-            use_glitch = st.checkbox("Abilita Glitch", value=st.session_state.get('glitch_on', False), key='glitch_on')
+            use_glitch = st.checkbox("Abilita Glitch", value=False, key='glitch_on')
             params['glitch_enabled'] = use_glitch
             if use_glitch:
-                glitch_factor_source = st.selectbox("Sorgente Fattore Glitch (Probabilità)", ["Variazione Movimento", "Movimento", "Dettaglio"], index=["Variazione Movimento", "Movimento", "Dettaglio"].index(st.session_state.get('glitch_factor_src', 'Variazione Movimento')), key='glitch_factor_src')
-                glitch_intensity_source = st.selectbox("Sorgente Intensità Glitch (Durata/Ampiezza)", ["Variazione Movimento", "Movimento", "Dettaglio"], index=["Variazione Movimento", "Movimento", "Dettaglio"].index(st.session_state.get('glitch_intensity_src', 'Variazione Movimento')), key='glitch_intensity_src')
+                glitch_factor_source = st.selectbox("Sorgente Fattore Glitch (Probabilità)", ["Variazione Movimento", "Movimento", "Dettaglio"], key='glitch_factor_src')
+                glitch_intensity_source = st.selectbox("Sorgente Intensità Glitch (Durata/Ampiezza)", ["Variazione Movimento", "Movimento", "Dettaglio"], key='glitch_intensity_src')
                 
-                glitch_factor_min = st.slider("Fattore Minimo Glitch (0-1)", 0.0, 1.0, st.session_state.get('glitch_factor_min', 0.01), step=0.005, key='glitch_factor_min')
-                glitch_factor_max = st.slider("Fattore Massimo Glitch (0-1)", 0.0, 1.0, st.session_state.get('glitch_factor_max', 0.1), step=0.005, key='glitch_factor_max')
-                glitch_intensity_min = st.slider("Intensità Minima Glitch (0-1)", 0.0, 1.0, st.session_state.get('glitch_intensity_min', 0.1), step=0.01, key='glitch_intensity_min')
-                glitch_intensity_max = st.slider("Intensità Massima Glitch (0-1)", 0.0, 1.0, st.session_state.get('glitch_intensity_max', 0.8), step=0.01, key='glitch_intensity_max')
+                glitch_factor_min = st.slider("Fattore Minimo Glitch (0-1)", 0.0, 1.0, 0.01, step=0.005, key='glitch_factor_min')
+                glitch_factor_max = st.slider("Fattore Massimo Glitch (0-1)", 0.0, 1.0, 0.1, step=0.005, key='glitch_factor_max')
+                glitch_intensity_min = st.slider("Intensità Minima Glitch (0-1)", 0.0, 1.0, 0.1, step=0.01, key='glitch_intensity_min')
+                glitch_intensity_max = st.slider("Intensità Massima Glitch (0-1)", 0.0, 1.0, 0.8, step=0.01, key='glitch_intensity_max')
 
                 params['glitch_factor_source'] = glitch_factor_source
                 params['glitch_intensity_source'] = glitch_intensity_source
@@ -767,21 +747,22 @@ def main():
 
                 glitch_factor_scaled = np.interp(glitch_factor_data_raw, (min(glitch_factor_data_raw) if glitch_factor_data_raw else 0, max(glitch_factor_data_raw) if glitch_factor_data_raw else 1), (glitch_factor_min, glitch_factor_max)).tolist()
                 glitch_intensity_data = np.interp(glitch_intensity_data_raw, (min(glitch_intensity_data_raw) if glitch_intensity_data_raw else 0, max(glitch_intensity_data_raw) if glitch_intensity_data_raw else 1), (glitch_intensity_min, glitch_intensity_max)).tolist()
-            else:
+            else: # Aggiunto else per gestire i casi in cui i dati non sono scalati
                 glitch_factor_scaled = []
                 glitch_intensity_data = []
 
+            # Delay
             st.subheader("Delay")
-            use_delay = st.checkbox("Abilita Delay", value=st.session_state.get('delay_on', False), key='delay_on')
+            use_delay = st.checkbox("Abilita Delay", value=False, key='delay_on')
             params['delay_enabled'] = use_delay
             if use_delay:
-                delay_time_source = st.selectbox("Sorgente Tempo Delay (sec)", ["Movimento", "Variazione Movimento", "Luminosità"], index=["Movimento", "Variazione Movimento", "Luminosità"].index(st.session_state.get('delay_time_src', 'Movimento')), key='delay_time_src')
-                delay_feedback_source = st.selectbox("Sorgente Feedback Delay (0-1)", ["Movimento", "Variazione Movimento", "Dettaglio"], index=["Movimento", "Variazione Movimento", "Dettaglio"].index(st.session_state.get('delay_feedback_src', 'Movimento')), key='delay_feedback_src')
+                delay_time_source = st.selectbox("Sorgente Tempo Delay (sec)", ["Movimento", "Variazione Movimento", "Luminosità"], key='delay_time_src')
+                delay_feedback_source = st.selectbox("Sorgente Feedback Delay (0-1)", ["Movimento", "Variazione Movimento", "Dettaglio"], key='delay_feedback_src')
                 
-                delay_time_min = st.slider("Tempo Minimo Delay (sec)", 0.01, 0.5, st.session_state.get('delay_time_min', 0.1), step=0.01, key='delay_time_min')
-                delay_time_max = st.slider("Tempo Massimo Delay (sec)", 0.01, 0.5, st.session_state.get('delay_time_max', 0.3), step=0.01, key='delay_time_max')
-                delay_feedback_min = st.slider("Feedback Minimo Delay", 0.0, 0.95, st.session_state.get('delay_feedback_min', 0.3), step=0.01, key='delay_feedback_min')
-                delay_feedback_max = st.slider("Feedback Massimo Delay", 0.0, 0.95, st.session_state.get('delay_feedback_max', 0.7), step=0.01, key='delay_feedback_max')
+                delay_time_min = st.slider("Tempo Minimo Delay (sec)", 0.01, 0.5, 0.1, step=0.01, key='delay_time_min')
+                delay_time_max = st.slider("Tempo Massimo Delay (sec)", 0.01, 0.5, 0.3, step=0.01, key='delay_time_max')
+                delay_feedback_min = st.slider("Feedback Minimo Delay", 0.0, 0.95, 0.3, step=0.01, key='delay_feedback_min')
+                delay_feedback_max = st.slider("Feedback Massimo Delay", 0.0, 0.95, 0.7, step=0.01, key='delay_feedback_max')
 
                 params['delay_time_source'] = delay_time_source
                 params['delay_feedback_source'] = delay_feedback_source
@@ -800,22 +781,23 @@ def main():
 
                 delay_time_scaled = np.interp(delay_time_data_raw, (min(delay_time_data_raw) if delay_time_data_raw else 0, max(delay_time_data_raw) if delay_time_data_raw else 1), (delay_time_min, delay_time_max)).tolist()
                 delay_feedback_scaled = np.interp(delay_feedback_data_raw, (min(delay_feedback_data_raw) if delay_feedback_data_raw else 0, max(delay_feedback_data_raw) if delay_feedback_data_raw else 1), (delay_feedback_min, delay_feedback_max)).tolist()
-            else:
+            else: # Aggiunto else per gestire i casi in cui i dati non sono scalati
                 delay_time_scaled = []
                 delay_feedback_scaled = []
 
 
+            # Reverb
             st.subheader("Riverbero")
-            use_reverb = st.checkbox("Abilita Riverbero", value=st.session_state.get('reverb_on', False), key='reverb_on')
+            use_reverb = st.checkbox("Abilita Riverbero", value=False, key='reverb_on')
             params['reverb_enabled'] = use_reverb
             if use_reverb:
-                reverb_decay_source = st.selectbox("Sorgente Tempo Decadimento (sec)", ["Luminosità", "Dettaglio", "Movimento"], index=["Luminosità", "Dettaglio", "Movimento"].index(st.session_state.get('reverb_decay_src', 'Luminosità')), key='reverb_decay_src')
-                reverb_mix_source = st.selectbox("Sorgente Mix (Wet/Dry)", ["Luminosità", "Dettaglio", "Movimento"], index=["Luminosità", "Dettaglio", "Movimento"].index(st.session_state.get('reverb_mix_src', 'Luminosità')), key='reverb_mix_src')
+                reverb_decay_source = st.selectbox("Sorgente Tempo Decadimento (sec)", ["Luminosità", "Dettaglio", "Movimento"], key='reverb_decay_src')
+                reverb_mix_source = st.selectbox("Sorgente Mix (Wet/Dry)", ["Luminosità", "Dettaglio", "Movimento"], key='reverb_mix_src')
                 
-                reverb_decay_min = st.slider("Decadimento Minimo (sec)", 0.1, 5.0, st.session_state.get('reverb_decay_min', 1.0), step=0.1, key='reverb_decay_min')
-                reverb_decay_max = st.slider("Decadimento Massimo (sec)", 0.1, 5.0, st.session_state.get('reverb_decay_max', 3.0), step=0.1, key='reverb_decay_max')
-                reverb_mix_min = st.slider("Mix Minimo (0-1)", 0.0, 1.0, st.session_state.get('reverb_mix_min', 0.2), step=0.01, key='reverb_mix_min')
-                reverb_mix_max = st.slider("Mix Massimo (0-1)", 0.0, 1.0, st.session_state.get('reverb_mix_max', 0.6), step=0.01, key='reverb_mix_max')
+                reverb_decay_min = st.slider("Decadimento Minimo (sec)", 0.1, 5.0, 1.0, step=0.1, key='reverb_decay_min')
+                reverb_decay_max = st.slider("Decadimento Massimo (sec)", 0.1, 5.0, 3.0, step=0.1, key='reverb_decay_max')
+                reverb_mix_min = st.slider("Mix Minimo (0-1)", 0.0, 1.0, 0.2, step=0.01, key='reverb_mix_min')
+                reverb_mix_max = st.slider("Mix Massimo (0-1)", 0.0, 1.0, 0.6, step=0.01, key='reverb_mix_max')
 
                 params['reverb_decay_source'] = reverb_decay_source
                 params['reverb_mix_source'] = reverb_mix_source
@@ -834,22 +816,23 @@ def main():
 
                 reverb_decay_scaled = np.interp(reverb_decay_data_raw, (min(reverb_decay_data_raw) if reverb_decay_data_raw else 0, max(reverb_decay_data_raw) if reverb_decay_data_raw else 1), (reverb_decay_min, reverb_decay_max)).tolist()
                 reverb_mix_scaled = np.interp(reverb_mix_data_raw, (min(reverb_mix_data_raw) if reverb_mix_data_raw else 0, max(reverb_mix_data_raw) if reverb_mix_data_raw else 1), (reverb_mix_min, reverb_mix_max)).tolist()
-            else:
+            else: # Aggiunto else per gestire i casi in cui i dati non sono scalati
                 reverb_decay_scaled = []
                 reverb_mix_scaled = []
 
 
+        # Equalizzatore Dinamico
         with tab_eq:
             st.markdown("### Equalizzatore Dinamico")
-            use_eq = st.checkbox("Abilita Equalizzatore", value=st.session_state.get('eq_on', False), key='eq_on')
+            use_eq = st.checkbox("Abilita Equalizzatore", value=False, key='eq_on')
             params['eq_enabled'] = use_eq
             if use_eq:
-                eq_low_source = st.selectbox("Sorgente Guadagno Bassi (dB)", ["Luminosità", "Movimento", "Variazione Movimento"], index=["Luminosità", "Movimento", "Variazione Movimento"].index(st.session_state.get('eq_low_src', 'Luminosità')), key='eq_low_src')
-                eq_mid_source = st.selectbox("Sorgente Guadagno Medi (dB)", ["Dettaglio", "Luminosità", "Movimento"], index=["Dettaglio", "Luminosità", "Movimento"].index(st.session_state.get('eq_mid_src', 'Dettaglio')), key='eq_mid_src')
-                eq_high_source = st.selectbox("Sorgente Guadagno Alti (dB)", ["Movimento", "Dettaglio", "Variazione Movimento"], index=["Movimento", "Dettaglio", "Variazione Movimento"].index(st.session_state.get('eq_high_src', 'Movimento')), key='eq_high_src')
+                eq_low_source = st.selectbox("Sorgente Guadagno Bassi (dB)", ["Luminosità", "Movimento", "Variazione Movimento"], key='eq_low_src')
+                eq_mid_source = st.selectbox("Sorgente Guadagno Medi (dB)", ["Dettaglio", "Luminosità", "Movimento"], key='eq_mid_src')
+                eq_high_source = st.selectbox("Sorgente Guadagno Alti (dB)", ["Movimento", "Dettaglio", "Variazione Movimento"], key='eq_high_src')
                 
-                eq_gain_min = st.slider("Guadagno Minimo (dB)", -20.0, 20.0, st.session_state.get('eq_gain_min', -10.0), step=0.5, key='eq_gain_min')
-                eq_gain_max = st.slider("Guadagno Massimo (dB)", -20.0, 20.0, st.session_state.get('eq_gain_max', 10.0), step=0.5, key='eq_gain_max')
+                eq_gain_min = st.slider("Guadagno Minimo (dB)", -20.0, 20.0, -10.0, step=0.5, key='eq_gain_min')
+                eq_gain_max = st.slider("Guadagno Massimo (dB)", -20.0, 20.0, 10.0, step=0.5, key='eq_gain_max')
 
                 params['eq_low_source'] = eq_low_source
                 params['eq_mid_source'] = eq_mid_source
@@ -874,73 +857,39 @@ def main():
                 eq_low_scaled = np.interp(eq_low_data_raw, (min(eq_low_data_raw) if eq_low_data_raw else 0, max(eq_low_data_raw) if eq_low_data_raw else 1), (eq_gain_min, eq_gain_max)).tolist()
                 eq_mid_scaled = np.interp(eq_mid_data_raw, (min(eq_mid_data_raw) if eq_mid_data_raw else 0, max(eq_mid_data_raw) if eq_mid_data_raw else 1), (eq_gain_min, eq_gain_max)).tolist()
                 eq_high_scaled = np.interp(eq_high_data_raw, (min(eq_high_data_raw) if eq_high_data_raw else 0, max(eq_high_data_raw) if eq_high_data_raw else 1), (eq_gain_min, eq_gain_max)).tolist()
-            else:
+            else: # Aggiunto else per gestire i casi in cui i dati non sono scalati
                 eq_low_scaled = []
                 eq_mid_scaled = []
                 eq_high_scaled = []
 
 
-        st.sidebar.markdown("---")
-        # === NUOVO BLOCCO PER SALVARE/CARICARE I PRESET NELLA SIDEBAR ===
-        st.sidebar.subheader("Salva e Carica Preset")
-        preset_name = st.sidebar.text_input("Nome Preset", value="", key='preset_name')
-
-        if st.sidebar.button("💾 Salva Preset come File"):
-            state_to_save = {key: st.session_state[key] for key in st.session_state.keys() if key not in ['uploaded_file']}
-            encoded_state = save_state_to_string(state_to_save)
-            st.sidebar.download_button(
-                label="⬇️ Scarica Preset",
-                data=encoded_state,
-                file_name=f"{preset_name if preset_name else 'preset'}.json",
-                mime="application/json"
-            )
-            st.sidebar.success("Preset salvato! Clicca sul pulsante 'Scarica Preset'.")
-
-        uploaded_preset_file = st.sidebar.file_uploader("Carica Preset da File", type="json")
-        if uploaded_preset_file is not None:
-            encoded_state = uploaded_preset_file.getvalue().decode('utf-8')
-            loaded_state = load_state_from_string(encoded_state)
-            if loaded_state:
-                st.session_state.update(loaded_state)
-                st.experimental_rerun()
-            else:
-                st.sidebar.error("❌ Errore nel caricamento del file preset.")
-
-        if st.sidebar.button("🔗 Copia Link con Preset"):
-            state_to_save = {key: st.session_state[key] for key in st.session_state.keys() if key not in ['uploaded_file']}
-            encoded_state = save_state_to_string(state_to_save)
-            query_params_url = {'preset': encoded_state}
-            app_url = f"{st.get_app_url()}?{urllib.parse.urlencode(query_params_url)}"
-            st.sidebar.text_area("Link Condivisibile", app_url, height=50)
-            st.sidebar.success("Link copiato! Puoi incollarlo e condividerlo.")
-        # =======================================================
-
-
         st.subheader("Impostazioni Output Video")
-        output_resolution_choice = st.selectbox("Formato Video Output", list(FORMAT_RESOLUTIONS.keys()), index=list(FORMAT_RESOLUTIONS.keys()).index(st.session_state.get('output_resolution_choice', '16:9 (Orizzontale)')))
+        output_resolution_choice = st.selectbox("Formato Video Output", list(FORMAT_RESOLUTIONS.keys()))
         params['output_resolution_choice'] = output_resolution_choice
 
         col_audio, col_video = st.columns(2)
         with col_audio:
-            normalize_audio = st.checkbox("Normalizza Audio Finale", value=st.session_state.get('normalize_audio', True))
+            normalize_audio = st.checkbox("Normalizza Audio Finale", value=True)
             params['normalize_audio'] = normalize_audio
         with col_video:
-            use_original_audio = st.checkbox("Mantieni Audio Originale del Video (Mix con quello generato)", value=st.session_state.get('use_original_audio', False))
+            use_original_audio = st.checkbox("Mantieni Audio Originale del Video (Mix con quello generato)", value=False)
             params['use_original_audio'] = use_original_audio
             if use_original_audio:
-                original_audio_mix_level = st.slider("Livello Mix Audio Originale", 0.0, 1.0, st.session_state.get('original_audio_mix_level', 0.5), step=0.01)
+                original_audio_mix_level = st.slider("Livello Mix Audio Originale", 0.0, 1.0, 0.5, step=0.01)
                 params['original_audio_mix_level'] = original_audio_mix_level
             else:
                 params['original_audio_mix_level'] = 0.0
 
 
         if st.button("Genera Video con Audio"):
+            # Sempre tenta la generazione audio se il pulsante è cliccato
             st.info("🎵 Generazione e mixaggio audio in corso... Attendere.")
             progress_bar_audio = st.progress(0)
             status_text_audio = st.empty()
 
             combined_audio = np.zeros(audio_generator.total_samples, dtype=np.float32)
 
+            # Generazione dei Layer Audio
             if use_subtractive:
                 subtractive_audio = audio_generator.generate_subtractive_waveform(sub_freq_scaled, sub_amp_scaled, sub_waveform_type)
                 combined_audio += subtractive_audio
@@ -955,11 +904,12 @@ def main():
 
             if use_noise:
                 noise_audio = audio_generator.add_noise_layer(combined_audio, noise_amp_scaled)
-                combined_audio += noise_audio
+                combined_audio += noise_audio # Aggiungi al combined_audio esistente
 
             progress_bar_audio.progress(30)
             status_text_audio.text("Applicazione effetti audio...")
 
+            # Applicazione degli Effetti Audio
             if use_glitch:
                 combined_audio = audio_generator.apply_glitch_effect(combined_audio, glitch_factor_scaled, glitch_intensity_data)
             
@@ -976,13 +926,16 @@ def main():
             status_text_audio.text("Normalizzazione audio...")
 
             if normalize_audio:
+                # Prevenire divisione per zero se l'audio è silenzioso
                 if np.max(np.abs(combined_audio)) > 1e-6:
                     combined_audio = librosa.util.normalize(combined_audio)
                 else:
-                    combined_audio = np.zeros_like(combined_audio)
-            
+                    combined_audio = np.zeros_like(combined_audio) # Mantieni a zero se già silenzioso
+
+            # Assicurati che l'audio sia nel range [-1, 1] per soundfile
             combined_audio = np.clip(combined_audio, -1.0, 1.0)
             
+            # audio_output_path è assegnato qui, sempre se il pulsante è cliccato
             audio_output_path = "output_audio.wav"
             sf.write(audio_output_path, combined_audio, AUDIO_SAMPLE_RATE)
             
@@ -990,8 +943,9 @@ def main():
             status_text_audio.text("Audio generato!")
             st.success("✅ Audio generato con successo!")
             
-            gc.collect()
+            gc.collect() # Libera memoria
 
+            # Ora controlla FFmpeg DOPO la generazione audio
             if not check_ffmpeg():
                 st.warning(f"⚠️ FFmpeg non è installato o non è nel PATH. Impossibile unire il video con l'audio. L'audio generato è disponibile in '{audio_output_path}'.")
                 with open(audio_output_path, "rb") as f:
@@ -1001,11 +955,12 @@ def main():
                         file_name=f"videosound_generato_audio_{base_name_output}.wav",
                         mime="audio/wav"
                     )
+                # Pulisci i file temporanei ANCHE se FFmpeg non è stato trovato
                 for temp_f in [video_input_path, audio_output_path]:
                     if temp_f and os.path.exists(temp_f):
                         os.remove(temp_f)
                 st.info("🗑️ File temporanei puliti.")
-            else:
+            else: # FFmpeg è disponibile, procedi con l'unione di video e audio
                 st.info("🎥 Unione audio/video e ricodifica in corso... Potrebbe richiedere del tempo.")
                 progress_bar_video = st.progress(0)
                 status_text_video = st.empty()
@@ -1015,45 +970,29 @@ def main():
                 ffmpeg_command = ["ffmpeg", "-y"]
 
                 if use_original_audio:
-                    temp_original_audio_path = "temp_original_audio.aac"
-                    try:
-                        subprocess.run([
-                            "ffmpeg", "-y", "-i", video_input_path, "-vn", "-acodec", "aac", temp_original_audio_path
-                        ], check=True, capture_output=True)
-                    except subprocess.CalledProcessError as e:
-                        st.error(f"❌ Errore nell'estrazione dell'audio originale: {e.stderr.decode()}")
-                        temp_original_audio_path = None
+                    # Estrai audio originale
+                    temp_original_audio_path = "temp_original_audio.aac" # o .wav
+                    subprocess.run([
+                        "ffmpeg", "-y", "-i", video_input_path, "-vn", "-acodec", "aac", temp_original_audio_path
+                    ], check=True, capture_output=True)
 
-                    if temp_original_audio_path and os.path.exists(temp_original_audio_path):
-                        ffmpeg_command.extend([
-                            "-i", video_input_path,
-                            "-i", audio_output_path,
-                            "-i", temp_original_audio_path,
-                            "-filter_complex",
-                            f"[1:a]volume=1.0[generated_audio];"
-                            f"[2:a]volume={original_audio_mix_level}[original_audio];"
-                            f"[generated_audio][original_audio]amix=inputs=2:duration=longest[aout]",
-                            "-map", "0:v",
-                            "-map", "[aout]",
-                            "-c:v", "libx264",
-                            "-preset", "medium",
-                            "-crf", "23",
-                            "-c:a", "aac",
-                            "-b:a", "192k",
-                        ])
-                    else:
-                        st.warning("⚠️ Impossibile estrarre l'audio originale. Verrà usato solo l'audio generato.")
-                        ffmpeg_command.extend([
-                            "-i", video_input_path,
-                            "-i", audio_output_path,
-                            "-map", "0:v",
-                            "-map", "1:a",
-                            "-c:v", "libx264",
-                            "-preset", "medium",
-                            "-crf", "23",
-                            "-c:a", "aac",
-                            "-b:a", "192k",
-                        ])
+                    # Mix e ricodifica
+                    ffmpeg_command.extend([
+                        "-i", video_input_path,
+                        "-i", audio_output_path,
+                        "-i", temp_original_audio_path,
+                        "-filter_complex",
+                        f"[1:a]volume=1.0[generated_audio];" # volume fisso per audio generato
+                        f"[2:a]volume={original_audio_mix_level}[original_audio];" # volume per audio originale
+                        f"[generated_audio][original_audio]amix=inputs=2:duration=longest[aout]", # mix
+                        "-map", "0:v",
+                        "-map", "[aout]",
+                        "-c:v", "libx264",
+                        "-preset", "medium",
+                        "-crf", "23",
+                        "-c:a", "aac",
+                        "-b:a", "192k",
+                    ])
                 else:
                     ffmpeg_command.extend([
                         "-i", video_input_path,
@@ -1076,9 +1015,12 @@ def main():
                 try:
                     process = subprocess.Popen(ffmpeg_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
                     
-                    total_seconds = duration_seconds
+                    # Cerca la durata totale del video per stimare il progresso
+                    total_duration_pattern = r"Duration: (\d{2}):(\d{2}):(\d{2}\.\d{2})"
                     time_pattern = r"time=(\d{2}):(\d{2}):(\d{2}\.\d{2})"
                     
+                    total_seconds = duration_seconds # Già calcolato prima
+
                     while True:
                         output = process.stderr.readline()
                         if not output and process.poll() is not None:
@@ -1090,7 +1032,7 @@ def main():
                                 current_seconds = hours * 3600 + minutes * 60 + seconds
                                 if total_seconds > 0:
                                     progress = int((current_seconds / total_seconds) * 100)
-                                    progress_bar_video.progress(min(progress, 99))
+                                    progress_bar_video.progress(min(progress, 99)) # Non arrivare al 100% finché non è finito
                                     status_text_video.text(f"Elaborazione video: {current_seconds:.2f}/{total_seconds:.2f}s")
                     
                     stdout, stderr = process.communicate()
@@ -1101,6 +1043,7 @@ def main():
                     status_text_video.text("Video completato!")
                     st.success(f"✅ Video con audio generato con successo! Scarica qui sotto:")
                     
+                    # Download button
                     with open(final_video_path, "rb") as f:
                         st.download_button(
                             "⬇️ Scarica Video Finale",
@@ -1109,7 +1052,8 @@ def main():
                             mime="video/mp4"
                         )
                     
-                    for temp_f in [video_input_path, audio_output_path, "temp_original_audio.aac" if use_original_audio else None, final_video_path]:
+                    # Pulisci i file temporanei
+                    for temp_f in [video_input_path, audio_output_path, temp_original_audio_path if use_original_audio else None, final_video_path]:
                         if temp_f and os.path.exists(temp_f):
                             os.remove(temp_f)
                     st.info("🗑️ File temporanei puliti.")
@@ -1117,18 +1061,25 @@ def main():
                 except subprocess.CalledProcessError as e:
                     st.error(f"❌ Errore FFmpeg durante l'unione/ricodifica: {e.stderr.decode()}")
                     st.code(e.stdout.decode() + e.stderr.decode())
-                    for temp_f in [video_input_path, audio_output_path, "temp_original_audio.aac" if use_original_audio else None]:
+                    # Pulisci i file temporanei anche in caso di errore FFmpeg
+                    for temp_f in [video_input_path, audio_output_path, temp_original_audio_path if use_original_audio else None]:
                         if temp_f and os.path.exists(temp_f):
                             os.remove(temp_f)
                     st.info("🗑️ File temporanei puliti.")
                 except Exception as e:
                     st.error(f"❌ Errore generico durante l'unione/ricodifica: {str(e)}")
-                    for temp_f in [video_input_path, audio_output_path, "temp_original_audio.aac" if use_original_audio else None]:
+                    # Pulisci i file temporanei anche in caso di errore generico
+                    for temp_f in [video_input_path, audio_output_path, temp_original_audio_path if use_original_audio else None]:
                         if temp_f and os.path.exists(temp_f):
                             os.remove(temp_f)
                     st.info("🗑️ File temporanei puliti.")
+        # Non c'è più un blocco 'else' diretto per 'if st.button' che usi audio_output_path
+        # La logica del "FFmpeg non trovato" è ora gestita all'interno del blocco 'if st.button'
+        # Questo previene l'UnboundLocalError quando il pulsante non è ancora stato cliccato.
 
 
+        # Questa sezione è volutamente fuori dal blocco if/else del pulsante,
+        # ma all'interno dell'if uploaded_file is not None.
         st.markdown("---")
         with st.expander("✨ Descrizione del Brano Generato"):
             st.write("Questa è una descrizione dettagliata dei parametri usati per generare il tuo brano:")
@@ -1142,68 +1093,68 @@ def main():
             st.write(f"- Normalizzazione Audio Finale: **{'Sì' if params['normalize_audio'] else 'No'}**")
             
             st.markdown("#### Layer Audio:")
-            if st.session_state.get('subtractive_on', False):
+            if params['subtractive_enabled']:
                 st.markdown("##### Sintesi Sottrattiva (Abilitata):")
-                st.write(f"- Frequenza Controllata da: **{st.session_state.get('sub_freq_src')}** ({st.session_state.get('sub_freq_min')} - {st.session_state.get('sub_freq_max')} Hz)")
-                st.write(f"- Ampiezza Controllata da: **{st.session_state.get('sub_amp_src')}** ({st.session_state.get('sub_amp_min'):.2f} - {st.session_state.get('sub_amp_max'):.2f})")
-                st.write(f"- Tipo Onda: **{st.session_state.get('sub_waveform_type')}**")
+                st.write(f"- Frequenza Controllata da: **{params['sub_freq_source']}** ({params['sub_freq_range'][0]} - {params['sub_freq_range'][1]} Hz)")
+                st.write(f"- Ampiezza Controllata da: **{params['sub_amp_source']}** ({params['sub_amp_range'][0]:.2f} - {params['sub_amp_range'][1]:.2f})")
+                st.write(f"- Tipo Onda: **{params['sub_waveform_type']}**")
             else:
                 st.write("##### Sintesi Sottrattiva: Disabilitata")
 
-            if st.session_state.get('fm_on', False):
+            if params['fm_enabled']:
                 st.markdown("##### Sintesi FM (Abilitata):")
-                st.write(f"- Frequenza Portante Controllata da: **{st.session_state.get('fm_carr_src')}** ({st.session_state.get('fm_carr_min')} - {st.session_state.get('fm_carr_max')} Hz)")
-                st.write(f"- Frequenza Modulatore Controllata da: **{st.session_state.get('fm_mod_src')}** ({st.session_state.get('fm_mod_min')} - {st.session_state.get('fm_mod_max')} Hz)")
-                st.write(f"- Indice Modulazione Controllato da: **{st.session_state.get('fm_idx_src')}** ({st.session_state.get('fm_idx_min'):.1f} - {st.session_state.get('fm_idx_max'):.1f})")
-                st.write(f"- Ampiezza FM Controllata da: **{st.session_state.get('fm_amp_src')}** ({st.session_state.get('fm_amp_min'):.2f} - {st.session_state.get('fm_amp_max'):.2f})")
+                st.write(f"- Frequenza Portante Controllata da: **{params['fm_carrier_source']}** ({params['fm_carrier_range'][0]} - {params['fm_carrier_range'][1]} Hz)")
+                st.write(f"- Frequenza Modulatore Controllata da: **{params['fm_mod_source']}** ({params['fm_mod_range'][0]} - {params['fm_mod_range'][1]} Hz)")
+                st.write(f"- Indice Modulazione Controllato da: **{params['fm_mod_idx_source']}** ({params['fm_mod_idx_range'][0]:.1f} - {params['fm_mod_idx_range'][1]:.1f})")
+                st.write(f"- Ampiezza FM Controllata da: **{params['fm_amp_source']}** ({params['fm_amp_range'][0]:.2f} - {params['fm_amp_range'][1]:.2f})")
             else:
                 st.write("##### Sintesi FM: Disabilitata")
 
-            if st.session_state.get('granular_on', False):
+            if params['granular_enabled']:
                 st.markdown("##### Sintesi Granulare (Abilitata):")
-                st.write(f"- Densità Grani Controllata da: **{st.session_state.get('gran_dens_src')}** ({st.session_state.get('gran_dens_min')} - {st.session_state.get('gran_dens_max')} grani)")
-                st.write(f"- Durata Grani Controllata da: **{st.session_state.get('gran_dur_src')}** ({st.session_state.get('gran_dur_min'):.3f} - {st.session_state.get('gran_dur_max'):.3f} sec)")
-                st.write(f"- Ampiezza Grani Controllata da: **{st.session_state.get('gran_amp_src')}** ({st.session_state.get('gran_amp_min'):.2f} - {st.session_state.get('gran_amp_max'):.2f})")
+                st.write(f"- Densità Grani Controllata da: **{params['gran_density_source']}** ({params['gran_density_range'][0]} - {params['gran_density_range'][1]} grani)")
+                st.write(f"- Durata Grani Controllata da: **{params['gran_duration_source']}** ({params['gran_duration_range'][0]:.3f} - {params['gran_duration_range'][1]:.3f} sec)")
+                st.write(f"- Ampiezza Grani Controllata da: **{params['gran_amp_source']}** ({params['gran_amp_range'][0]:.2f} - {params['gran_amp_range'][1]:.2f})")
             else:
                 st.write("##### Sintesi Granulare: Disabilitata")
 
-            if st.session_state.get('noise_on', False):
+            if params['noise_enabled']:
                 st.markdown("##### Rumore (Abilitato):")
-                st.write(f"- Ampiezza Rumore Controllata da: **{st.session_state.get('noise_amp_src')}** ({st.session_state.get('noise_amp_min'):.2f} - {st.session_state.get('noise_amp_max'):.2f})")
+                st.write(f"- Ampiezza Rumore Controllata da: **{params['noise_amp_source']}** ({params['noise_amp_range'][0]:.2f} - {params['noise_amp_range'][1]:.2f})")
             else:
                 st.write("##### Rumore: Disabilitato")
 
             st.markdown("#### Effetti Audio:")
-            if st.session_state.get('glitch_on', False):
+            if params['glitch_enabled']:
                 st.markdown("##### Glitch (Abilitato):")
-                st.write(f"- Fattore Glitch (Probabilità) Controllato da: **{st.session_state.get('glitch_factor_src')}** ({st.session_state.get('glitch_factor_min'):.3f} - {st.session_state.get('glitch_factor_max'):.3f})")
-                st.write(f"- Intensità Glitch (Durata/Ampiezza) Controllata da: **{st.session_state.get('glitch_intensity_src')}** ({st.session_state.get('glitch_intensity_min'):.2f} - {st.session_state.get('glitch_intensity_max'):.2f})")
+                st.write(f"- Fattore Glitch (Probabilità) Controllato da: **{params['glitch_factor_source']}** ({params['glitch_factor_range'][0]:.3f} - {params['glitch_factor_range'][1]:.3f})")
+                st.write(f"- Intensità Glitch (Durata/Ampiezza) Controllata da: **{params['glitch_intensity_source']}** ({params['glitch_intensity_range'][0]:.2f} - {params['glitch_intensity_range'][1]:.2f})")
             else:
                 st.write("##### Glitch: Disabilitato")
 
-            if st.session_state.get('delay_on', False):
+            if params['delay_enabled']:
                 st.markdown("##### Delay (Abilitato):")
-                st.write(f"- Tempo Delay Controllato da: **{st.session_state.get('delay_time_src')}** ({st.session_state.get('delay_time_min'):.2f} - {st.session_state.get('delay_time_max'):.2f} sec)")
-                st.write(f"- Feedback Delay Controllato da: **{st.session_state.get('delay_feedback_src')}** ({st.session_state.get('delay_feedback_min'):.2f} - {st.session_state.get('delay_feedback_max'):.2f})")
+                st.write(f"- Tempo Delay Controllato da: **{params['delay_time_source']}** ({params['delay_time_range'][0]:.2f} - {params['delay_time_range'][1]:.2f} sec)")
+                st.write(f"- Feedback Delay Controllato da: **{params['delay_feedback_source']}** ({params['delay_feedback_range'][0]:.2f} - {params['delay_feedback_range'][1]:.2f})")
             else:
                 st.write("##### Delay: Disabilitato")
 
-            if st.session_state.get('reverb_on', False):
+            if params['reverb_enabled']:
                 st.markdown("##### Riverbero (Abilitato):")
-                st.write(f"- Tempo Decadimento Controllato da: **{st.session_state.get('reverb_decay_src')}** ({st.session_state.get('reverb_decay_min'):.1f} - {st.session_state.get('reverb_decay_max'):.1f} sec)")
-                st.write(f"- Mix Riverbero Controllato da: **{st.session_state.get('reverb_mix_src')}** ({st.session_state.get('reverb_mix_min'):.2f} - {st.session_state.get('reverb_mix_max'):.2f})")
+                st.write(f"- Tempo Decadimento Controllato da: **{params['reverb_decay_source']}** ({params['reverb_decay_range'][0]:.1f} - {params['reverb_decay_range'][1]:.1f} sec)")
+                st.write(f"- Mix Riverbero Controllato da: **{params['reverb_mix_source']}** ({params['reverb_mix_range'][0]:.2f} - {params['reverb_mix_range'][1]:.2f})")
             else:
                 st.write("##### Riverbero: Disabilitato")
 
-            if st.session_state.get('eq_on', False):
+            if params['eq_enabled']:
                 st.markdown("##### Equalizzatore Dinamico (Abilitato):")
-                st.write(f"- Guadagno Bassi Controllato da: **{st.session_state.get('eq_low_src')}** ({st.session_state.get('eq_gain_min'):.1f} - {st.session_state.get('eq_gain_max'):.1f} dB)")
-                st.write(f"- Guadagno Medi Controllato da: **{st.session_state.get('eq_mid_src')}** ({st.session_state.get('eq_gain_min'):.1f} - {st.session_state.get('eq_gain_max'):.1f} dB)")
-                st.write(f"- Guadagno Alti Controllato da: **{st.session_state.get('eq_high_src')}** ({st.session_state.get('eq_gain_min'):.1f} - {st.session_state.get('eq_gain_max'):.1f} dB)")
+                st.write(f"- Guadagno Bassi Controllato da: **{params['eq_low_source']}** ({params['eq_gain_range'][0]:.1f} - {params['eq_gain_range'][1]:.1f} dB)")
+                st.write(f"- Guadagno Medi Controllato da: **{params['eq_mid_source']}** ({params['eq_gain_range'][0]:.1f} - {params['eq_gain_range'][1]:.1f} dB)")
+                st.write(f"- Guadagno Alti Controllato da: **{params['eq_high_source']}** ({params['eq_gain_range'][0]:.1f} - {params['eq_gain_range'][1]:.1f} dB)")
             else:
                 st.write("##### Equalizzatore Dinamico: Disabilitato")
 
-    gc.collect()
+    gc.collect() # Questa riga è ora all'interno del blocco `if uploaded_file is not None`
 
 if __name__ == "__main__":
     main()
