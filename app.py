@@ -158,6 +158,16 @@ def check_ffmpeg() -> bool:
     """Verifica se FFmpeg è installato e disponibile nel PATH."""
     return shutil.which("ffmpeg") is not None
 
+def preset_to_filename_slug(preset_name: str) -> str:
+    """Converte il nome di un preset in uno slug sicuro da usare nei nomi file
+    (rimuove emoji/simboli, sostituisce spazi e slash con underscore)."""
+    if not preset_name or preset_name == PRESET_MANUALE:
+        return ""
+    # Rimuove tutto ciò che non è lettera, numero, spazio o underscore (elimina emoji/simboli)
+    cleaned = re.sub(r"[^\w\s]", "", preset_name, flags=re.UNICODE)
+    cleaned = cleaned.strip().replace(" ", "_").replace("__", "_")
+    return cleaned.strip("_")
+
 def validate_video_file(uploaded_file) -> bool:
     """Valida le dimensioni del file video caricato."""
     if uploaded_file.size > MAX_FILE_SIZE:
@@ -1198,8 +1208,10 @@ def main():
                     # Salva video in session_state (così il download non riavvia la generazione)
                     with open(final_video_path, "rb") as f:
                         st.session_state['video_bytes'] = f.read()
-                    st.session_state['video_filename'] = f"{base_name_output}_video.mp4"
-                    st.session_state['report_filename'] = f"{base_name_output}_report.txt"
+                    preset_slug = preset_to_filename_slug(st.session_state.get('preset_choice', PRESET_MANUALE))
+                    name_suffix = f"_{preset_slug}" if preset_slug else ""
+                    st.session_state['video_filename'] = f"{base_name_output}{name_suffix}_video.mp4"
+                    st.session_state['report_filename'] = f"{base_name_output}{name_suffix}_report.txt"
 
                     # Costruisci testo del report e salvalo in session_state
                     report_lines = []
