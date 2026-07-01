@@ -26,6 +26,134 @@ FORMAT_RESOLUTIONS = {
     "9:16 (Verticale)": (720, 1280)
 }
 
+# ── PRESET PER TIPO DI VIDEO ────────────────────────────────────────────────
+# Ogni preset imposta direttamente i valori di session_state associati alle
+# key dei widget. Devono essere scritti PRIMA che i widget vengano istanziati,
+# altrimenti Streamlit ignora il valore preimpostato.
+PRESET_MANUALE = "🎛️ Manuale (nessun preset)"
+
+VIDEO_PRESETS = {
+    "🌿 Natura / Paesaggio": {
+        'subtractive_on': True, 'sub_freq_src': "Luminosità", 'sub_amp_src': "Luminosità",
+        'sub_waveform_type': "sine", 'sub_freq_min': 80, 'sub_freq_max': 400,
+        'sub_amp_min': 0.15, 'sub_amp_max': 0.45,
+        'fm_on': False, 'granular_on': False, 'noise_on': False, 'glitch_on': False, 'delay_on': False,
+        'reverb_on': True, 'reverb_decay_src': "Luminosità", 'reverb_mix_src': "Luminosità",
+        'reverb_decay_min': 2.0, 'reverb_decay_max': 4.5, 'reverb_mix_min': 0.3, 'reverb_mix_max': 0.6,
+        'eq_on': False,
+    },
+    "🏙️ Città / Folla / Traffico": {
+        'subtractive_on': False,
+        'fm_on': True, 'fm_carr_src': "Movimento", 'fm_mod_src': "Variazione Movimento",
+        'fm_idx_src': "Variazione Movimento", 'fm_amp_src': "Movimento",
+        'fm_carr_min': 300, 'fm_carr_max': 1200, 'fm_mod_min': 80, 'fm_mod_max': 300,
+        'fm_idx_min': 1.0, 'fm_idx_max': 6.0, 'fm_amp_min': 0.1, 'fm_amp_max': 0.35,
+        'granular_on': True, 'gran_dens_src': "Dettaglio", 'gran_dur_src': "Movimento", 'gran_amp_src': "Movimento",
+        'gran_dens_min': 3, 'gran_dens_max': 9, 'gran_dur_min': 0.015, 'gran_dur_max': 0.04,
+        'gran_amp_min': 0.03, 'gran_amp_max': 0.15,
+        'noise_on': True, 'noise_amp_src': "Variazione Movimento", 'noise_amp_min': 0.02, 'noise_amp_max': 0.15,
+        'glitch_on': False,
+        'delay_on': True, 'delay_time_src': "Movimento", 'delay_feedback_src': "Movimento",
+        'delay_time_min': 0.03, 'delay_time_max': 0.12, 'delay_feedback_min': 0.2, 'delay_feedback_max': 0.5,
+        'reverb_on': False, 'eq_on': False,
+    },
+    "💃 Corpo in Movimento / Danza": {
+        'subtractive_on': True, 'sub_freq_src': "Luminosità", 'sub_amp_src': "Movimento",
+        'sub_waveform_type': "sine", 'sub_freq_min': 100, 'sub_freq_max': 500,
+        'sub_amp_min': 0.1, 'sub_amp_max': 0.4,
+        'fm_on': True, 'fm_carr_src': "Movimento", 'fm_mod_src': "Movimento",
+        'fm_idx_src': "Movimento", 'fm_amp_src': "Movimento",
+        'fm_carr_min': 200, 'fm_carr_max': 1000, 'fm_mod_min': 40, 'fm_mod_max': 200,
+        'fm_idx_min': 0.5, 'fm_idx_max': 4.0, 'fm_amp_min': 0.1, 'fm_amp_max': 0.35,
+        'granular_on': False, 'noise_on': False, 'glitch_on': False, 'delay_on': False,
+        'reverb_on': False,
+        'eq_on': True, 'eq_low_src': "Movimento", 'eq_mid_src': "Movimento", 'eq_high_src': "Movimento",
+        'eq_gain_min': -8.0, 'eq_gain_max': 8.0,
+    },
+    "📼 Found Footage / VHS": {
+        'subtractive_on': False,
+        'fm_on': True, 'fm_carr_src': "Variazione Movimento", 'fm_mod_src': "Variazione Movimento",
+        'fm_idx_src': "Dettaglio", 'fm_amp_src': "Variazione Movimento",
+        'fm_carr_min': 150, 'fm_carr_max': 900, 'fm_mod_min': 30, 'fm_mod_max': 200,
+        'fm_idx_min': 2.0, 'fm_idx_max': 8.0, 'fm_amp_min': 0.1, 'fm_amp_max': 0.3,
+        'granular_on': True, 'gran_dens_src': "Variazione Movimento", 'gran_dur_src': "Dettaglio",
+        'gran_amp_src': "Variazione Movimento",
+        'gran_dens_min': 2, 'gran_dens_max': 8, 'gran_dur_min': 0.02, 'gran_dur_max': 0.06,
+        'gran_amp_min': 0.05, 'gran_amp_max': 0.2,
+        'noise_on': True, 'noise_amp_src': "Variazione Movimento", 'noise_amp_min': 0.1, 'noise_amp_max': 0.4,
+        'glitch_on': True, 'glitch_factor_src': "Variazione Movimento", 'glitch_intensity_src': "Variazione Movimento",
+        'glitch_factor_min': 0.1, 'glitch_factor_max': 0.4, 'glitch_intensity_min': 0.3, 'glitch_intensity_max': 0.8,
+        'delay_on': False, 'reverb_on': False, 'eq_on': False,
+    },
+    "🕰️ Timelapse / Cambi Luce Lenti": {
+        'subtractive_on': True, 'sub_freq_src': "Luminosità", 'sub_amp_src': "Dettaglio",
+        'sub_waveform_type': "sine", 'sub_freq_min': 60, 'sub_freq_max': 350,
+        'sub_amp_min': 0.1, 'sub_amp_max': 0.4,
+        'fm_on': True, 'fm_carr_src': "Dettaglio", 'fm_mod_src': "Luminosità",
+        'fm_idx_src': "Luminosità", 'fm_amp_src': "Dettaglio",
+        'fm_carr_min': 100, 'fm_carr_max': 600, 'fm_mod_min': 20, 'fm_mod_max': 120,
+        'fm_idx_min': 0.2, 'fm_idx_max': 3.0, 'fm_amp_min': 0.05, 'fm_amp_max': 0.2,
+        'granular_on': False, 'noise_on': False, 'glitch_on': False, 'delay_on': False,
+        'reverb_on': True, 'reverb_decay_src': "Luminosità", 'reverb_mix_src': "Luminosità",
+        'reverb_decay_min': 2.5, 'reverb_decay_max': 5.0, 'reverb_mix_min': 0.4, 'reverb_mix_max': 0.7,
+        'eq_on': False,
+    },
+    "◼️ Op Art / Pattern Geometrici": {
+        'subtractive_on': True, 'sub_freq_src': "Dettaglio", 'sub_amp_src': "Dettaglio",
+        'sub_waveform_type': "square", 'sub_freq_min': 150, 'sub_freq_max': 900,
+        'sub_amp_min': 0.15, 'sub_amp_max': 0.4,
+        'fm_on': True, 'fm_carr_src': "Luminosità", 'fm_mod_src': "Dettaglio",
+        'fm_idx_src': "Dettaglio", 'fm_amp_src': "Luminosità",
+        'fm_carr_min': 300, 'fm_carr_max': 1500, 'fm_mod_min': 50, 'fm_mod_max': 250,
+        'fm_idx_min': 1.0, 'fm_idx_max': 5.0, 'fm_amp_min': 0.05, 'fm_amp_max': 0.2,
+        'granular_on': False, 'noise_on': False,
+        'glitch_on': True, 'glitch_factor_src': "Dettaglio", 'glitch_intensity_src': "Dettaglio",
+        'glitch_factor_min': 0.02, 'glitch_factor_max': 0.12, 'glitch_intensity_min': 0.1, 'glitch_intensity_max': 0.4,
+        'delay_on': False, 'reverb_on': False,
+        'eq_on': True, 'eq_low_src': "Luminosità", 'eq_mid_src': "Dettaglio", 'eq_high_src': "Dettaglio",
+        'eq_gain_min': -5.0, 'eq_gain_max': 12.0,
+    },
+    "🌀 Video Sperimentale / Astratto": {
+        'subtractive_on': False,
+        'fm_on': True, 'fm_carr_src': "Variazione Movimento", 'fm_mod_src': "Variazione Movimento",
+        'fm_idx_src': "Variazione Movimento", 'fm_amp_src': "Variazione Movimento",
+        'fm_carr_min': 200, 'fm_carr_max': 1800, 'fm_mod_min': 60, 'fm_mod_max': 450,
+        'fm_idx_min': 3.0, 'fm_idx_max': 9.0, 'fm_amp_min': 0.1, 'fm_amp_max': 0.3,
+        'granular_on': True, 'gran_dens_src': "Dettaglio", 'gran_dur_src': "Variazione Movimento",
+        'gran_amp_src': "Dettaglio",
+        'gran_dens_min': 2, 'gran_dens_max': 7, 'gran_dur_min': 0.01, 'gran_dur_max': 0.05,
+        'gran_amp_min': 0.03, 'gran_amp_max': 0.15,
+        'noise_on': False,
+        'glitch_on': True, 'glitch_factor_src': "Variazione Movimento", 'glitch_intensity_src': "Variazione Movimento",
+        'glitch_factor_min': 0.05, 'glitch_factor_max': 0.2, 'glitch_intensity_min': 0.2, 'glitch_intensity_max': 0.6,
+        'delay_on': True, 'delay_time_src': "Variazione Movimento", 'delay_feedback_src': "Variazione Movimento",
+        'delay_time_min': 0.05, 'delay_time_max': 0.25, 'delay_feedback_min': 0.3, 'delay_feedback_max': 0.6,
+        'reverb_on': False, 'eq_on': False,
+    },
+    "🎞️ Audiovisual Sequences": {
+        'subtractive_on': True, 'sub_freq_src': "Movimento", 'sub_amp_src': "Movimento",
+        'sub_waveform_type': "sine", 'sub_freq_min': 100, 'sub_freq_max': 700,
+        'sub_amp_min': 0.15, 'sub_amp_max': 0.45,
+        'fm_on': False, 'granular_on': False, 'noise_on': False,
+        'glitch_on': True, 'glitch_factor_src': "Movimento", 'glitch_intensity_src': "Movimento",
+        'glitch_factor_min': 0.01, 'glitch_factor_max': 0.08, 'glitch_intensity_min': 0.1, 'glitch_intensity_max': 0.35,
+        'delay_on': True, 'delay_time_src': "Movimento", 'delay_feedback_src': "Movimento",
+        'delay_time_min': 0.05, 'delay_time_max': 0.15, 'delay_feedback_min': 0.2, 'delay_feedback_max': 0.4,
+        'reverb_on': False, 'eq_on': False,
+    },
+    "⚡ Glitch Digitale / Datamosh": {
+        'subtractive_on': False, 'fm_on': False,
+        'granular_on': True, 'gran_dens_src': "Variazione Movimento", 'gran_dur_src': "Variazione Movimento",
+        'gran_amp_src': "Dettaglio",
+        'gran_dens_min': 4, 'gran_dens_max': 10, 'gran_dur_min': 0.01, 'gran_dur_max': 0.025,
+        'gran_amp_min': 0.05, 'gran_amp_max': 0.2,
+        'noise_on': True, 'noise_amp_src': "Dettaglio", 'noise_amp_min': 0.0, 'noise_amp_max': 0.05,
+        'glitch_on': True, 'glitch_factor_src': "Variazione Movimento", 'glitch_intensity_src': "Variazione Movimento",
+        'glitch_factor_min': 0.15, 'glitch_factor_max': 0.5, 'glitch_intensity_min': 0.4, 'glitch_intensity_max': 0.9,
+        'delay_on': False, 'reverb_on': False, 'eq_on': False,
+    },
+}
+
 def check_ffmpeg() -> bool:
     """Verifica se FFmpeg è installato e disponibile nel PATH."""
     return shutil.which("ffmpeg") is not None
@@ -514,6 +642,8 @@ def main():
         st.session_state['video_filename'] = None
     if 'report_text' not in st.session_state:
         st.session_state['report_text'] = None
+    if 'report_filename' not in st.session_state:
+        st.session_state['report_filename'] = None
 
     if uploaded_file is not None:
         if not validate_video_file(uploaded_file):
@@ -539,7 +669,21 @@ def main():
         base_name_output = os.path.splitext(uploaded_file.name)[0]
 
         st.subheader("Generazione Audio")
-        
+
+        # ── BOX PRESET PER TIPO DI VIDEO ────────────────────────────────────
+        st.markdown("#### 🎨 Preset per tipo di video")
+        st.caption("Scegli un punto di partenza in base al tipo di footage, poi ritocca liberamente i parametri nei tab sotto.")
+        preset_options = [PRESET_MANUALE] + list(VIDEO_PRESETS.keys())
+        selected_preset = st.selectbox("Preset", preset_options, key='preset_choice')
+
+        if selected_preset != PRESET_MANUALE and st.session_state.get('_last_applied_preset') != selected_preset:
+            for preset_key, preset_value in VIDEO_PRESETS[selected_preset].items():
+                st.session_state[preset_key] = preset_value
+            st.session_state['_last_applied_preset'] = selected_preset
+            st.rerun()
+        elif selected_preset == PRESET_MANUALE:
+            st.session_state['_last_applied_preset'] = None
+
         # Inizializza AudioGenerator
         audio_generator = AudioGenerator(sample_rate=AUDIO_SAMPLE_RATE, total_duration_seconds=duration_seconds)
 
@@ -1054,7 +1198,8 @@ def main():
                     # Salva video in session_state (così il download non riavvia la generazione)
                     with open(final_video_path, "rb") as f:
                         st.session_state['video_bytes'] = f.read()
-                    st.session_state['video_filename'] = final_video_path
+                    st.session_state['video_filename'] = f"{base_name_output}_video.mp4"
+                    st.session_state['report_filename'] = f"{base_name_output}_report.txt"
 
                     # Costruisci testo del report e salvalo in session_state
                     report_lines = []
@@ -1175,7 +1320,7 @@ def main():
                     st.download_button(
                         label="📄 Scarica Report Parametri",
                         data=st.session_state['report_text'],
-                        file_name="report_parametri.txt",
+                        file_name=st.session_state.get('report_filename', f"{base_name_output}_report.txt"),
                         mime="text/plain",
                         key="dl_report"
                     )
