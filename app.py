@@ -1120,8 +1120,8 @@ def main():
                 )
                 params['glitch_character'] = glitch_character
 
-                glitch_factor_source = st.selectbox("Sorgente Fattore Glitch (Probabilità)", ["Variazione Movimento", "Movimento", "Dettaglio"], key='glitch_factor_src')
-                glitch_intensity_source = st.selectbox("Sorgente Intensità Glitch (Durata/Ampiezza)", ["Variazione Movimento", "Movimento", "Dettaglio"], key='glitch_intensity_src')
+                glitch_factor_source = st.selectbox("Sorgente Fattore Glitch (Probabilità)", ["Variazione Movimento", "Movimento", "Dettaglio", "Densità Contorni", "Variazione Colore"], key='glitch_factor_src')
+                glitch_intensity_source = st.selectbox("Sorgente Intensità Glitch (Durata/Ampiezza)", ["Variazione Movimento", "Movimento", "Dettaglio", "Densità Contorni", "Variazione Colore"], key='glitch_intensity_src')
                 
                 glitch_factor_min = st.slider("Fattore Minimo Glitch (0-1)", 0.0, 1.0, 0.01, step=0.005, key='glitch_factor_min')
                 glitch_factor_max = st.slider("Fattore Massimo Glitch (0-1)", 0.0, 1.0, 0.1, step=0.005, key='glitch_factor_max')
@@ -1144,11 +1144,15 @@ def main():
                 if glitch_factor_source == "Variazione Movimento": glitch_factor_data_raw = variation_movement_data
                 elif glitch_factor_source == "Movimento": glitch_factor_data_raw = movement_data
                 elif glitch_factor_source == "Dettaglio": glitch_factor_data_raw = detail_data
-                
+                elif glitch_factor_source == "Densità Contorni": glitch_factor_data_raw = edge_density_data
+                elif glitch_factor_source == "Variazione Colore": glitch_factor_data_raw = color_variation_data
+
                 glitch_intensity_data_raw = []
                 if glitch_intensity_source == "Variazione Movimento": glitch_intensity_data_raw = variation_movement_data
                 elif glitch_intensity_source == "Movimento": glitch_intensity_data_raw = movement_data
                 elif glitch_intensity_source == "Dettaglio": glitch_intensity_data_raw = detail_data
+                elif glitch_intensity_source == "Densità Contorni": glitch_intensity_data_raw = edge_density_data
+                elif glitch_intensity_source == "Variazione Colore": glitch_intensity_data_raw = color_variation_data
 
                 glitch_factor_scaled = np.interp(glitch_factor_data_raw, (min(glitch_factor_data_raw) if glitch_factor_data_raw else 0, max(glitch_factor_data_raw) if glitch_factor_data_raw else 1), (glitch_factor_min, glitch_factor_max)).tolist()
                 glitch_intensity_data = np.interp(glitch_intensity_data_raw, (min(glitch_intensity_data_raw) if glitch_intensity_data_raw else 0, max(glitch_intensity_data_raw) if glitch_intensity_data_raw else 1), (glitch_intensity_min, glitch_intensity_max)).tolist()
@@ -1162,8 +1166,8 @@ def main():
             use_delay = st.checkbox("Abilita Delay", value=False, key='delay_on')
             params['delay_enabled'] = use_delay
             if use_delay:
-                delay_time_source = st.selectbox("Sorgente Tempo Delay (sec)", ["Movimento", "Variazione Movimento", "Luminosità"], key='delay_time_src')
-                delay_feedback_source = st.selectbox("Sorgente Feedback Delay (0-1)", ["Movimento", "Variazione Movimento", "Dettaglio"], key='delay_feedback_src')
+                delay_time_source = st.selectbox("Sorgente Tempo Delay (sec)", ["Movimento", "Variazione Movimento", "Luminosità", "Densità Contorni", "Variazione Colore"], key='delay_time_src')
+                delay_feedback_source = st.selectbox("Sorgente Feedback Delay (0-1)", ["Movimento", "Variazione Movimento", "Dettaglio", "Densità Contorni", "Variazione Colore"], key='delay_feedback_src')
                 
                 delay_time_min = st.slider("Tempo Minimo Delay (sec)", 0.01, 0.5, 0.1, step=0.01, key='delay_time_min')
                 delay_time_max = st.slider("Tempo Massimo Delay (sec)", 0.01, 0.5, 0.3, step=0.01, key='delay_time_max')
@@ -1179,11 +1183,15 @@ def main():
                 if delay_time_source == "Movimento": delay_time_data_raw = movement_data
                 elif delay_time_source == "Variazione Movimento": delay_time_data_raw = variation_movement_data
                 elif delay_time_source == "Luminosità": delay_time_data_raw = luminosity_data
+                elif delay_time_source == "Densità Contorni": delay_time_data_raw = edge_density_data
+                elif delay_time_source == "Variazione Colore": delay_time_data_raw = color_variation_data
 
                 delay_feedback_data_raw = []
                 if delay_feedback_source == "Movimento": delay_feedback_data_raw = movement_data
                 elif delay_feedback_source == "Variazione Movimento": delay_feedback_data_raw = variation_movement_data
                 elif delay_feedback_source == "Dettaglio": delay_feedback_data_raw = detail_data
+                elif delay_feedback_source == "Densità Contorni": delay_feedback_data_raw = edge_density_data
+                elif delay_feedback_source == "Variazione Colore": delay_feedback_data_raw = color_variation_data
 
                 delay_time_scaled = np.interp(delay_time_data_raw, (min(delay_time_data_raw) if delay_time_data_raw else 0, max(delay_time_data_raw) if delay_time_data_raw else 1), (delay_time_min, delay_time_max)).tolist()
                 delay_feedback_scaled = np.interp(delay_feedback_data_raw, (min(delay_feedback_data_raw) if delay_feedback_data_raw else 0, max(delay_feedback_data_raw) if delay_feedback_data_raw else 1), (delay_feedback_min, delay_feedback_max)).tolist()
@@ -1197,8 +1205,8 @@ def main():
             use_reverb = st.checkbox("Abilita Riverbero", value=False, key='reverb_on')
             params['reverb_enabled'] = use_reverb
             if use_reverb:
-                reverb_decay_source = st.selectbox("Sorgente Tempo Decadimento (sec)", ["Luminosità", "Dettaglio", "Movimento"], key='reverb_decay_src')
-                reverb_mix_source = st.selectbox("Sorgente Mix (Wet/Dry)", ["Luminosità", "Dettaglio", "Movimento"], key='reverb_mix_src')
+                reverb_decay_source = st.selectbox("Sorgente Tempo Decadimento (sec)", ["Luminosità", "Dettaglio", "Movimento", "Densità Contorni", "Variazione Colore"], key='reverb_decay_src')
+                reverb_mix_source = st.selectbox("Sorgente Mix (Wet/Dry)", ["Luminosità", "Dettaglio", "Movimento", "Densità Contorni", "Variazione Colore"], key='reverb_mix_src')
                 
                 reverb_decay_min = st.slider("Decadimento Minimo (sec)", 0.1, 5.0, 1.0, step=0.1, key='reverb_decay_min')
                 reverb_decay_max = st.slider("Decadimento Massimo (sec)", 0.1, 5.0, 3.0, step=0.1, key='reverb_decay_max')
@@ -1214,11 +1222,15 @@ def main():
                 if reverb_decay_source == "Luminosità": reverb_decay_data_raw = luminosity_data
                 elif reverb_decay_source == "Dettaglio": reverb_decay_data_raw = detail_data
                 elif reverb_decay_source == "Movimento": reverb_decay_data_raw = movement_data
+                elif reverb_decay_source == "Densità Contorni": reverb_decay_data_raw = edge_density_data
+                elif reverb_decay_source == "Variazione Colore": reverb_decay_data_raw = color_variation_data
 
                 reverb_mix_data_raw = []
                 if reverb_mix_source == "Luminosità": reverb_mix_data_raw = luminosity_data
                 elif reverb_mix_source == "Dettaglio": reverb_mix_data_raw = detail_data
                 elif reverb_mix_source == "Movimento": reverb_mix_data_raw = movement_data
+                elif reverb_mix_source == "Densità Contorni": reverb_mix_data_raw = edge_density_data
+                elif reverb_mix_source == "Variazione Colore": reverb_mix_data_raw = color_variation_data
 
                 reverb_decay_scaled = np.interp(reverb_decay_data_raw, (min(reverb_decay_data_raw) if reverb_decay_data_raw else 0, max(reverb_decay_data_raw) if reverb_decay_data_raw else 1), (reverb_decay_min, reverb_decay_max)).tolist()
                 reverb_mix_scaled = np.interp(reverb_mix_data_raw, (min(reverb_mix_data_raw) if reverb_mix_data_raw else 0, max(reverb_mix_data_raw) if reverb_mix_data_raw else 1), (reverb_mix_min, reverb_mix_max)).tolist()
@@ -1281,7 +1293,7 @@ def main():
             use_panning = st.checkbox("Abilita Panning Stereo", value=False, key='panning_on')
             params['panning_enabled'] = use_panning
             if use_panning:
-                pan_source = st.selectbox("Sorgente Panning", ["Centro di Massa Orizzontale", "Movimento", "Variazione Movimento"], key='pan_src',
+                pan_source = st.selectbox("Sorgente Panning", ["Centro di Massa Orizzontale", "Movimento", "Variazione Movimento", "Densità Contorni", "Variazione Colore"], key='pan_src',
                                            help="Centro di Massa Orizzontale è la scelta più naturale: segue davvero dove si trova il soggetto nel frame.")
                 params['pan_source'] = pan_source
 
@@ -1289,6 +1301,8 @@ def main():
                 if pan_source == "Centro di Massa Orizzontale": pan_data_raw = horizontal_mass_center_data
                 elif pan_source == "Movimento": pan_data_raw = movement_data
                 elif pan_source == "Variazione Movimento": pan_data_raw = variation_movement_data
+                elif pan_source == "Densità Contorni": pan_data_raw = edge_density_data
+                elif pan_source == "Variazione Colore": pan_data_raw = color_variation_data
 
                 # Il centro di massa orizzontale è già normalizzato 0..1 (0=sinistra, 1=destra):
                 # per questa sorgente non serve rimappare min/max, altrimenti un soggetto che sta
@@ -1306,16 +1320,19 @@ def main():
             use_elevation = st.checkbox("Abilita Simulazione Altezza", value=False, key='elevation_on')
             params['elevation_enabled'] = use_elevation
             if use_elevation:
-                elevation_source = st.selectbox("Sorgente Altezza", ["Centro di Massa Verticale", "Luminosità"], key='elevation_src',
-                                                 help="Centro di Massa Verticale segue davvero se il soggetto è in alto o in basso nel frame. Luminosità è una mappatura più creativa: video più chiari suonano più 'in alto'.")
+                elevation_source = st.selectbox("Sorgente Altezza", ["Centro di Massa Verticale", "Luminosità", "Densità Contorni", "Variazione Colore"], key='elevation_src',
+                                                 help="Centro di Massa Verticale segue davvero se il soggetto è in alto o in basso nel frame. Le altre sono mappature più creative.")
                 params['elevation_source'] = elevation_source
 
                 if elevation_source == "Centro di Massa Verticale":
                     # Già normalizzato 0..1 (0=alto del frame, 1=basso): nessun rimappaggio min/max,
                     # altrimenti un soggetto sempre in alto verrebbe "stirato" fino in basso.
                     elevation_scaled = vertical_mass_center_data
-                else: # Luminosità: video più luminoso = più "in alto" (elevation_data basso = luminosità alta)
+                elif elevation_source == "Luminosità": # video più luminoso = più "in alto" (elevation_data basso = luminosità alta)
                     elevation_scaled = [1.0 - l for l in luminosity_data]
+                else: # Densità Contorni / Variazione Colore: mappatura creativa, normalizzata 0..1 senza inversione
+                    elevation_raw = edge_density_data if elevation_source == "Densità Contorni" else color_variation_data
+                    elevation_scaled = np.interp(elevation_raw, (min(elevation_raw) if elevation_raw else 0, max(elevation_raw) if elevation_raw else 1), (0.0, 1.0)).tolist()
             else:
                 elevation_scaled = []
 
