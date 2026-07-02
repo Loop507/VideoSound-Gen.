@@ -748,7 +748,7 @@ class AudioGenerator:
 
         return result.squeeze() if result.shape[1] == 1 else result
 
-
+    def apply_stereo_panning(self, audio_array: np.ndarray, pan_data: list) -> np.ndarray:
         """Applica un panning stereo dinamico a un segnale mono, basato su pan_data
         (valori 0=sinistra, 0.5=centro, 1=destra, tipicamente il centro di massa orizzontale del video).
         Usa una legge a potenza costante (constant-power pan law) per un movimento naturale nello
