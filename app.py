@@ -154,27 +154,28 @@ VIDEO_PRESETS = {
     },
     "🛸 Suoni dello Spazio (Barron)": {
         # Ispirato alle "electronic tonalities" di Bebe e Louis Barron per Forbidden Planet (1956):
-        # toni elettronici puri che planano e decadono, timbri metallici da ring-modulation,
-        # pochissimo rumore/sporcizia, senso di vuoto siderale, suoni che si muovono nello spazio.
+        # non i momenti "d'allarme" più aggressivi della colonna sonora, ma il carattere più iconico
+        # e ricorrente — droni sospesi, quasi immobili, che sembrano respirare nel vuoto siderale.
+        # La Sottrattiva è il drone portante, l'FM colora appena (non domina più con ring-mod dura).
         'subtractive_on': True, 'sub_freq_src': "Luminosità", 'sub_amp_src': "Movimento",
-        'sub_waveform_type': "sine", 'sub_freq_min': 100, 'sub_freq_max': 1000,
-        'sub_amp_min': 0.1, 'sub_amp_max': 0.35, 'sub_gain': 0.7,
+        'sub_waveform_type': "sine", 'sub_freq_min': 60, 'sub_freq_max': 800,
+        'sub_amp_min': 0.15, 'sub_amp_max': 0.4, 'sub_gain': 1.0,
         'fm_on': True, 'fm_carr_src': "Movimento", 'fm_mod_src': "Variazione Movimento",
         'fm_idx_src': "Variazione Movimento", 'fm_amp_src': "Luminosità",
-        'fm_carr_min': 200, 'fm_carr_max': 2000, 'fm_mod_min': 50, 'fm_mod_max': 400,
-        'fm_idx_min': 3.0, 'fm_idx_max': 9.0, 'fm_amp_min': 0.1, 'fm_amp_max': 0.3, 'fm_gain': 1.0,
+        'fm_carr_min': 150, 'fm_carr_max': 900, 'fm_mod_min': 20, 'fm_mod_max': 150,
+        'fm_idx_min': 0.5, 'fm_idx_max': 3.0, 'fm_amp_min': 0.05, 'fm_amp_max': 0.15, 'fm_gain': 0.6,
         'granular_on': True, 'gran_dens_src': "Dettaglio", 'gran_dur_src': "Movimento",
         'gran_amp_src': "Movimento", 'gran_pitch_src': "Luminosità",
-        'gran_dens_min': 1, 'gran_dens_max': 4, 'gran_dur_min': 0.03, 'gran_dur_max': 0.08,
-        'gran_amp_min': 0.05, 'gran_amp_max': 0.15, 'gran_pitch_min': 300, 'gran_pitch_max': 2000, 'gran_gain': 0.5,
+        'gran_dens_min': 1, 'gran_dens_max': 3, 'gran_dur_min': 0.05, 'gran_dur_max': 0.1,
+        'gran_amp_min': 0.02, 'gran_amp_max': 0.08, 'gran_pitch_min': 200, 'gran_pitch_max': 1200, 'gran_gain': 0.4,
         'noise_on': False,
         'glitch_on': False,
         'delay_on': True, 'delay_time_src': "Movimento", 'delay_feedback_src': "Variazione Movimento",
-        'delay_time_min': 0.08, 'delay_time_max': 0.25, 'delay_feedback_min': 0.3, 'delay_feedback_max': 0.6,
+        'delay_time_min': 0.1, 'delay_time_max': 0.3, 'delay_feedback_min': 0.2, 'delay_feedback_max': 0.45,
         'reverb_on': True, 'reverb_decay_src': "Luminosità", 'reverb_mix_src': "Luminosità",
-        'reverb_decay_min': 3.0, 'reverb_decay_max': 5.0, 'reverb_mix_min': 0.4, 'reverb_mix_max': 0.7,
+        'reverb_decay_min': 3.5, 'reverb_decay_max': 5.0, 'reverb_mix_min': 0.5, 'reverb_mix_max': 0.8,
         'eq_on': True, 'eq_low_src': "Movimento", 'eq_mid_src': "Dettaglio", 'eq_high_src': "Luminosità",
-        'eq_gain_min': -3.0, 'eq_gain_max': 10.0,
+        'eq_gain_min': -5.0, 'eq_gain_max': 6.0,
         'panning_on': True, 'pan_src': "Centro di Massa Orizzontale",
     },
     "📻 Musica Concreta / Nastro": {
