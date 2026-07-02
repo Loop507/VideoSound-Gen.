@@ -1500,6 +1500,8 @@ def main():
                     # Costruisci testo del report e salvalo in session_state
                     report_lines = []
                     report_lines.append("=== DESCRIZIONE DEL BRANO GENERATO ===\n")
+                    preset_used = st.session_state.get('preset_choice', PRESET_MANUALE)
+                    report_lines.append(f"Preset di Partenza: {preset_used}")
                     report_lines.append("--- Impostazioni Video ---")
                     report_lines.append(f"Formato Output Video: {params.get('output_resolution_choice', 'N/A')}")
                     if params.get('use_original_audio'):
@@ -1511,6 +1513,7 @@ def main():
                     report_lines.append("\n--- Layer Audio ---")
                     if params.get('subtractive_enabled'):
                         report_lines.append("Sintesi Sottrattiva: Abilitata")
+                        report_lines.append(f"  Volume Layer: {params.get('sub_layer_gain', 1.0):.2f}")
                         report_lines.append(f"  Frequenza: {params['sub_freq_source']} ({params['sub_freq_range'][0]}-{params['sub_freq_range'][1]} Hz)")
                         report_lines.append(f"  Ampiezza: {params['sub_amp_source']} ({params['sub_amp_range'][0]:.2f}-{params['sub_amp_range'][1]:.2f})")
                         report_lines.append(f"  Forma d'Onda: {params['sub_waveform_type']}")
@@ -1519,6 +1522,7 @@ def main():
 
                     if params.get('fm_enabled'):
                         report_lines.append("Sintesi FM: Abilitata")
+                        report_lines.append(f"  Volume Layer: {params.get('fm_layer_gain', 1.0):.2f}")
                         report_lines.append(f"  Portante: {params['fm_carrier_source']} ({params['fm_carrier_range'][0]}-{params['fm_carrier_range'][1]} Hz)")
                         report_lines.append(f"  Modulatore: {params['fm_mod_source']} ({params['fm_mod_range'][0]}-{params['fm_mod_range'][1]} Hz)")
                         report_lines.append(f"  Indice Mod.: {params['fm_mod_idx_source']} ({params['fm_mod_idx_range'][0]:.1f}-{params['fm_mod_idx_range'][1]:.1f})")
@@ -1528,14 +1532,18 @@ def main():
 
                     if params.get('granular_enabled'):
                         report_lines.append("Sintesi Granulare: Abilitata")
+                        report_lines.append(f"  Volume Layer: {params.get('gran_layer_gain', 1.0):.2f}")
                         report_lines.append(f"  Densità: {params['gran_density_source']} ({params['gran_density_range'][0]}-{params['gran_density_range'][1]} grani)")
                         report_lines.append(f"  Durata: {params['gran_duration_source']} ({params['gran_duration_range'][0]:.3f}-{params['gran_duration_range'][1]:.3f} sec)")
                         report_lines.append(f"  Ampiezza: {params['gran_amp_source']} ({params['gran_amp_range'][0]:.2f}-{params['gran_amp_range'][1]:.2f})")
+                        if 'gran_pitch_range' in params:
+                            report_lines.append(f"  Intonazione Grani: {params.get('gran_pitch_source', 'N/A')} ({params['gran_pitch_range'][0]}-{params['gran_pitch_range'][1]} Hz)")
                     else:
                         report_lines.append("Sintesi Granulare: Disabilitata")
 
                     if params.get('noise_enabled'):
                         report_lines.append("Rumore: Abilitato")
+                        report_lines.append(f"  Volume Layer: {params.get('noise_layer_gain', 1.0):.2f}")
                         report_lines.append(f"  Ampiezza: {params['noise_amp_source']} ({params['noise_amp_range'][0]:.2f}-{params['noise_amp_range'][1]:.2f})")
                     else:
                         report_lines.append("Rumore: Disabilitato")
@@ -1543,6 +1551,7 @@ def main():
                     report_lines.append("\n--- Effetti Audio ---")
                     if params.get('glitch_enabled'):
                         report_lines.append("Glitch: Abilitato")
+                        report_lines.append(f"  Carattere: {params.get('glitch_character', 'Bilanciato (default)')}")
                         report_lines.append(f"  Fattore: {params['glitch_factor_source']} ({params['glitch_factor_range'][0]:.3f}-{params['glitch_factor_range'][1]:.3f})")
                         report_lines.append(f"  Intensità: {params['glitch_intensity_source']} ({params['glitch_intensity_range'][0]:.2f}-{params['glitch_intensity_range'][1]:.2f})")
                     else:
@@ -1566,6 +1575,16 @@ def main():
                         report_lines.append(f"  Alti: {params['eq_high_source']} ({params['eq_gain_range'][0]:.1f}-{params['eq_gain_range'][1]:.1f} dB)")
                     else:
                         report_lines.append("Equalizzatore Dinamico: Disabilitato")
+
+                    report_lines.append("\n--- Spazializzazione ---")
+                    if params.get('panning_enabled'):
+                        report_lines.append(f"Panning Stereo: Abilitato (Sorgente: {params.get('pan_source', 'N/A')})")
+                    else:
+                        report_lines.append("Panning Stereo: Disabilitato")
+                    if params.get('elevation_enabled'):
+                        report_lines.append(f"Simulazione Altezza: Abilitata (Sorgente: {params.get('elevation_source', 'N/A')})")
+                    else:
+                        report_lines.append("Simulazione Altezza: Disabilitata")
 
                     st.session_state['report_text'] = "\n".join(report_lines)
                     
