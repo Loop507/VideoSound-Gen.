@@ -559,58 +559,79 @@ class AudioGenerator:
         return glitched_audio
 
     def apply_delay_effect(self, audio_array: np.ndarray, delay_time_data: list, feedback_data: list) -> np.ndarray:
-        """Applica un effetto delay dinamico all'audio."""
+        """Applica un effetto delay dinamico all'audio, processato a piccoli blocchi (non più campione per
+        campione). Dato che il tempo di delay minimo possibile (10ms) corrisponde sempre a molti più
+        campioni della dimensione del blocco, nessuna lettura ritardata entro un blocco può dipendere da
+        dati calcolati nello stesso blocco: questo permette di leggere/scrivere l'intero blocco con
+        NumPy vettorizzato invece che con un loop Python per-campione. I parametri (tempo/feedback)
+        vengono aggiornati una volta per blocco anziché per ogni singolo campione: una quantizzazione
+        finissima (~3ms) che in pratica non si sente, ma è un cambiamento reale rispetto a prima."""
         if audio_array.ndim == 1:
             audio_array_processed = np.expand_dims(audio_array, axis=1)
         else:
             audio_array_processed = audio_array
 
         delayed_audio = np.copy(audio_array_processed)
-        
+
         delay_time_interp = self._interp_data_to_audio_length(delay_time_data)
         feedback_interp = self._interp_data_to_audio_length(feedback_data)
 
         num_channels = delayed_audio.shape[1]
-        
-        delay_buffers = [np.zeros(self.sample_rate, dtype=delayed_audio.dtype) for _ in range(num_channels)]
-        write_indices = [0] * num_channels
+        buffer_len = self.sample_rate
+        delay_buffers = [np.zeros(buffer_len, dtype=delayed_audio.dtype) for _ in range(num_channels)]
+        write_pos = [0] * num_channels
 
-        for i in range(len(delayed_audio)):
-            current_delay_time_seconds = np.clip(delay_time_interp[i], 0.01, 0.5)
-            current_feedback_gain = np.clip(feedback_interp[i], 0.0, 0.95)
+        # Il delay minimo possibile è 0.01s: il blocco deve restare ben al di sotto di quella soglia
+        # in campioni, per garantire che nessuna lettura ritardata ricada nel blocco corrente.
+        min_possible_delay_samples = max(1, int(0.01 * self.sample_rate))
+        chunk_size = max(1, min(128, min_possible_delay_samples // 2))
 
-            delay_samples = int(current_delay_time_seconds * self.sample_rate)
-            
+        total_samples = len(delayed_audio)
+        idx = 0
+        while idx < total_samples:
+            end = min(idx + chunk_size, total_samples)
+            seg_len = end - idx
+
+            current_delay_time_seconds = float(np.clip(delay_time_interp[idx], 0.01, 0.5))
+            current_feedback_gain = float(np.clip(feedback_interp[idx], 0.0, 0.95))
+            delay_samples = max(1, int(current_delay_time_seconds * self.sample_rate))
+
             for c in range(num_channels):
-                read_idx = (write_indices[c] - delay_samples + self.sample_rate) % self.sample_rate
-                
-                current_sample_channel = delayed_audio[i, c]
-                delayed_audio[i, c] += delay_buffers[c][read_idx] * current_feedback_gain
-                delay_buffers[c][write_indices[c]] = current_sample_channel + delay_buffers[c][read_idx] * current_feedback_gain
+                wp = write_pos[c]
+                write_positions = (wp + np.arange(seg_len)) % buffer_len
+                read_positions = (write_positions - delay_samples) % buffer_len
 
-                write_indices[c] = (write_indices[c] + 1) % self.sample_rate
+                delayed_vals = delay_buffers[c][read_positions]
+                in_chunk = audio_array_processed[idx:end, c]
+                out_chunk = in_chunk + delayed_vals * current_feedback_gain
+
+                delayed_audio[idx:end, c] = out_chunk
+                delay_buffers[c][write_positions] = out_chunk
+                write_pos[c] = (wp + seg_len) % buffer_len
+
+            idx = end
 
         return delayed_audio.squeeze() if num_channels == 1 else delayed_audio
 
     def apply_reverb_effect(self, audio_array: np.ndarray, decay_time_data: list, mix_data: list) -> np.ndarray:
-        """Applica un semplice effetto di riverbero all'audio."""
+        """Applica un semplice effetto di riverbero all'audio, processato a piccoli blocchi (stessa logica
+        di apply_delay_effect): i 4 tempi di delay delle linee comb-filter (Schroeder) sono sempre molto
+        più lunghi della dimensione del blocco, quindi ogni blocco può essere letto/scritto in modo
+        vettorizzato con NumPy invece che campione per campione."""
         if audio_array.ndim == 1:
             audio_array_processed = np.expand_dims(audio_array, axis=1)
         else:
             audio_array_processed = audio_array
 
         reverbed_audio = np.copy(audio_array_processed)
-        
+
         decay_time_interp = self._interp_data_to_audio_length(decay_time_data)
         mix_interp = self._interp_data_to_audio_length(mix_data)
 
         num_channels = reverbed_audio.shape[1]
-        num_delay_lines_per_channel = 4 
-        
-        # Buffer di delay per ogni linea, per ogni canale
-        delay_lines = [[np.zeros(self.sample_rate, dtype=reverbed_audio.dtype) for _ in range(num_delay_lines_per_channel)] for _ in range(num_channels)]
-        write_indices_reverb = [[0] * num_delay_lines_per_channel for _ in range(num_channels)]
-        
+        num_delay_lines_per_channel = 4
+        buffer_len = self.sample_rate
+
         # Tempi di delay fissi per un effetto base di riverbero (in campioni)
         # Basati sui valori raccomandati per i delay comb filter (Schroeder)
         delay_times_samples = [
@@ -619,41 +640,45 @@ class AudioGenerator:
             int(0.0411 * self.sample_rate),
             int(0.0437 * self.sample_rate)
         ]
-        
-        for i in range(len(reverbed_audio)):
-            current_decay_time = np.clip(decay_time_interp[i], 0.1, 5.0) # decay da 0.1 a 5 secondi
-            current_mix = np.clip(mix_interp[i], 0.0, 1.0) # mix da 0 a 1
+
+        delay_lines = [[np.zeros(buffer_len, dtype=reverbed_audio.dtype) for _ in range(num_delay_lines_per_channel)] for _ in range(num_channels)]
+        write_pos = [[0] * num_delay_lines_per_channel for _ in range(num_channels)]
+
+        # Il delay più corto tra le 4 linee comb-filter definisce il tetto massimo di sicurezza per il blocco
+        min_delay_samples = min(delay_times_samples)
+        chunk_size = max(1, min(128, min_delay_samples // 2))
+
+        total_samples = len(reverbed_audio)
+        idx = 0
+        while idx < total_samples:
+            end = min(idx + chunk_size, total_samples)
+            seg_len = end - idx
+
+            current_decay_time = float(np.clip(decay_time_interp[idx], 0.1, 5.0))
+            current_mix = float(np.clip(mix_interp[idx], 0.0, 1.0))
 
             for c in range(num_channels):
-                dry_signal = audio_array_processed[i, c]
-                wet_signal = 0.0
+                dry_chunk = audio_array_processed[idx:end, c]
+                wet_chunk = np.zeros(seg_len, dtype=reverbed_audio.dtype)
 
                 for dl_idx in range(num_delay_lines_per_channel):
-                    delay_samples = delay_times_samples[dl_idx]
-                    read_idx = (write_indices_reverb[c][dl_idx] - delay_samples + self.sample_rate) % self.sample_rate
-                    
-                    # Calcola il guadagno di feedback basato sul tempo di decadimento
-                    # Guadagno = 10^(-3 * decay_time_in_seconds / (delay_in_seconds))
-                    # approx_decay_in_seconds = delay_samples / self.sample_rate # Tempo di delay di questa linea
-                    
-                    # Per una stabilità e prevedibilità del riverbero,
-                    # il guadagno di feedback deve essere calcolato in modo che il suono decada entro current_decay_time.
-                    # Un'approssimazione è: feedback_gain = (10**(-3 / (self.sample_rate / delay_samples))) ** (current_decay_time * self.sample_rate / (delay_samples * num_delay_lines_per_channel))
-                    # O più semplicemente, un guadagno fisso dipendente da decay_time che non vada mai sopra 1.0
-                    feedback_gain = np.exp(-3 * delay_samples / (self.sample_rate * current_decay_time))
-                    feedback_gain = np.clip(feedback_gain, 0.0, 0.99) # Assicurati che non superi 1.0 per stabilità
+                    D = delay_times_samples[dl_idx]
+                    feedback_gain = float(np.clip(np.exp(-3 * D / (self.sample_rate * current_decay_time)), 0.0, 0.99))
 
-                    # Output del comb filter
-                    delayed_output = delay_lines[c][dl_idx][read_idx]
-                    wet_signal += delayed_output
+                    wp = write_pos[c][dl_idx]
+                    write_positions = (wp + np.arange(seg_len)) % buffer_len
+                    read_positions = (write_positions - D) % buffer_len
 
-                    # Input del comb filter (dry + feedback)
-                    delay_lines[c][dl_idx][write_indices_reverb[c][dl_idx]] = dry_signal + delayed_output * feedback_gain
-                    
-                    write_indices_reverb[c][dl_idx] = (write_indices_reverb[c][dl_idx] + 1) % self.sample_rate
+                    delayed_vals = delay_lines[c][dl_idx][read_positions]
+                    wet_chunk = wet_chunk + delayed_vals
 
-                # Mix dry e wet (output del riverbero)
-                reverbed_audio[i, c] = dry_signal * (1 - current_mix) + wet_signal * current_mix * 0.2 # Wet attenuato
+                    comb_input = dry_chunk + delayed_vals * feedback_gain
+                    delay_lines[c][dl_idx][write_positions] = comb_input
+                    write_pos[c][dl_idx] = (wp + seg_len) % buffer_len
+
+                reverbed_audio[idx:end, c] = dry_chunk * (1 - current_mix) + wet_chunk * current_mix * 0.2 # Wet attenuato
+
+            idx = end
 
         return reverbed_audio.squeeze() if num_channels == 1 else reverbed_audio
 
