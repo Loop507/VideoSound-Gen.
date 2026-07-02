@@ -152,6 +152,52 @@ VIDEO_PRESETS = {
         'glitch_factor_min': 0.15, 'glitch_factor_max': 0.5, 'glitch_intensity_min': 0.4, 'glitch_intensity_max': 0.9,
         'delay_on': False, 'reverb_on': False, 'eq_on': False,
     },
+    "🛸 Suoni dello Spazio (Barron)": {
+        # Ispirato alle "electronic tonalities" di Bebe e Louis Barron per Forbidden Planet (1956):
+        # toni elettronici puri che planano e decadono, timbri metallici da ring-modulation,
+        # pochissimo rumore/sporcizia, senso di vuoto siderale, suoni che si muovono nello spazio.
+        'subtractive_on': True, 'sub_freq_src': "Luminosità", 'sub_amp_src': "Movimento",
+        'sub_waveform_type': "sine", 'sub_freq_min': 100, 'sub_freq_max': 1800,
+        'sub_amp_min': 0.1, 'sub_amp_max': 0.35, 'sub_gain': 0.7,
+        'fm_on': True, 'fm_carr_src': "Movimento", 'fm_mod_src': "Variazione Movimento",
+        'fm_idx_src': "Variazione Movimento", 'fm_amp_src': "Luminosità",
+        'fm_carr_min': 200, 'fm_carr_max': 2000, 'fm_mod_min': 50, 'fm_mod_max': 400,
+        'fm_idx_min': 3.0, 'fm_idx_max': 9.0, 'fm_amp_min': 0.1, 'fm_amp_max': 0.3, 'fm_gain': 1.0,
+        'granular_on': True, 'gran_dens_src': "Dettaglio", 'gran_dur_src': "Movimento",
+        'gran_amp_src': "Movimento", 'gran_pitch_src': "Luminosità",
+        'gran_dens_min': 1, 'gran_dens_max': 4, 'gran_dur_min': 0.03, 'gran_dur_max': 0.08,
+        'gran_amp_min': 0.05, 'gran_amp_max': 0.15, 'gran_pitch_min': 300, 'gran_pitch_max': 2000, 'gran_gain': 0.5,
+        'noise_on': False,
+        'glitch_on': False,
+        'delay_on': True, 'delay_time_src': "Movimento", 'delay_feedback_src': "Variazione Movimento",
+        'delay_time_min': 0.08, 'delay_time_max': 0.25, 'delay_feedback_min': 0.3, 'delay_feedback_max': 0.6,
+        'reverb_on': True, 'reverb_decay_src': "Luminosità", 'reverb_mix_src': "Luminosità",
+        'reverb_decay_min': 3.0, 'reverb_decay_max': 5.0, 'reverb_mix_min': 0.4, 'reverb_mix_max': 0.7,
+        'eq_on': True, 'eq_low_src': "Movimento", 'eq_mid_src': "Dettaglio", 'eq_high_src': "Luminosità",
+        'eq_gain_min': -3.0, 'eq_gain_max': 10.0,
+        'panning_on': True, 'pan_src': "Centro di Massa Orizzontale",
+    },
+    "📻 Musica Concreta / Nastro": {
+        # Ispirato a Schaeffer/Stockhausen e all'estetica dei registratori a nastro: materiale
+        # "trovato" e manipolato invece di toni puri, tagli/splice netti, varispeed, fruscio,
+        # eco da tape-delay, gamma di frequenze più stretta (risposta in frequenza del nastro).
+        'subtractive_on': False,
+        'fm_on': False,
+        'granular_on': True, 'gran_dens_src': "Variazione Movimento", 'gran_dur_src': "Dettaglio",
+        'gran_amp_src': "Movimento", 'gran_pitch_src': "Movimento",
+        'gran_dens_min': 3, 'gran_dens_max': 9, 'gran_dur_min': 0.02, 'gran_dur_max': 0.09,
+        'gran_amp_min': 0.05, 'gran_amp_max': 0.2, 'gran_pitch_min': 80, 'gran_pitch_max': 1200, 'gran_gain': 1.2,
+        'noise_on': True, 'noise_amp_src': "Dettaglio", 'noise_amp_min': 0.05, 'noise_amp_max': 0.25, 'noise_gain': 0.8,
+        'glitch_on': True, 'glitch_factor_src': "Variazione Movimento", 'glitch_intensity_src': "Variazione Movimento",
+        'glitch_factor_min': 0.1, 'glitch_factor_max': 0.4, 'glitch_intensity_min': 0.3, 'glitch_intensity_max': 0.7,
+        'delay_on': True, 'delay_time_src': "Movimento", 'delay_feedback_src': "Variazione Movimento",
+        'delay_time_min': 0.15, 'delay_time_max': 0.4, 'delay_feedback_min': 0.5, 'delay_feedback_max': 0.85,
+        'reverb_on': True, 'reverb_decay_src': "Dettaglio", 'reverb_mix_src': "Movimento",
+        'reverb_decay_min': 1.5, 'reverb_decay_max': 3.5, 'reverb_mix_min': 0.25, 'reverb_mix_max': 0.5,
+        'eq_on': True, 'eq_low_src': "Dettaglio", 'eq_mid_src': "Movimento", 'eq_high_src': "Variazione Movimento",
+        'eq_gain_min': -10.0, 'eq_gain_max': 4.0,
+        'panning_on': True, 'pan_src': "Variazione Movimento",
+    },
 }
 
 def check_ffmpeg() -> bool:
