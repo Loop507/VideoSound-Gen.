@@ -175,7 +175,7 @@ def validate_video_file(uploaded_file) -> bool:
         return False
     return True
 
-def analyze_video_frames(video_path: str) -> Tuple[list, list, list, list, list, float, float]:
+def analyze_video_frames(video_path: str) -> Tuple[list, list, list, list, list, list, list, float, float]:
     """
     Analizza i frame di un video per estrarre dati visivi.
 
@@ -183,14 +183,14 @@ def analyze_video_frames(video_path: str) -> Tuple[list, list, list, list, list,
         video_path (str): Il percorso del file video da analizzare.
 
     Returns:
-        Tuple[list, list, list, list, list, float, float]: Una tupla contenente liste di dati
+        Tuple[list, list, list, list, list, list, list, float, float]: Una tupla contenente liste di dati
         per luminosità, dettaglio, movimento, variazione del movimento, centro di massa orizzontale,
-        la durata effettiva del video in secondi, e il frame rate (FPS) del video.
+        densità contorni, variazione colore, la durata effettiva del video in secondi, e il frame rate (FPS) del video.
     """
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         st.error(f"❌ Impossibile aprire il video: {video_path}")
-        return [], [], [], [], [], 0.0, 0.0
+        return [], [], [], [], [], [], [], 0.0, 0.0
 
     frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     fps = cap.get(cv2.CAP_PROP_FPS)
@@ -199,17 +199,19 @@ def analyze_video_frames(video_path: str) -> Tuple[list, list, list, list, list,
     if duration_seconds > MAX_DURATION:
         st.error(f"❌ Video troppo lungo. Durata massima consentita: {MAX_DURATION} secondi. Il tuo video è di {duration_seconds:.2f} secondi.")
         cap.release()
-        return [], [], [], [], [], 0.0, 0.0
+        return [], [], [], [], [], [], [], 0.0, 0.0
     if duration_seconds < MIN_DURATION:
         st.error(f"❌ Video troppo corto. Durata minima consentita: {MIN_DURATION} secondi. Il tuo video è di {duration_seconds:.2f} secondi.")
         cap.release()
-        return [], [], [], [], [], 0.0, 0.0
+        return [], [], [], [], [], [], [], 0.0, 0.0
 
     luminosity_data = []
     detail_data = [] # Misurato come deviazione standard dell'intensità dei pixel
     movement_data = [] # Differenza assoluta media tra frame consecutivi
     variation_movement_data = [] # Variazione del movimento
     horizontal_mass_center_data = [] # Centro di massa orizzontale per il panning
+    edge_density_data = [] # Densità dei contorni (Sobel) - per pattern/linee/geometrie
+    color_variation_data = [] # Deviazione standard della tonalità (Hue) - per varietà cromatica
 
     prev_gray_frame = None
     prev_movement = 0.0
@@ -253,6 +255,19 @@ def analyze_video_frames(video_path: str) -> Tuple[list, list, list, list, list,
         else:
             horizontal_mass_center_data.append(0.5) # Centro se il frame è vuoto o scuro
 
+        # Densità contorni (magnitudine media del gradiente Sobel) - utile per pattern/linee/geometrie
+        sobel_x = cv2.Sobel(gray_frame, cv2.CV_64F, 1, 0, ksize=3)
+        sobel_y = cv2.Sobel(gray_frame, cv2.CV_64F, 0, 1, ksize=3)
+        edge_magnitude = np.sqrt(sobel_x**2 + sobel_y**2)
+        edge_density = np.mean(edge_magnitude) / 255.0 # Normalizzato approssimativamente tra 0 e 1
+        edge_density_data.append(min(edge_density, 1.0))
+
+        # Variazione colore (deviazione standard della tonalità/Hue) - utile per varietà cromatica
+        hsv_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        hue_channel = hsv_frame[:, :, 0]
+        color_variation = np.std(hue_channel) / 180.0 # Hue in OpenCV va da 0 a 179
+        color_variation_data.append(min(color_variation, 1.0))
+
         prev_gray_frame = gray_frame
         prev_movement = current_movement
 
@@ -266,13 +281,15 @@ def analyze_video_frames(video_path: str) -> Tuple[list, list, list, list, list,
 
     # Assicurati che tutti gli array abbiano la stessa lunghezza finale
     max_len = len(luminosity_data)
-    for arr in [detail_data, movement_data, variation_movement_data, horizontal_mass_center_data]:
+    for arr in [detail_data, movement_data, variation_movement_data, horizontal_mass_center_data,
+                edge_density_data, color_variation_data]:
         while len(arr) < max_len:
             arr.append(arr[-1] if arr else 0.0) # Aggiunge l'ultimo valore o 0.0 se vuoto
 
     gc.collect() # Libera memoria
 
-    return luminosity_data, detail_data, movement_data, variation_movement_data, horizontal_mass_center_data, duration_seconds, fps
+    return (luminosity_data, detail_data, movement_data, variation_movement_data, horizontal_mass_center_data,
+            edge_density_data, color_variation_data, duration_seconds, fps)
 
 
 class AudioGenerator:
@@ -336,11 +353,13 @@ class AudioGenerator:
         audio = carrier_signal * amp_interp * 0.5
         return audio
 
-    def generate_granular_layer(self, density_data: list, grain_duration_data: list, amp_data: list) -> np.ndarray:
-        """Genera un layer di sintesi granulare."""
+    def generate_granular_layer(self, density_data: list, grain_duration_data: list, amp_data: list, pitch_data: list) -> np.ndarray:
+        """Genera un layer di sintesi granulare. L'intonazione dei grani è guidata da pitch_data
+        (con un piccolo jitter casuale per mantenere una texture organica), non più puramente random."""
         density_interp = self._interp_data_to_audio_length(density_data)
         grain_duration_interp = self._interp_data_to_audio_length(grain_duration_data)
         amp_interp = self._interp_data_to_audio_length(amp_data)
+        pitch_interp = self._interp_data_to_audio_length(pitch_data)
 
         audio = np.zeros(self.total_samples)
         
@@ -350,6 +369,7 @@ class AudioGenerator:
             current_density = density_interp[i * samples_per_virtual_frame] if i * samples_per_virtual_frame < self.total_samples else density_interp[-1]
             current_grain_dur_seconds = grain_duration_interp[i * samples_per_virtual_frame] if i * samples_per_virtual_frame < self.total_samples else grain_duration_interp[-1]
             current_amp = amp_interp[i * samples_per_virtual_frame] if i * samples_per_virtual_frame < self.total_samples else amp_interp[-1]
+            current_pitch = pitch_interp[i * samples_per_virtual_frame] if i * samples_per_virtual_frame < self.total_samples else pitch_interp[-1]
 
             num_grains_in_segment = int(current_density)
             
@@ -368,7 +388,8 @@ class AudioGenerator:
                 
                 start_grain_sample = np.random.randint(start_sample_segment, end_sample_segment - grain_dur_samples)
 
-                grain_freq = 200 + np.random.rand() * 800
+                # Intonazione guidata dal video (current_pitch) con +/-10% di jitter casuale per texture organica
+                grain_freq = max(20.0, current_pitch * (1.0 + (np.random.rand() - 0.5) * 0.2))
                 grain_t = np.arange(grain_dur_samples) / self.sample_rate
                 grain_waveform = np.sin(2 * np.pi * grain_freq * grain_t)
 
@@ -384,11 +405,11 @@ class AudioGenerator:
 
         return audio
 
-    def add_noise_layer(self, audio_array: np.ndarray, noise_amp_data: list) -> np.ndarray:
-        """Aggiunge un layer di rumore modulato all'audio esistente."""
+    def add_noise_layer(self, noise_amp_data: list) -> np.ndarray:
+        """Genera un layer di rumore modulato (da aggiungere una sola volta all'audio esistente)."""
         noise_amp_interp = self._interp_data_to_audio_length(noise_amp_data)
         noise_layer = np.random.normal(0, 1, self.total_samples) * noise_amp_interp * 0.2
-        return audio_array + noise_layer
+        return noise_layer
 
     def apply_glitch_effect(self, audio_array: np.ndarray, glitch_factor_data: list, glitch_intensity_data: list) -> np.ndarray:
         """Applica un effetto glitch all'audio."""
@@ -608,23 +629,43 @@ class AudioGenerator:
         # La banda media è il segnale originale meno le componenti basse e alte (approssimazione)
         mid_band = eq_audio - low_band - high_band # Potrebbe introdurre artefatti per filtri non ideali
 
-        # Iterazione per applicare il guadagno dinamico
-        for i in range(len(eq_audio)):
-            current_low_gain_db = low_gain_interp[i]
-            current_mid_gain_db = mid_gain_interp[i]
-            current_high_gain_db = high_gain_interp[i]
+        # Applicazione vettorizzata del guadagno dinamico (dB -> lineare per l'intero array in un colpo solo,
+        # senza loop Python per-campione/per-canale: stesso risultato, molto più veloce su video lunghi)
+        low_gain_linear = 10 ** (low_gain_interp / 20.0)
+        mid_gain_linear = 10 ** (mid_gain_interp / 20.0)
+        high_gain_linear = 10 ** (high_gain_interp / 20.0)
 
-            # Converti dB in fattori lineari
-            low_gain_linear = 10**(current_low_gain_db / 20)
-            mid_gain_linear = 10**(current_mid_gain_db / 20)
-            high_gain_linear = 10**(current_high_gain_db / 20)
+        if eq_audio.ndim == 2:
+            low_gain_linear = low_gain_linear[:, np.newaxis]
+            mid_gain_linear = mid_gain_linear[:, np.newaxis]
+            high_gain_linear = high_gain_linear[:, np.newaxis]
 
-            for c in range(eq_audio.shape[1]):
-                eq_audio[i, c] = (low_band[i, c] * low_gain_linear +
-                                  mid_band[i, c] * mid_gain_linear +
-                                  high_band[i, c] * high_gain_linear)
+        eq_audio = (low_band * low_gain_linear +
+                    mid_band * mid_gain_linear +
+                    high_band * high_gain_linear)
 
         return eq_audio.squeeze() if eq_audio.shape[1] == 1 else eq_audio
+
+    def apply_stereo_panning(self, audio_array: np.ndarray, pan_data: list) -> np.ndarray:
+        """Applica un panning stereo dinamico a un segnale mono, basato su pan_data
+        (valori 0=sinistra, 0.5=centro, 1=destra, tipicamente il centro di massa orizzontale del video).
+        Usa una legge a potenza costante (constant-power pan law) per un movimento naturale nello
+        spazio stereo. Completamente vettorizzato: nessun loop per-campione.
+        Se l'audio è già multi-canale, viene restituito invariato (non sovrascriviamo un mix già stereo)."""
+        if audio_array.ndim != 1:
+            return audio_array
+
+        pan_interp = self._interp_data_to_audio_length(pan_data)
+        pan_interp = np.clip(pan_interp, 0.0, 1.0)
+
+        angle = pan_interp * (np.pi / 2.0)
+        left_gain = np.cos(angle)
+        right_gain = np.sin(angle)
+
+        left_channel = audio_array * left_gain
+        right_channel = audio_array * right_gain
+
+        return np.stack([left_channel, right_channel], axis=1)
 
 
 def main():
@@ -669,7 +710,7 @@ def main():
         with open(video_input_path, "wb") as f:
             f.write(uploaded_file.getbuffer())
 
-        luminosity_data, detail_data, movement_data, variation_movement_data, horizontal_mass_center_data, duration_seconds, fps = analyze_video_frames(video_input_path)
+        luminosity_data, detail_data, movement_data, variation_movement_data, horizontal_mass_center_data, edge_density_data, color_variation_data, duration_seconds, fps = analyze_video_frames(video_input_path)
 
         if duration_seconds == 0.0: # Se l'analisi fallisce o video troppo corto/lungo
             os.remove(video_input_path)
@@ -698,8 +739,8 @@ def main():
         audio_generator = AudioGenerator(sample_rate=AUDIO_SAMPLE_RATE, total_duration_seconds=duration_seconds)
 
         # Scheda per i parametri audio
-        tab_sub, tab_fm, tab_gran, tab_noise, tab_fx, tab_eq = st.tabs([
-            "Sintesi Sottrattiva", "Sintesi FM", "Sintesi Granulare", "Rumore", "Effetti Audio", "Equalizzatore"
+        tab_sub, tab_fm, tab_gran, tab_noise, tab_fx, tab_eq, tab_pan = st.tabs([
+            "Sintesi Sottrattiva", "Sintesi FM", "Sintesi Granulare", "Rumore", "Effetti Audio", "Equalizzatore", "Panning Stereo"
         ])
 
         # Layer 1: Sintesi Sottrattiva (Basato su Luminosità e Dettaglio)
@@ -708,8 +749,14 @@ def main():
             use_subtractive = st.checkbox("Abilita Sintesi Sottrattiva", value=True, key='subtractive_on')
             params['subtractive_enabled'] = use_subtractive
             if use_subtractive:
-                sub_freq_source = st.selectbox("Sorgente Frequenza (Hz)", ["Luminosità", "Dettaglio", "Movimento"], key='sub_freq_src')
-                sub_amp_source = st.selectbox("Sorgente Ampiezza (0-1)", ["Luminosità", "Dettaglio", "Movimento"], key='sub_amp_src')
+                sub_layer_gain = st.slider("🎚️ Volume Layer Sottrattivo", 0.0, 2.0, 1.0, step=0.05, key='sub_gain',
+                                            help="Bilancia questo layer rispetto agli altri attivi contemporaneamente.")
+                params['sub_layer_gain'] = sub_layer_gain
+            else:
+                sub_layer_gain = 0.0
+            if use_subtractive:
+                sub_freq_source = st.selectbox("Sorgente Frequenza (Hz)", ["Luminosità", "Dettaglio", "Movimento", "Densità Contorni", "Variazione Colore"], key='sub_freq_src')
+                sub_amp_source = st.selectbox("Sorgente Ampiezza (0-1)", ["Luminosità", "Dettaglio", "Movimento", "Densità Contorni", "Variazione Colore"], key='sub_amp_src')
                 sub_waveform_type = st.selectbox("Tipo di Forma d'Onda", ["sine", "square", "sawtooth"], key='sub_waveform_type')
                 
                 sub_freq_min = st.slider("Frequenza Minima (Hz)", 20, 1000, 100, key='sub_freq_min')
@@ -727,11 +774,15 @@ def main():
                 if sub_freq_source == "Luminosità": sub_freq_data_raw = luminosity_data
                 elif sub_freq_source == "Dettaglio": sub_freq_data_raw = detail_data
                 elif sub_freq_source == "Movimento": sub_freq_data_raw = movement_data
+                elif sub_freq_source == "Densità Contorni": sub_freq_data_raw = edge_density_data
+                elif sub_freq_source == "Variazione Colore": sub_freq_data_raw = color_variation_data
 
                 sub_amp_data_raw = []
                 if sub_amp_source == "Luminosità": sub_amp_data_raw = luminosity_data
                 elif sub_amp_source == "Dettaglio": sub_amp_data_raw = detail_data
                 elif sub_amp_source == "Movimento": sub_amp_data_raw = movement_data
+                elif sub_amp_source == "Densità Contorni": sub_amp_data_raw = edge_density_data
+                elif sub_amp_source == "Variazione Colore": sub_amp_data_raw = color_variation_data
                 
                 # Normalizza e scala i dati delle sorgenti
                 sub_freq_scaled = np.interp(sub_freq_data_raw, (min(sub_freq_data_raw) if sub_freq_data_raw else 0, max(sub_freq_data_raw) if sub_freq_data_raw else 1), (sub_freq_min, sub_freq_max)).tolist()
@@ -746,10 +797,15 @@ def main():
             use_fm = st.checkbox("Abilita Sintesi FM", value=True, key='fm_on')
             params['fm_enabled'] = use_fm
             if use_fm:
-                fm_carrier_source = st.selectbox("Sorgente Frequenza Portante (Hz)", ["Luminosità", "Dettaglio", "Movimento", "Variazione Movimento"], key='fm_carr_src')
-                fm_mod_source = st.selectbox("Sorgente Frequenza Modulatore (Hz)", ["Luminosità", "Dettaglio", "Movimento", "Variazione Movimento"], key='fm_mod_src')
-                fm_mod_idx_source = st.selectbox("Sorgente Indice Modulazione", ["Luminosità", "Dettaglio", "Movimento", "Variazione Movimento"], key='fm_idx_src')
-                fm_amp_source = st.selectbox("Sorgente Ampiezza (0-1)", ["Luminosità", "Dettaglio", "Movimento", "Variazione Movimento"], key='fm_amp_src')
+                fm_layer_gain = st.slider("🎚️ Volume Layer FM", 0.0, 2.0, 1.0, step=0.05, key='fm_gain',
+                                           help="Bilancia questo layer rispetto agli altri attivi contemporaneamente.")
+                params['fm_layer_gain'] = fm_layer_gain
+
+                fm_source_options = ["Luminosità", "Dettaglio", "Movimento", "Variazione Movimento", "Densità Contorni", "Variazione Colore"]
+                fm_carrier_source = st.selectbox("Sorgente Frequenza Portante (Hz)", fm_source_options, key='fm_carr_src')
+                fm_mod_source = st.selectbox("Sorgente Frequenza Modulatore (Hz)", fm_source_options, key='fm_mod_src')
+                fm_mod_idx_source = st.selectbox("Sorgente Indice Modulazione", fm_source_options, key='fm_idx_src')
+                fm_amp_source = st.selectbox("Sorgente Ampiezza (0-1)", fm_source_options, key='fm_amp_src')
 
                 fm_carrier_min = st.slider("Portante Minima (Hz)", 50, 2000, 200, key='fm_carr_min')
                 fm_carrier_max = st.slider("Portante Massima (Hz)", 50, 2000, 1500, key='fm_carr_max')
@@ -774,24 +830,32 @@ def main():
                 elif fm_carrier_source == "Dettaglio": fm_carrier_data_raw = detail_data
                 elif fm_carrier_source == "Movimento": fm_carrier_data_raw = movement_data
                 elif fm_carrier_source == "Variazione Movimento": fm_carrier_data_raw = variation_movement_data
+                elif fm_carrier_source == "Densità Contorni": fm_carrier_data_raw = edge_density_data
+                elif fm_carrier_source == "Variazione Colore": fm_carrier_data_raw = color_variation_data
 
                 fm_mod_data_raw = []
                 if fm_mod_source == "Luminosità": fm_mod_data_raw = luminosity_data
                 elif fm_mod_source == "Dettaglio": fm_mod_data_raw = detail_data
                 elif fm_mod_source == "Movimento": fm_mod_data_raw = movement_data
                 elif fm_mod_source == "Variazione Movimento": fm_mod_data_raw = variation_movement_data
+                elif fm_mod_source == "Densità Contorni": fm_mod_data_raw = edge_density_data
+                elif fm_mod_source == "Variazione Colore": fm_mod_data_raw = color_variation_data
 
                 fm_mod_idx_data_raw = []
                 if fm_mod_idx_source == "Luminosità": fm_mod_idx_data_raw = luminosity_data
                 elif fm_mod_idx_source == "Dettaglio": fm_mod_idx_data_raw = detail_data
                 elif fm_mod_idx_source == "Movimento": fm_mod_idx_data_raw = movement_data
                 elif fm_mod_idx_source == "Variazione Movimento": fm_mod_idx_data_raw = variation_movement_data
-                
+                elif fm_mod_idx_source == "Densità Contorni": fm_mod_idx_data_raw = edge_density_data
+                elif fm_mod_idx_source == "Variazione Colore": fm_mod_idx_data_raw = color_variation_data
+
                 fm_amp_data_raw = []
                 if fm_amp_source == "Luminosità": fm_amp_data_raw = luminosity_data
                 elif fm_amp_source == "Dettaglio": fm_amp_data_raw = detail_data
                 elif fm_amp_source == "Movimento": fm_amp_data_raw = movement_data
                 elif fm_amp_source == "Variazione Movimento": fm_amp_data_raw = variation_movement_data
+                elif fm_amp_source == "Densità Contorni": fm_amp_data_raw = edge_density_data
+                elif fm_amp_source == "Variazione Colore": fm_amp_data_raw = color_variation_data
 
 
                 fm_carrier_scaled = np.interp(fm_carrier_data_raw, (min(fm_carrier_data_raw) if fm_carrier_data_raw else 0, max(fm_carrier_data_raw) if fm_carrier_data_raw else 1), (fm_carrier_min, fm_carrier_max)).tolist()
@@ -803,6 +867,7 @@ def main():
                 fm_mod_scaled = []
                 fm_mod_idx_scaled = []
                 fm_amp_scaled = []
+                fm_layer_gain = 0.0
 
         # Layer 3: Sintesi Granulare (Basato su Dettaglio e Movimento)
         with tab_gran:
@@ -810,9 +875,16 @@ def main():
             use_granular = st.checkbox("Abilita Sintesi Granulare", value=True, key='granular_on')
             params['granular_enabled'] = use_granular
             if use_granular:
-                gran_density_source = st.selectbox("Sorgente Densità Grani", ["Dettaglio", "Movimento", "Variazione Movimento"], key='gran_dens_src')
-                gran_duration_source = st.selectbox("Sorgente Durata Grani (sec)", ["Dettaglio", "Movimento", "Variazione Movimento"], key='gran_dur_src')
-                gran_amp_source = st.selectbox("Sorgente Ampiezza Grani (0-1)", ["Dettaglio", "Movimento", "Variazione Movimento"], key='gran_amp_src')
+                gran_layer_gain = st.slider("🎚️ Volume Layer Granulare", 0.0, 2.0, 1.0, step=0.05, key='gran_gain',
+                                             help="Bilancia questo layer rispetto agli altri attivi contemporaneamente.")
+                params['gran_layer_gain'] = gran_layer_gain
+
+                gran_source_options = ["Dettaglio", "Movimento", "Variazione Movimento", "Densità Contorni", "Variazione Colore"]
+                gran_density_source = st.selectbox("Sorgente Densità Grani", gran_source_options, key='gran_dens_src')
+                gran_duration_source = st.selectbox("Sorgente Durata Grani (sec)", gran_source_options, key='gran_dur_src')
+                gran_amp_source = st.selectbox("Sorgente Ampiezza Grani (0-1)", gran_source_options, key='gran_amp_src')
+                gran_pitch_source = st.selectbox("Sorgente Intonazione Grani (Hz)", ["Luminosità"] + gran_source_options, key='gran_pitch_src',
+                                                  help="Prima era sempre casuale: ora anche l'intonazione di ogni grano segue il video.")
                 
                 gran_density_min = st.slider("Densità Minima Grani", 0, 10, 1, key='gran_dens_min')
                 gran_density_max = st.slider("Densità Massima Grani", 0, 10, 5, key='gran_dens_max')
@@ -820,36 +892,57 @@ def main():
                 gran_duration_max = st.slider("Durata Massima Grani (sec)", 0.01, 0.1, 0.05, step=0.005, key='gran_dur_max')
                 gran_amp_min = st.slider("Ampiezza Grani Minima", 0.0, 1.0, 0.01, step=0.01, key='gran_amp_min')
                 gran_amp_max = st.slider("Ampiezza Grani Massima", 0.0, 1.0, 0.1, step=0.01, key='gran_amp_max')
+                gran_pitch_min = st.slider("Intonazione Minima Grani (Hz)", 50, 2000, 200, key='gran_pitch_min')
+                gran_pitch_max = st.slider("Intonazione Massima Grani (Hz)", 50, 2000, 1000, key='gran_pitch_max')
 
                 params['gran_density_source'] = gran_density_source
                 params['gran_duration_source'] = gran_duration_source
                 params['gran_amp_source'] = gran_amp_source
+                params['gran_pitch_source'] = gran_pitch_source
                 params['gran_density_range'] = (gran_density_min, gran_density_max)
                 params['gran_duration_range'] = (gran_duration_min, gran_duration_max)
                 params['gran_amp_range'] = (gran_amp_min, gran_amp_max)
+                params['gran_pitch_range'] = (gran_pitch_min, gran_pitch_max)
 
                 gran_density_data_raw = []
                 if gran_density_source == "Dettaglio": gran_density_data_raw = detail_data
                 elif gran_density_source == "Movimento": gran_density_data_raw = movement_data
                 elif gran_density_source == "Variazione Movimento": gran_density_data_raw = variation_movement_data
+                elif gran_density_source == "Densità Contorni": gran_density_data_raw = edge_density_data
+                elif gran_density_source == "Variazione Colore": gran_density_data_raw = color_variation_data
 
                 gran_duration_data_raw = []
                 if gran_duration_source == "Dettaglio": gran_duration_data_raw = detail_data
                 elif gran_duration_source == "Movimento": gran_duration_data_raw = movement_data
                 elif gran_duration_source == "Variazione Movimento": gran_duration_data_raw = variation_movement_data
+                elif gran_duration_source == "Densità Contorni": gran_duration_data_raw = edge_density_data
+                elif gran_duration_source == "Variazione Colore": gran_duration_data_raw = color_variation_data
 
                 gran_amp_data_raw = []
                 if gran_amp_source == "Dettaglio": gran_amp_data_raw = detail_data
                 elif gran_amp_source == "Movimento": gran_amp_data_raw = movement_data
                 elif gran_amp_source == "Variazione Movimento": gran_amp_data_raw = variation_movement_data
+                elif gran_amp_source == "Densità Contorni": gran_amp_data_raw = edge_density_data
+                elif gran_amp_source == "Variazione Colore": gran_amp_data_raw = color_variation_data
+
+                gran_pitch_data_raw = []
+                if gran_pitch_source == "Luminosità": gran_pitch_data_raw = luminosity_data
+                elif gran_pitch_source == "Dettaglio": gran_pitch_data_raw = detail_data
+                elif gran_pitch_source == "Movimento": gran_pitch_data_raw = movement_data
+                elif gran_pitch_source == "Variazione Movimento": gran_pitch_data_raw = variation_movement_data
+                elif gran_pitch_source == "Densità Contorni": gran_pitch_data_raw = edge_density_data
+                elif gran_pitch_source == "Variazione Colore": gran_pitch_data_raw = color_variation_data
 
                 gran_density_scaled = np.interp(gran_density_data_raw, (min(gran_density_data_raw) if gran_density_data_raw else 0, max(gran_density_data_raw) if gran_density_data_raw else 1), (gran_density_min, gran_density_max)).tolist()
                 gran_duration_scaled = np.interp(gran_duration_data_raw, (min(gran_duration_data_raw) if gran_duration_data_raw else 0, max(gran_duration_data_raw) if gran_duration_data_raw else 1), (gran_duration_min, gran_duration_max)).tolist()
                 gran_amp_scaled = np.interp(gran_amp_data_raw, (min(gran_amp_data_raw) if gran_amp_data_raw else 0, max(gran_amp_data_raw) if gran_amp_data_raw else 1), (gran_amp_min, gran_amp_max)).tolist()
+                gran_pitch_scaled = np.interp(gran_pitch_data_raw, (min(gran_pitch_data_raw) if gran_pitch_data_raw else 0, max(gran_pitch_data_raw) if gran_pitch_data_raw else 1), (gran_pitch_min, gran_pitch_max)).tolist()
             else: # Aggiunto else per gestire i casi in cui i dati non sono scalati
                 gran_density_scaled = []
                 gran_duration_scaled = []
                 gran_amp_scaled = []
+                gran_pitch_scaled = []
+                gran_layer_gain = 0.0
 
 
         # Layer 4: Rumore (Basato su Variazione Movimento)
@@ -858,7 +951,11 @@ def main():
             use_noise = st.checkbox("Abilita Rumore", value=True, key='noise_on')
             params['noise_enabled'] = use_noise
             if use_noise:
-                noise_amp_source = st.selectbox("Sorgente Ampiezza Rumore", ["Variazione Movimento", "Movimento", "Dettaglio"], key='noise_amp_src')
+                noise_layer_gain = st.slider("🎚️ Volume Layer Rumore", 0.0, 2.0, 1.0, step=0.05, key='noise_gain',
+                                              help="Bilancia questo layer rispetto agli altri attivi contemporaneamente.")
+                params['noise_layer_gain'] = noise_layer_gain
+
+                noise_amp_source = st.selectbox("Sorgente Ampiezza Rumore", ["Variazione Movimento", "Movimento", "Dettaglio", "Densità Contorni", "Variazione Colore"], key='noise_amp_src')
                 noise_amp_min = st.slider("Ampiezza Minima Rumore", 0.0, 1.0, 0.0, step=0.01, key='noise_amp_min')
                 noise_amp_max = st.slider("Ampiezza Massima Rumore", 0.0, 1.0, 0.1, step=0.01, key='noise_amp_max')
 
@@ -869,10 +966,13 @@ def main():
                 if noise_amp_source == "Variazione Movimento": noise_amp_data_raw = variation_movement_data
                 elif noise_amp_source == "Movimento": noise_amp_data_raw = movement_data
                 elif noise_amp_source == "Dettaglio": noise_amp_data_raw = detail_data
+                elif noise_amp_source == "Densità Contorni": noise_amp_data_raw = edge_density_data
+                elif noise_amp_source == "Variazione Colore": noise_amp_data_raw = color_variation_data
 
                 noise_amp_scaled = np.interp(noise_amp_data_raw, (min(noise_amp_data_raw) if noise_amp_data_raw else 0, max(noise_amp_data_raw) if noise_amp_data_raw else 1), (noise_amp_min, noise_amp_max)).tolist()
             else: # Aggiunto else per gestire i casi in cui i dati non sono scalati
                 noise_amp_scaled = []
+                noise_layer_gain = 0.0
 
 
         # Effetti Audio (Glitch, Delay, Reverb)
@@ -989,9 +1089,9 @@ def main():
             use_eq = st.checkbox("Abilita Equalizzatore", value=False, key='eq_on')
             params['eq_enabled'] = use_eq
             if use_eq:
-                eq_low_source = st.selectbox("Sorgente Guadagno Bassi (dB)", ["Luminosità", "Movimento", "Variazione Movimento"], key='eq_low_src')
-                eq_mid_source = st.selectbox("Sorgente Guadagno Medi (dB)", ["Dettaglio", "Luminosità", "Movimento"], key='eq_mid_src')
-                eq_high_source = st.selectbox("Sorgente Guadagno Alti (dB)", ["Movimento", "Dettaglio", "Variazione Movimento"], key='eq_high_src')
+                eq_low_source = st.selectbox("Sorgente Guadagno Bassi (dB)", ["Luminosità", "Movimento", "Variazione Movimento", "Densità Contorni", "Variazione Colore"], key='eq_low_src')
+                eq_mid_source = st.selectbox("Sorgente Guadagno Medi (dB)", ["Dettaglio", "Luminosità", "Movimento", "Densità Contorni", "Variazione Colore"], key='eq_mid_src')
+                eq_high_source = st.selectbox("Sorgente Guadagno Alti (dB)", ["Movimento", "Dettaglio", "Variazione Movimento", "Densità Contorni", "Variazione Colore"], key='eq_high_src')
                 
                 eq_gain_min = st.slider("Guadagno Minimo (dB)", -20.0, 20.0, -10.0, step=0.5, key='eq_gain_min')
                 eq_gain_max = st.slider("Guadagno Massimo (dB)", -20.0, 20.0, 10.0, step=0.5, key='eq_gain_max')
@@ -1005,16 +1105,22 @@ def main():
                 if eq_low_source == "Luminosità": eq_low_data_raw = luminosity_data
                 elif eq_low_source == "Movimento": eq_low_data_raw = movement_data
                 elif eq_low_source == "Variazione Movimento": eq_low_data_raw = variation_movement_data
+                elif eq_low_source == "Densità Contorni": eq_low_data_raw = edge_density_data
+                elif eq_low_source == "Variazione Colore": eq_low_data_raw = color_variation_data
 
                 eq_mid_data_raw = []
                 if eq_mid_source == "Dettaglio": eq_mid_data_raw = detail_data
                 elif eq_mid_source == "Luminosità": eq_mid_data_raw = luminosity_data
                 elif eq_mid_source == "Movimento": eq_mid_data_raw = movement_data
+                elif eq_mid_source == "Densità Contorni": eq_mid_data_raw = edge_density_data
+                elif eq_mid_source == "Variazione Colore": eq_mid_data_raw = color_variation_data
 
                 eq_high_data_raw = []
                 if eq_high_source == "Movimento": eq_high_data_raw = movement_data
                 elif eq_high_source == "Dettaglio": eq_high_data_raw = detail_data
                 elif eq_high_source == "Variazione Movimento": eq_high_data_raw = variation_movement_data
+                elif eq_high_source == "Densità Contorni": eq_high_data_raw = edge_density_data
+                elif eq_high_source == "Variazione Colore": eq_high_data_raw = color_variation_data
 
                 eq_low_scaled = np.interp(eq_low_data_raw, (min(eq_low_data_raw) if eq_low_data_raw else 0, max(eq_low_data_raw) if eq_low_data_raw else 1), (eq_gain_min, eq_gain_max)).tolist()
                 eq_mid_scaled = np.interp(eq_mid_data_raw, (min(eq_mid_data_raw) if eq_mid_data_raw else 0, max(eq_mid_data_raw) if eq_mid_data_raw else 1), (eq_gain_min, eq_gain_max)).tolist()
@@ -1023,6 +1129,32 @@ def main():
                 eq_low_scaled = []
                 eq_mid_scaled = []
                 eq_high_scaled = []
+
+        # Panning Stereo (finora il centro di massa orizzontale veniva calcolato ma mai usato)
+        with tab_pan:
+            st.markdown("### Panning Stereo")
+            st.caption("Il centro di massa orizzontale del video (dove si concentra la 'massa' visiva nel frame) può spostare il suono nello spazio stereo: se il soggetto si muove a sinistra o a destra, il suono lo segue.")
+            use_panning = st.checkbox("Abilita Panning Stereo", value=False, key='panning_on')
+            params['panning_enabled'] = use_panning
+            if use_panning:
+                pan_source = st.selectbox("Sorgente Panning", ["Centro di Massa Orizzontale", "Movimento", "Variazione Movimento"], key='pan_src',
+                                           help="Centro di Massa Orizzontale è la scelta più naturale: segue davvero dove si trova il soggetto nel frame.")
+                params['pan_source'] = pan_source
+
+                pan_data_raw = []
+                if pan_source == "Centro di Massa Orizzontale": pan_data_raw = horizontal_mass_center_data
+                elif pan_source == "Movimento": pan_data_raw = movement_data
+                elif pan_source == "Variazione Movimento": pan_data_raw = variation_movement_data
+
+                # Il centro di massa orizzontale è già normalizzato 0..1 (0=sinistra, 1=destra):
+                # per questa sorgente non serve rimappare min/max, altrimenti un soggetto che sta
+                # sempre a destra verrebbe "stirato" fino all'estrema sinistra.
+                if pan_source == "Centro di Massa Orizzontale":
+                    pan_scaled = pan_data_raw
+                else:
+                    pan_scaled = np.interp(pan_data_raw, (min(pan_data_raw) if pan_data_raw else 0, max(pan_data_raw) if pan_data_raw else 1), (0.0, 1.0)).tolist()
+            else:
+                pan_scaled = []
 
 
         st.subheader("Impostazioni Output Video")
@@ -1051,22 +1183,22 @@ def main():
 
             combined_audio = np.zeros(audio_generator.total_samples, dtype=np.float32)
 
-            # Generazione dei Layer Audio
+            # Generazione dei Layer Audio (ognuno pesato dal proprio Volume Layer)
             if use_subtractive:
                 subtractive_audio = audio_generator.generate_subtractive_waveform(sub_freq_scaled, sub_amp_scaled, sub_waveform_type)
-                combined_audio += subtractive_audio
+                combined_audio += subtractive_audio * sub_layer_gain
             
             if use_fm:
                 fm_audio = audio_generator.generate_fm_layer(fm_carrier_scaled, fm_mod_scaled, fm_mod_idx_scaled, fm_amp_scaled)
-                combined_audio += fm_audio
+                combined_audio += fm_audio * fm_layer_gain
 
             if use_granular:
-                granular_audio = audio_generator.generate_granular_layer(gran_density_scaled, gran_duration_scaled, gran_amp_scaled)
-                combined_audio += granular_audio
+                granular_audio = audio_generator.generate_granular_layer(gran_density_scaled, gran_duration_scaled, gran_amp_scaled, gran_pitch_scaled)
+                combined_audio += granular_audio * gran_layer_gain
 
             if use_noise:
-                noise_audio = audio_generator.add_noise_layer(combined_audio, noise_amp_scaled)
-                combined_audio += noise_audio # Aggiungi al combined_audio esistente
+                noise_audio = audio_generator.add_noise_layer(noise_amp_scaled)
+                combined_audio += noise_audio * noise_layer_gain
 
             progress_bar_audio.progress(30)
             status_text_audio.text("Applicazione effetti audio...")
@@ -1084,13 +1216,22 @@ def main():
             if use_eq:
                 combined_audio = audio_generator.apply_eq_effect(combined_audio, eq_low_scaled, eq_mid_scaled, eq_high_scaled)
 
+            # Panning stereo: applicato per ultimo, dopo tutti gli effetti mono, così converte
+            # l'audio in stereo (samples, 2) solo alla fine della catena.
+            if use_panning:
+                combined_audio = audio_generator.apply_stereo_panning(combined_audio, pan_scaled)
+
             progress_bar_audio.progress(70)
             status_text_audio.text("Normalizzazione audio...")
 
             if normalize_audio:
-                # Prevenire divisione per zero se l'audio è silenzioso
-                if np.max(np.abs(combined_audio)) > 1e-6:
-                    combined_audio = librosa.util.normalize(combined_audio)
+                # Prevenire divisione per zero se l'audio è silenzioso.
+                # Usiamo il picco GLOBALE (non per-canale) per non alterare il bilanciamento
+                # stereo introdotto dal panning: normalizzare i due canali in modo indipendente
+                # appiattirebbe la differenza di volume tra sinistra e destra.
+                peak = np.max(np.abs(combined_audio))
+                if peak > 1e-6:
+                    combined_audio = combined_audio / peak
                 else:
                     combined_audio = np.zeros_like(combined_audio) # Mantieni a zero se già silenzioso
 
