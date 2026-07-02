@@ -81,7 +81,7 @@ VIDEO_PRESETS = {
         'gran_dens_min': 2, 'gran_dens_max': 8, 'gran_dur_min': 0.02, 'gran_dur_max': 0.06,
         'gran_amp_min': 0.05, 'gran_amp_max': 0.2,
         'noise_on': True, 'noise_amp_src': "Variazione Movimento", 'noise_amp_min': 0.1, 'noise_amp_max': 0.4,
-        'glitch_on': True, 'glitch_factor_src': "Variazione Movimento", 'glitch_intensity_src': "Variazione Movimento",
+        'glitch_on': True, 'glitch_character': "Sporco / Analogico (rumore dominante)", 'glitch_factor_src': "Variazione Movimento", 'glitch_intensity_src': "Variazione Movimento",
         'glitch_factor_min': 0.1, 'glitch_factor_max': 0.4, 'glitch_intensity_min': 0.3, 'glitch_intensity_max': 0.8,
         'delay_on': False, 'reverb_on': False, 'eq_on': False,
     },
@@ -107,7 +107,7 @@ VIDEO_PRESETS = {
         'fm_carr_min': 300, 'fm_carr_max': 1500, 'fm_mod_min': 50, 'fm_mod_max': 250,
         'fm_idx_min': 1.0, 'fm_idx_max': 5.0, 'fm_amp_min': 0.05, 'fm_amp_max': 0.2,
         'granular_on': False, 'noise_on': False,
-        'glitch_on': True, 'glitch_factor_src': "Dettaglio", 'glitch_intensity_src': "Dettaglio",
+        'glitch_on': True, 'glitch_character': "Pulito / Digitale (repeat + reverse, poco rumore)", 'glitch_factor_src': "Dettaglio", 'glitch_intensity_src': "Dettaglio",
         'glitch_factor_min': 0.02, 'glitch_factor_max': 0.12, 'glitch_intensity_min': 0.1, 'glitch_intensity_max': 0.4,
         'delay_on': False, 'reverb_on': False,
         'eq_on': True, 'eq_low_src': "Luminosità", 'eq_mid_src': "Dettaglio", 'eq_high_src': "Dettaglio",
@@ -124,7 +124,7 @@ VIDEO_PRESETS = {
         'gran_dens_min': 2, 'gran_dens_max': 7, 'gran_dur_min': 0.01, 'gran_dur_max': 0.05,
         'gran_amp_min': 0.03, 'gran_amp_max': 0.15,
         'noise_on': False,
-        'glitch_on': True, 'glitch_factor_src': "Variazione Movimento", 'glitch_intensity_src': "Variazione Movimento",
+        'glitch_on': True, 'glitch_character': "Bilanciato (default)", 'glitch_factor_src': "Variazione Movimento", 'glitch_intensity_src': "Variazione Movimento",
         'glitch_factor_min': 0.05, 'glitch_factor_max': 0.2, 'glitch_intensity_min': 0.2, 'glitch_intensity_max': 0.6,
         'delay_on': True, 'delay_time_src': "Variazione Movimento", 'delay_feedback_src': "Variazione Movimento",
         'delay_time_min': 0.05, 'delay_time_max': 0.25, 'delay_feedback_min': 0.3, 'delay_feedback_max': 0.6,
@@ -135,7 +135,7 @@ VIDEO_PRESETS = {
         'sub_waveform_type': "sine", 'sub_freq_min': 100, 'sub_freq_max': 700,
         'sub_amp_min': 0.15, 'sub_amp_max': 0.45,
         'fm_on': False, 'granular_on': False, 'noise_on': False,
-        'glitch_on': True, 'glitch_factor_src': "Movimento", 'glitch_intensity_src': "Movimento",
+        'glitch_on': True, 'glitch_character': "Pulito / Digitale (repeat + reverse, poco rumore)", 'glitch_factor_src': "Movimento", 'glitch_intensity_src': "Movimento",
         'glitch_factor_min': 0.01, 'glitch_factor_max': 0.08, 'glitch_intensity_min': 0.1, 'glitch_intensity_max': 0.35,
         'delay_on': True, 'delay_time_src': "Movimento", 'delay_feedback_src': "Movimento",
         'delay_time_min': 0.05, 'delay_time_max': 0.15, 'delay_feedback_min': 0.2, 'delay_feedback_max': 0.4,
@@ -148,7 +148,7 @@ VIDEO_PRESETS = {
         'gran_dens_min': 4, 'gran_dens_max': 10, 'gran_dur_min': 0.01, 'gran_dur_max': 0.025,
         'gran_amp_min': 0.05, 'gran_amp_max': 0.2,
         'noise_on': True, 'noise_amp_src': "Dettaglio", 'noise_amp_min': 0.0, 'noise_amp_max': 0.05,
-        'glitch_on': True, 'glitch_factor_src': "Variazione Movimento", 'glitch_intensity_src': "Variazione Movimento",
+        'glitch_on': True, 'glitch_character': "Pulito / Digitale (repeat + reverse, poco rumore)", 'glitch_factor_src': "Variazione Movimento", 'glitch_intensity_src': "Variazione Movimento",
         'glitch_factor_min': 0.15, 'glitch_factor_max': 0.5, 'glitch_intensity_min': 0.4, 'glitch_intensity_max': 0.9,
         'delay_on': False, 'reverb_on': False, 'eq_on': False,
     },
@@ -189,7 +189,7 @@ VIDEO_PRESETS = {
         'gran_dens_min': 3, 'gran_dens_max': 9, 'gran_dur_min': 0.02, 'gran_dur_max': 0.09,
         'gran_amp_min': 0.05, 'gran_amp_max': 0.2, 'gran_pitch_min': 80, 'gran_pitch_max': 1200, 'gran_gain': 1.2,
         'noise_on': True, 'noise_amp_src': "Dettaglio", 'noise_amp_min': 0.05, 'noise_amp_max': 0.25, 'noise_gain': 0.8,
-        'glitch_on': True, 'glitch_factor_src': "Variazione Movimento", 'glitch_intensity_src': "Variazione Movimento",
+        'glitch_on': True, 'glitch_character': "Pulito / Digitale (repeat + reverse, poco rumore)", 'glitch_factor_src': "Variazione Movimento", 'glitch_intensity_src': "Variazione Movimento",
         'glitch_factor_min': 0.1, 'glitch_factor_max': 0.4, 'glitch_intensity_min': 0.3, 'glitch_intensity_max': 0.7,
         'delay_on': True, 'delay_time_src': "Movimento", 'delay_feedback_src': "Variazione Movimento",
         'delay_time_min': 0.15, 'delay_time_max': 0.4, 'delay_feedback_min': 0.5, 'delay_feedback_max': 0.85,
@@ -222,7 +222,7 @@ def validate_video_file(uploaded_file) -> bool:
         return False
     return True
 
-def analyze_video_frames(video_path: str) -> Tuple[list, list, list, list, list, list, list, float, float]:
+def analyze_video_frames(video_path: str) -> Tuple[list, list, list, list, list, list, list, list, float, float]:
     """
     Analizza i frame di un video per estrarre dati visivi.
 
@@ -230,14 +230,15 @@ def analyze_video_frames(video_path: str) -> Tuple[list, list, list, list, list,
         video_path (str): Il percorso del file video da analizzare.
 
     Returns:
-        Tuple[list, list, list, list, list, list, list, float, float]: Una tupla contenente liste di dati
+        Tuple[list, list, list, list, list, list, list, list, float, float]: Una tupla contenente liste di dati
         per luminosità, dettaglio, movimento, variazione del movimento, centro di massa orizzontale,
-        densità contorni, variazione colore, la durata effettiva del video in secondi, e il frame rate (FPS) del video.
+        centro di massa verticale, densità contorni, variazione colore, la durata effettiva del video in secondi,
+        e il frame rate (FPS) del video.
     """
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         st.error(f"❌ Impossibile aprire il video: {video_path}")
-        return [], [], [], [], [], [], [], 0.0, 0.0
+        return [], [], [], [], [], [], [], [], 0.0, 0.0
 
     frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     fps = cap.get(cv2.CAP_PROP_FPS)
@@ -246,17 +247,18 @@ def analyze_video_frames(video_path: str) -> Tuple[list, list, list, list, list,
     if duration_seconds > MAX_DURATION:
         st.error(f"❌ Video troppo lungo. Durata massima consentita: {MAX_DURATION} secondi. Il tuo video è di {duration_seconds:.2f} secondi.")
         cap.release()
-        return [], [], [], [], [], [], [], 0.0, 0.0
+        return [], [], [], [], [], [], [], [], 0.0, 0.0
     if duration_seconds < MIN_DURATION:
         st.error(f"❌ Video troppo corto. Durata minima consentita: {MIN_DURATION} secondi. Il tuo video è di {duration_seconds:.2f} secondi.")
         cap.release()
-        return [], [], [], [], [], [], [], 0.0, 0.0
+        return [], [], [], [], [], [], [], [], 0.0, 0.0
 
     luminosity_data = []
     detail_data = [] # Misurato come deviazione standard dell'intensità dei pixel
     movement_data = [] # Differenza assoluta media tra frame consecutivi
     variation_movement_data = [] # Variazione del movimento
     horizontal_mass_center_data = [] # Centro di massa orizzontale per il panning
+    vertical_mass_center_data = [] # Centro di massa verticale per la simulazione di altezza (su/giù)
     edge_density_data = [] # Densità dei contorni (Sobel) - per pattern/linee/geometrie
     color_variation_data = [] # Deviazione standard della tonalità (Hue) - per varietà cromatica
 
@@ -299,8 +301,11 @@ def analyze_video_frames(video_path: str) -> Tuple[list, list, list, list, list,
         if M['m00'] != 0 and np.sum(gray_frame) > 0: # Evita divisione per zero e frame completamente neri
             cx = int(M['m10'] / M['m00'])
             horizontal_mass_center_data.append(cx / frame.shape[1]) # Normalizzato tra 0 e 1
+            cy = int(M['m01'] / M['m00'])
+            vertical_mass_center_data.append(cy / frame.shape[0]) # 0=alto del frame, 1=basso del frame
         else:
             horizontal_mass_center_data.append(0.5) # Centro se il frame è vuoto o scuro
+            vertical_mass_center_data.append(0.5)
 
         # Densità contorni (magnitudine media del gradiente Sobel) - utile per pattern/linee/geometrie
         sobel_x = cv2.Sobel(gray_frame, cv2.CV_64F, 1, 0, ksize=3)
@@ -329,14 +334,14 @@ def analyze_video_frames(video_path: str) -> Tuple[list, list, list, list, list,
     # Assicurati che tutti gli array abbiano la stessa lunghezza finale
     max_len = len(luminosity_data)
     for arr in [detail_data, movement_data, variation_movement_data, horizontal_mass_center_data,
-                edge_density_data, color_variation_data]:
+                vertical_mass_center_data, edge_density_data, color_variation_data]:
         while len(arr) < max_len:
             arr.append(arr[-1] if arr else 0.0) # Aggiunge l'ultimo valore o 0.0 se vuoto
 
     gc.collect() # Libera memoria
 
     return (luminosity_data, detail_data, movement_data, variation_movement_data, horizontal_mass_center_data,
-            edge_density_data, color_variation_data, duration_seconds, fps)
+            vertical_mass_center_data, edge_density_data, color_variation_data, duration_seconds, fps)
 
 
 class AudioGenerator:
@@ -458,8 +463,13 @@ class AudioGenerator:
         noise_layer = np.random.normal(0, 1, self.total_samples) * noise_amp_interp * 0.2
         return noise_layer
 
-    def apply_glitch_effect(self, audio_array: np.ndarray, glitch_factor_data: list, glitch_intensity_data: list) -> np.ndarray:
-        """Applica un effetto glitch all'audio."""
+    def apply_glitch_effect(self, audio_array: np.ndarray, glitch_factor_data: list, glitch_intensity_data: list,
+                             type_weights: dict = None) -> np.ndarray:
+        """Applica un effetto glitch all'audio.
+
+        type_weights: dict opzionale tipo {"repeat": 0.4, "noise": 0.2, "reverse": 0.4} per pesare
+        la scelta del tipo di glitch invece di sceglierlo sempre in modo uniforme/casuale. Se None,
+        i tre tipi hanno la stessa probabilità (comportamento precedente)."""
         glitched_audio = np.copy(audio_array)
         glitched_audio = np.nan_to_num(glitched_audio, nan=0.0)
 
@@ -467,6 +477,14 @@ class AudioGenerator:
         glitch_intensity_interp = self._interp_data_to_audio_length(glitch_intensity_data)
 
         glitch_check_interval_samples = int(0.1 * self.sample_rate) # Controlla ogni 100ms
+
+        if type_weights is None:
+            type_names = ["repeat", "noise", "reverse"]
+            type_probs = [1/3, 1/3, 1/3]
+        else:
+            type_names = list(type_weights.keys())
+            raw_weights = np.array(list(type_weights.values()), dtype=np.float64)
+            type_probs = (raw_weights / raw_weights.sum()).tolist()
         
         i = 0
         while i < self.total_samples:
@@ -477,8 +495,9 @@ class AudioGenerator:
             if current_time_idx >= 0 and np.random.rand() < glitch_factor_interp[current_time_idx]:
                 glitch_intensity = glitch_intensity_interp[current_time_idx]
                 
-                # Durata del glitch basata sull'intensità (minimo 1 campione)
-                glitch_duration_samples = int(glitch_intensity * self.sample_rate * 0.05)
+                # Durata del glitch basata sull'intensità (minimo 1 campione).
+                # Tetto massimo alzato da 50ms a 150ms per dare più margine reale allo slider Intensità.
+                glitch_duration_samples = int(glitch_intensity * self.sample_rate * 0.15)
                 if glitch_duration_samples == 0: glitch_duration_samples = 1
                 
                 start_glitch_sample = i
@@ -502,8 +521,8 @@ class AudioGenerator:
                         # riempi il segmento glitched con zeri.
                         glitched_segment[:] = 0
                     else:
-                        # Scegli il tipo di glitch
-                        glitch_type = np.random.choice(["repeat", "noise", "reverse"])
+                        # Scegli il tipo di glitch (pesato da type_probs, uniforme se non specificato)
+                        glitch_type = np.random.choice(type_names, p=type_probs)
 
                         if glitch_type == "repeat":
                             # Ripeti il segmento originale finché non raggiunge o supera la lunghezza target
@@ -693,7 +712,43 @@ class AudioGenerator:
 
         return eq_audio.squeeze() if eq_audio.shape[1] == 1 else eq_audio
 
-    def apply_stereo_panning(self, audio_array: np.ndarray, pan_data: list) -> np.ndarray:
+    def apply_elevation_filter(self, audio_array: np.ndarray, elevation_data: list) -> np.ndarray:
+        """Simula una sensazione di 'altezza' (sopra/sotto) tramite il timbro, non tramite posizione:
+        lo stereo non ha un canale fisico per l'asse verticale, quindi usiamo un trucco psicoacustico
+        classico del sound design — un suono più chiaro/brillante viene percepito come "in alto",
+        uno più scuro/attutito come "in basso". elevation_data: 0=molto in alto, 1=molto in basso.
+        Crossfade vettorizzato tra una versione filtrata passa-basso (scura, "in basso") e il segnale
+        pieno (chiaro, "in alto"). Stesso pattern architetturale già usato per l'EQ dinamico."""
+        if len(elevation_data) == 0:
+            return audio_array
+
+        if audio_array.ndim == 1:
+            audio_processed = np.expand_dims(audio_array, axis=1)
+        else:
+            audio_processed = audio_array
+
+        elevation_interp = self._interp_data_to_audio_length(elevation_data)
+        elevation_interp = np.clip(elevation_interp, 0.0, 1.0)
+
+        nyquist = 0.5 * self.sample_rate
+        dark_cutoff = 700 / nyquist
+        b_dark, a_dark = butter(2, dark_cutoff, btype='low', analog=False)
+        dark_signal = lfilter(b_dark, a_dark, audio_processed, axis=0)
+
+        # elevation basso (in alto nel frame) -> peso alto sul segnale pieno/chiaro
+        # elevation alto (in basso nel frame) -> peso alto sul segnale scuro/filtrato
+        bright_weight = 1.0 - elevation_interp
+        dark_weight = elevation_interp
+
+        if audio_processed.ndim == 2:
+            bright_weight = bright_weight[:, np.newaxis]
+            dark_weight = dark_weight[:, np.newaxis]
+
+        result = audio_processed * bright_weight + dark_signal * dark_weight
+
+        return result.squeeze() if result.shape[1] == 1 else result
+
+
         """Applica un panning stereo dinamico a un segnale mono, basato su pan_data
         (valori 0=sinistra, 0.5=centro, 1=destra, tipicamente il centro di massa orizzontale del video).
         Usa una legge a potenza costante (constant-power pan law) per un movimento naturale nello
@@ -757,7 +812,7 @@ def main():
         with open(video_input_path, "wb") as f:
             f.write(uploaded_file.getbuffer())
 
-        luminosity_data, detail_data, movement_data, variation_movement_data, horizontal_mass_center_data, edge_density_data, color_variation_data, duration_seconds, fps = analyze_video_frames(video_input_path)
+        luminosity_data, detail_data, movement_data, variation_movement_data, horizontal_mass_center_data, vertical_mass_center_data, edge_density_data, color_variation_data, duration_seconds, fps = analyze_video_frames(video_input_path)
 
         if duration_seconds == 0.0: # Se l'analisi fallisce o video troppo corto/lungo
             os.remove(video_input_path)
@@ -787,7 +842,7 @@ def main():
 
         # Scheda per i parametri audio
         tab_sub, tab_fm, tab_gran, tab_noise, tab_fx, tab_eq, tab_pan = st.tabs([
-            "Sintesi Sottrattiva", "Sintesi FM", "Sintesi Granulare", "Rumore", "Effetti Audio", "Equalizzatore", "Panning Stereo"
+            "Sintesi Sottrattiva", "Sintesi FM", "Sintesi Granulare", "Rumore", "Effetti Audio", "Equalizzatore", "Panning & Altezza"
         ])
 
         # Layer 1: Sintesi Sottrattiva (Basato su Luminosità e Dettaglio)
@@ -1031,6 +1086,15 @@ def main():
             use_glitch = st.checkbox("Abilita Glitch", value=False, key='glitch_on')
             params['glitch_enabled'] = use_glitch
             if use_glitch:
+                glitch_character = st.selectbox(
+                    "Carattere del Glitch",
+                    ["Bilanciato (default)", "Pulito / Digitale (repeat + reverse, poco rumore)", "Sporco / Analogico (rumore dominante)"],
+                    key='glitch_character',
+                    help="Prima il tipo di glitch (repeat/noise/reverse) era sempre scelto a caso in modo uniforme, "
+                         "quindi 'VHS sporco' e 'Datamosh pulito' suonavano uguali nel carattere. Ora puoi pesare la scelta."
+                )
+                params['glitch_character'] = glitch_character
+
                 glitch_factor_source = st.selectbox("Sorgente Fattore Glitch (Probabilità)", ["Variazione Movimento", "Movimento", "Dettaglio"], key='glitch_factor_src')
                 glitch_intensity_source = st.selectbox("Sorgente Intensità Glitch (Durata/Ampiezza)", ["Variazione Movimento", "Movimento", "Dettaglio"], key='glitch_intensity_src')
                 
@@ -1038,6 +1102,13 @@ def main():
                 glitch_factor_max = st.slider("Fattore Massimo Glitch (0-1)", 0.0, 1.0, 0.1, step=0.005, key='glitch_factor_max')
                 glitch_intensity_min = st.slider("Intensità Minima Glitch (0-1)", 0.0, 1.0, 0.1, step=0.01, key='glitch_intensity_min')
                 glitch_intensity_max = st.slider("Intensità Massima Glitch (0-1)", 0.0, 1.0, 0.8, step=0.01, key='glitch_intensity_max')
+
+                if glitch_character.startswith("Pulito"):
+                    glitch_type_weights = {"repeat": 0.45, "noise": 0.1, "reverse": 0.45}
+                elif glitch_character.startswith("Sporco"):
+                    glitch_type_weights = {"repeat": 0.2, "noise": 0.65, "reverse": 0.15}
+                else:
+                    glitch_type_weights = {"repeat": 1/3, "noise": 1/3, "reverse": 1/3}
 
                 params['glitch_factor_source'] = glitch_factor_source
                 params['glitch_intensity_source'] = glitch_intensity_source
@@ -1059,6 +1130,7 @@ def main():
             else: # Aggiunto else per gestire i casi in cui i dati non sono scalati
                 glitch_factor_scaled = []
                 glitch_intensity_data = []
+                glitch_type_weights = {"repeat": 1/3, "noise": 1/3, "reverse": 1/3}
 
             # Delay
             st.subheader("Delay")
@@ -1203,6 +1275,25 @@ def main():
             else:
                 pan_scaled = []
 
+            st.markdown("---")
+            st.markdown("### Altezza (Su/Giù)")
+            st.caption("Lo stereo non ha un canale fisico per 'sopra' e 'sotto': qui si usa un trucco psicoacustico — un suono più chiaro/brillante viene percepito come 'in alto', uno più scuro/attutito come 'in basso'. Basato sul centro di massa verticale del video.")
+            use_elevation = st.checkbox("Abilita Simulazione Altezza", value=False, key='elevation_on')
+            params['elevation_enabled'] = use_elevation
+            if use_elevation:
+                elevation_source = st.selectbox("Sorgente Altezza", ["Centro di Massa Verticale", "Luminosità"], key='elevation_src',
+                                                 help="Centro di Massa Verticale segue davvero se il soggetto è in alto o in basso nel frame. Luminosità è una mappatura più creativa: video più chiari suonano più 'in alto'.")
+                params['elevation_source'] = elevation_source
+
+                if elevation_source == "Centro di Massa Verticale":
+                    # Già normalizzato 0..1 (0=alto del frame, 1=basso): nessun rimappaggio min/max,
+                    # altrimenti un soggetto sempre in alto verrebbe "stirato" fino in basso.
+                    elevation_scaled = vertical_mass_center_data
+                else: # Luminosità: video più luminoso = più "in alto" (elevation_data basso = luminosità alta)
+                    elevation_scaled = [1.0 - l for l in luminosity_data]
+            else:
+                elevation_scaled = []
+
 
         st.subheader("Impostazioni Output Video")
         output_resolution_choice = st.selectbox("Formato Video Output", list(FORMAT_RESOLUTIONS.keys()))
@@ -1252,7 +1343,7 @@ def main():
 
             # Applicazione degli Effetti Audio
             if use_glitch:
-                combined_audio = audio_generator.apply_glitch_effect(combined_audio, glitch_factor_scaled, glitch_intensity_data)
+                combined_audio = audio_generator.apply_glitch_effect(combined_audio, glitch_factor_scaled, glitch_intensity_data, glitch_type_weights)
             
             if use_delay:
                 combined_audio = audio_generator.apply_delay_effect(combined_audio, delay_time_scaled, delay_feedback_scaled)
@@ -1262,6 +1353,11 @@ def main():
 
             if use_eq:
                 combined_audio = audio_generator.apply_eq_effect(combined_audio, eq_low_scaled, eq_mid_scaled, eq_high_scaled)
+
+            # Altezza (su/giù): applicata prima del panning, mentre l'audio è ancora mono
+            # (illusione timbrica, non di posizione).
+            if use_elevation:
+                combined_audio = audio_generator.apply_elevation_filter(combined_audio, elevation_scaled)
 
             # Panning stereo: applicato per ultimo, dopo tutti gli effetti mono, così converte
             # l'audio in stereo (samples, 2) solo alla fine della catena.
