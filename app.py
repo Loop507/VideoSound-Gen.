@@ -157,7 +157,7 @@ VIDEO_PRESETS = {
         # toni elettronici puri che planano e decadono, timbri metallici da ring-modulation,
         # pochissimo rumore/sporcizia, senso di vuoto siderale, suoni che si muovono nello spazio.
         'subtractive_on': True, 'sub_freq_src': "Luminosità", 'sub_amp_src': "Movimento",
-        'sub_waveform_type': "sine", 'sub_freq_min': 100, 'sub_freq_max': 1800,
+        'sub_waveform_type': "sine", 'sub_freq_min': 100, 'sub_freq_max': 1000,
         'sub_amp_min': 0.1, 'sub_amp_max': 0.35, 'sub_gain': 0.7,
         'fm_on': True, 'fm_carr_src': "Movimento", 'fm_mod_src': "Variazione Movimento",
         'fm_idx_src': "Variazione Movimento", 'fm_amp_src': "Luminosità",
