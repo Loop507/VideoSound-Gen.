@@ -2,14 +2,14 @@ import streamlit as st
 import numpy as np
 import cv2
 import os
+import glob
 import subprocess
 import gc
 import shutil
-from typing import Tuple, Optional
+import uuid
+from typing import Tuple
 import soundfile as sf
 from scipy.signal import butter, lfilter
-import librosa
-import librosa.display
 import re # Spostato qui per assicurare che sia importato all'inizio del modulo
 
 # Costanti globali (puoi modificarle)
@@ -205,6 +205,24 @@ def check_ffmpeg() -> bool:
     """Verifica se FFmpeg è installato e disponibile nel PATH."""
     return shutil.which("ffmpeg") is not None
 
+def cleanup_session_temp_files(session_id: str) -> None:
+    """Rimuove eventuali file temporanei residui di una sessione precedente
+    (es. se l'utente carica un nuovo video senza aver completato la generazione
+    precedente). Ogni file temporaneo della sessione contiene session_id nel nome,
+    quindi non tocca mai i file di altre sessioni/utenti concorrenti."""
+    patterns = [
+        f"temp_input_{session_id}_*",
+        f"output_audio_{session_id}.wav",
+        f"temp_original_audio_{session_id}.aac",
+        f"output_*_{session_id}_*.mp4",
+    ]
+    for pattern in patterns:
+        for path in glob.glob(pattern):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
 def preset_to_filename_slug(preset_name: str) -> str:
     """Converte il nome di un preset in uno slug sicuro da usare nei nomi file
     (rimuove emoji/simboli, sostituisce spazi e slash con underscore)."""
@@ -242,6 +260,12 @@ def analyze_video_frames(video_path: str) -> Tuple[list, list, list, list, list,
 
     frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     fps = cap.get(cv2.CAP_PROP_FPS)
+
+    if not fps or fps <= 0 or frame_count <= 0:
+        st.error("❌ Impossibile leggere frame rate/numero di frame dal video. Il file potrebbe essere corrotto o in un formato non supportato.")
+        cap.release()
+        return [], [], [], [], [], [], [], [], 0.0, 0.0
+
     duration_seconds = frame_count / fps
 
     if duration_seconds > MAX_DURATION:
@@ -823,17 +847,30 @@ def main():
     if 'report_filename' not in st.session_state:
         st.session_state['report_filename'] = None
 
+    # ID univoco per sessione: usato in tutti i nomi dei file temporanei per evitare
+    # collisioni quando più utenti usano l'app contemporaneamente sulla stessa istanza
+    # (es. Streamlit Cloud, dove i processi condividono la working directory).
+    if 'session_id' not in st.session_state:
+        st.session_state['session_id'] = uuid.uuid4().hex[:8]
+    session_id = st.session_state['session_id']
+
     if uploaded_file is not None:
         if not validate_video_file(uploaded_file):
             # Se la validazione fallisce, pulisci il file caricato e termina
-            if os.path.exists(f"temp_input_{uploaded_file.name}"):
-                os.remove(f"temp_input_{uploaded_file.name}")
+            invalid_path = f"temp_input_{session_id}_{uploaded_file.name}"
+            if os.path.exists(invalid_path):
+                os.remove(invalid_path)
             return
 
         st.sidebar.success("✅ Video caricato con successo!")
 
-        # Salva il file temporaneamente
-        video_input_path = f"temp_input_{uploaded_file.name}"
+        # Pulisci eventuali file temporanei rimasti da un upload precedente in questa
+        # stessa sessione (es. utente carica un video, non completa la generazione,
+        # poi ne carica un altro: senza questa pulizia i vecchi file si accumulerebbero).
+        cleanup_session_temp_files(session_id)
+
+        # Salva il file temporaneamente, con nome univoco per sessione
+        video_input_path = f"temp_input_{session_id}_{uploaded_file.name}"
         with open(video_input_path, "wb") as f:
             f.write(uploaded_file.getbuffer())
 
@@ -1424,7 +1461,7 @@ def main():
             combined_audio = np.clip(combined_audio, -1.0, 1.0)
             
             # audio_output_path è assegnato qui, sempre se il pulsante è cliccato
-            audio_output_path = "output_audio.wav"
+            audio_output_path = f"output_audio_{session_id}.wav"
             sf.write(audio_output_path, combined_audio, AUDIO_SAMPLE_RATE)
             
             progress_bar_audio.progress(100)
@@ -1453,17 +1490,30 @@ def main():
                 progress_bar_video = st.progress(0)
                 status_text_video = st.empty()
 
-                final_video_path = f"output_{base_name_output}_{output_resolution_choice.replace(' ', '_')}.mp4"
+                final_video_path = f"output_{base_name_output}_{session_id}_{output_resolution_choice.replace(' ', '_')}.mp4"
                 
                 ffmpeg_command = ["ffmpeg", "-y"]
 
+                temp_original_audio_path = None
                 if use_original_audio:
-                    # Estrai audio originale
-                    temp_original_audio_path = "temp_original_audio.aac" # o .wav
-                    subprocess.run([
-                        "ffmpeg", "-y", "-i", video_input_path, "-vn", "-acodec", "aac", temp_original_audio_path
-                    ], check=True, capture_output=True)
+                    # Estrai audio originale. Il video caricato potrebbe non avere una
+                    # traccia audio (es. screen recording muto) o avere un codec che
+                    # ffmpeg non riesce a rimappare in AAC: in quel caso non crashare,
+                    # avvisa l'utente e prosegui usando solo l'audio generato.
+                    temp_original_audio_path = f"temp_original_audio_{session_id}.aac"
+                    try:
+                        subprocess.run([
+                            "ffmpeg", "-y", "-i", video_input_path, "-vn", "-acodec", "aac", temp_original_audio_path
+                        ], check=True, capture_output=True)
+                    except subprocess.CalledProcessError:
+                        st.warning("⚠️ Impossibile estrarre l'audio originale dal video (potrebbe non avere una traccia audio). Procedo usando solo l'audio generato.")
+                        use_original_audio = False
+                        params['use_original_audio'] = False
+                        if os.path.exists(temp_original_audio_path):
+                            os.remove(temp_original_audio_path)
+                        temp_original_audio_path = None
 
+                if use_original_audio:
                     # Mix e ricodifica
                     ffmpeg_command.extend([
                         "-i", video_input_path,
@@ -1503,8 +1553,8 @@ def main():
                 try:
                     process = subprocess.Popen(ffmpeg_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
                     
-                    # Cerca la durata totale del video per stimare il progresso
-                    total_duration_pattern = r"Duration: (\d{2}):(\d{2}):(\d{2}\.\d{2})"
+                    # Cerca il progresso corrente nell'output di FFmpeg (la durata totale
+                    # è già nota da duration_seconds, quindi non serve riestrarla dallo stderr)
                     time_pattern = r"time=(\d{2}):(\d{2}):(\d{2}\.\d{2})"
                     
                     total_seconds = duration_seconds # Già calcolato prima
@@ -1529,7 +1579,7 @@ def main():
 
                     progress_bar_video.progress(100)
                     status_text_video.text("Video completato!")
-                    st.success(f"✅ Video con audio generato con successo! Scarica qui sotto:")
+                    st.success("✅ Video con audio generato con successo! Scarica qui sotto:")
                     
                     # Salva video in session_state (così il download non riavvia la generazione)
                     with open(final_video_path, "rb") as f:
