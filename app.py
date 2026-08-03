@@ -213,6 +213,7 @@ def cleanup_session_temp_files(session_id: str) -> None:
     patterns = [
         f"temp_input_{session_id}_*",
         f"output_audio_{session_id}.wav",
+        f"preview_audio_{session_id}.wav",
         f"temp_original_audio_{session_id}.aac",
         f"output_*_{session_id}_*.mp4",
     ]
@@ -1451,6 +1452,21 @@ def main():
         with col_audio:
             normalize_audio = st.checkbox("Normalizza Audio Finale", value=True)
             params['normalize_audio'] = normalize_audio
+            use_saturation = st.checkbox(
+                "Saturazione Soft (Analogica)", value=True,
+                help="Applica una leggera compressione morbida (tanh) prima della normalizzazione: "
+                     "addolcisce i picchi improvvisi (tipici quando grani/glitch/riverbero si sommano) "
+                     "con un carattere più 'analogico' invece di un clip digitale netto."
+            )
+            params['use_saturation'] = use_saturation
+            if use_saturation:
+                saturation_drive = st.slider(
+                    "Intensità Saturazione", 1.0, 3.0, 1.5, step=0.1,
+                    help="Valori più alti = compressione più marcata dei picchi (più 'calda'/satura)."
+                )
+                params['saturation_drive'] = saturation_drive
+            else:
+                params['saturation_drive'] = 1.0
         with col_video:
             use_original_audio = st.checkbox("Mantieni Audio Originale del Video (Mix con quello generato)", value=False)
             params['use_original_audio'] = use_original_audio
@@ -1460,6 +1476,85 @@ def main():
             else:
                 params['original_audio_mix_level'] = 0.0
 
+        def build_combined_audio() -> np.ndarray:
+            """Genera e mixa tutti i layer/effetti audio secondo i parametri già impostati
+            nell'interfaccia (chiusura su tutte le variabili '..._scaled' calcolate sopra).
+            Condivisa tra l'anteprima audio rapida e il render video finale, per non duplicare
+            la stessa logica in due punti che potrebbero disallinearsi nel tempo."""
+            mixed_audio = np.zeros(audio_generator.total_samples, dtype=np.float32)
+
+            if use_subtractive:
+                subtractive_audio = audio_generator.generate_subtractive_waveform(sub_freq_scaled, sub_amp_scaled, sub_waveform_type)
+                mixed_audio += subtractive_audio * sub_layer_gain
+
+            if use_fm:
+                fm_audio = audio_generator.generate_fm_layer(fm_carrier_scaled, fm_mod_scaled, fm_mod_idx_scaled, fm_amp_scaled)
+                mixed_audio += fm_audio * fm_layer_gain
+
+            if use_granular:
+                granular_audio = audio_generator.generate_granular_layer(gran_density_scaled, gran_duration_scaled, gran_amp_scaled, gran_pitch_scaled)
+                mixed_audio += granular_audio * gran_layer_gain
+
+            if use_noise:
+                noise_audio = audio_generator.add_noise_layer(noise_amp_scaled)
+                mixed_audio += noise_audio * noise_layer_gain
+
+            if use_glitch:
+                mixed_audio = audio_generator.apply_glitch_effect(mixed_audio, glitch_factor_scaled, glitch_intensity_data, glitch_type_weights)
+
+            if use_delay:
+                mixed_audio = audio_generator.apply_delay_effect(mixed_audio, delay_time_scaled, delay_feedback_scaled)
+
+            if use_reverb:
+                mixed_audio = audio_generator.apply_reverb_effect(mixed_audio, reverb_decay_scaled, reverb_mix_scaled)
+
+            if use_eq:
+                mixed_audio = audio_generator.apply_eq_effect(mixed_audio, eq_low_scaled, eq_mid_scaled, eq_high_scaled)
+
+            # Altezza (su/giù): applicata prima del panning, mentre l'audio è ancora mono
+            # (illusione timbrica, non di posizione).
+            if use_elevation:
+                mixed_audio = audio_generator.apply_elevation_filter(mixed_audio, elevation_scaled)
+
+            # Panning stereo: applicato per ultimo, dopo tutti gli effetti mono, così converte
+            # l'audio in stereo (samples, 2) solo alla fine della catena.
+            if use_panning:
+                mixed_audio = audio_generator.apply_stereo_panning(mixed_audio, pan_scaled)
+
+            if use_saturation:
+                # Saturazione soft (tanh) prima della normalizzazione: comprime morbidamente i
+                # picchi (es. quando più grani/glitch/riverbero si sovrappongono nello stesso
+                # istante) invece di lasciare che un clip rigido più avanti li tagli di netto.
+                # tanh(x) è per costruzione sempre in (-1, 1) qualunque sia l'ampiezza in ingresso:
+                # 'drive' controlla quanto la non-linearità entra in gioco (più alto = più
+                # compressione/calore) e, come effetto collaterale voluto, anche il volume
+                # percepito dei passaggi più quieti (comportamento standard per un saturatore
+                # in stile analogico/nastro).
+                mixed_audio = np.tanh(mixed_audio * saturation_drive)
+
+            if normalize_audio:
+                # Prevenire divisione per zero se l'audio è silenzioso.
+                # Usiamo il picco GLOBALE (non per-canale) per non alterare il bilanciamento
+                # stereo introdotto dal panning: normalizzare i due canali in modo indipendente
+                # appiattirebbe la differenza di volume tra sinistra e destra.
+                peak = np.max(np.abs(mixed_audio))
+                if peak > 1e-6:
+                    mixed_audio = mixed_audio / peak
+                else:
+                    mixed_audio = np.zeros_like(mixed_audio) # Mantieni a zero se già silenzioso
+
+            # Assicurati che l'audio sia nel range [-1, 1] per soundfile
+            return np.clip(mixed_audio, -1.0, 1.0)
+
+        if st.button("🔊 Anteprima Audio (senza video)"):
+            # Genera solo l'audio, senza toccare FFmpeg/video: pensata per iterare rapidamente
+            # sui parametri ad orecchio, senza aspettare ogni volta il render+mux del video intero.
+            st.info("🎵 Generazione anteprima audio in corso...")
+            preview_audio = build_combined_audio()
+            preview_audio_path = f"preview_audio_{session_id}.wav"
+            sf.write(preview_audio_path, preview_audio, AUDIO_SAMPLE_RATE)
+            st.audio(preview_audio_path, format="audio/wav")
+            gc.collect()
 
         if st.button("Genera Video con Audio"):
             # Sempre tenta la generazione audio se il pulsante è cliccato
@@ -1467,68 +1562,14 @@ def main():
             progress_bar_audio = st.progress(0)
             status_text_audio = st.empty()
 
-            combined_audio = np.zeros(audio_generator.total_samples, dtype=np.float32)
+            progress_bar_audio.progress(10)
+            status_text_audio.text("Generazione layer e applicazione effetti...")
 
-            # Generazione dei Layer Audio (ognuno pesato dal proprio Volume Layer)
-            if use_subtractive:
-                subtractive_audio = audio_generator.generate_subtractive_waveform(sub_freq_scaled, sub_amp_scaled, sub_waveform_type)
-                combined_audio += subtractive_audio * sub_layer_gain
-            
-            if use_fm:
-                fm_audio = audio_generator.generate_fm_layer(fm_carrier_scaled, fm_mod_scaled, fm_mod_idx_scaled, fm_amp_scaled)
-                combined_audio += fm_audio * fm_layer_gain
+            combined_audio = build_combined_audio()
 
-            if use_granular:
-                granular_audio = audio_generator.generate_granular_layer(gran_density_scaled, gran_duration_scaled, gran_amp_scaled, gran_pitch_scaled)
-                combined_audio += granular_audio * gran_layer_gain
+            progress_bar_audio.progress(90)
+            status_text_audio.text("Scrittura file audio...")
 
-            if use_noise:
-                noise_audio = audio_generator.add_noise_layer(noise_amp_scaled)
-                combined_audio += noise_audio * noise_layer_gain
-
-            progress_bar_audio.progress(30)
-            status_text_audio.text("Applicazione effetti audio...")
-
-            # Applicazione degli Effetti Audio
-            if use_glitch:
-                combined_audio = audio_generator.apply_glitch_effect(combined_audio, glitch_factor_scaled, glitch_intensity_data, glitch_type_weights)
-            
-            if use_delay:
-                combined_audio = audio_generator.apply_delay_effect(combined_audio, delay_time_scaled, delay_feedback_scaled)
-
-            if use_reverb:
-                combined_audio = audio_generator.apply_reverb_effect(combined_audio, reverb_decay_scaled, reverb_mix_scaled)
-
-            if use_eq:
-                combined_audio = audio_generator.apply_eq_effect(combined_audio, eq_low_scaled, eq_mid_scaled, eq_high_scaled)
-
-            # Altezza (su/giù): applicata prima del panning, mentre l'audio è ancora mono
-            # (illusione timbrica, non di posizione).
-            if use_elevation:
-                combined_audio = audio_generator.apply_elevation_filter(combined_audio, elevation_scaled)
-
-            # Panning stereo: applicato per ultimo, dopo tutti gli effetti mono, così converte
-            # l'audio in stereo (samples, 2) solo alla fine della catena.
-            if use_panning:
-                combined_audio = audio_generator.apply_stereo_panning(combined_audio, pan_scaled)
-
-            progress_bar_audio.progress(70)
-            status_text_audio.text("Normalizzazione audio...")
-
-            if normalize_audio:
-                # Prevenire divisione per zero se l'audio è silenzioso.
-                # Usiamo il picco GLOBALE (non per-canale) per non alterare il bilanciamento
-                # stereo introdotto dal panning: normalizzare i due canali in modo indipendente
-                # appiattirebbe la differenza di volume tra sinistra e destra.
-                peak = np.max(np.abs(combined_audio))
-                if peak > 1e-6:
-                    combined_audio = combined_audio / peak
-                else:
-                    combined_audio = np.zeros_like(combined_audio) # Mantieni a zero se già silenzioso
-
-            # Assicurati che l'audio sia nel range [-1, 1] per soundfile
-            combined_audio = np.clip(combined_audio, -1.0, 1.0)
-            
             # audio_output_path è assegnato qui, sempre se il pulsante è cliccato
             audio_output_path = f"output_audio_{session_id}.wav"
             sf.write(audio_output_path, combined_audio, AUDIO_SAMPLE_RATE)
@@ -1679,6 +1720,10 @@ def main():
                     else:
                         report_lines.append(field("audio originale", "original audio", "non mantenuto / not kept"))
                     report_lines.append(field("normalizzazione audio finale", "final audio normalization", "sì / yes" if params.get('normalize_audio') else "no / no"))
+                    if params.get('use_saturation'):
+                        report_lines.append(field("saturazione soft", "soft saturation", f"abilitata / enabled (drive {params.get('saturation_drive', 1.5):.1f})"))
+                    else:
+                        report_lines.append(field("saturazione soft", "soft saturation", "disabilitata / disabled"))
 
                     report_lines.append("")
                     report_lines.append(":: --- layer audio / audio layers ---")
