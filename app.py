@@ -263,6 +263,27 @@ VIDEO_PRESETS = {
     },
 }
 
+def scale_frequency_exponential(data_raw: list, freq_min: float, freq_max: float) -> list:
+    """Mappa una serie di valori di controllo (es. luminosità/movimento frame-per-frame) su un
+    range di frequenza in scala ESPONENZIALE (log2 in Hz) invece che lineare — lo standard
+    professionale '1V/ottava' usato in ogni sintetizzatore analogico o digitale.
+
+    Perché: l'orecchio percepisce l'altezza in modo logaritmico. Un raddoppio di frequenza è
+    sempre 'un'ottava' percepita, che si parta da 55Hz o da 880Hz. Con un mapping lineare in Hz,
+    lo stesso range assoluto (es. 80-400Hz) risulta percettivamente compresso nella parte bassa
+    (80→120Hz è quasi un'ottava e mezza) ed espanso in quella alta (280→320Hz è un intervallo
+    minuscolo), anche se il video si muove in modo uniforme. Con lo scaling esponenziale, passi
+    uguali del segnale di controllo producono sempre lo stesso salto musicale percepito, ovunque
+    nel range — esattamente il motivo per cui i synth modulari usano l'esponenziale per il
+    controllo di pitch/cutoff invece del semplice Hz/volt lineare."""
+    if not data_raw:
+        return []
+    lo, hi = min(data_raw), max(data_raw)
+    log_min = np.log2(max(freq_min, 1e-6))
+    log_max = np.log2(max(freq_max, 1e-6))
+    normalized_log = np.interp(data_raw, (lo, hi), (log_min, log_max))
+    return np.exp2(normalized_log).tolist()
+
 def check_ffmpeg() -> bool:
     """Verifica se FFmpeg è installato e disponibile nel PATH."""
     return shutil.which("ffmpeg") is not None
@@ -1422,7 +1443,7 @@ def main():
                 elif sub_amp_source == "Variazione Colore": sub_amp_data_raw = color_variation_data
                 
                 # Normalizza e scala i dati delle sorgenti
-                sub_freq_scaled = np.interp(sub_freq_data_raw, (min(sub_freq_data_raw) if sub_freq_data_raw else 0, max(sub_freq_data_raw) if sub_freq_data_raw else 1), (sub_freq_min, sub_freq_max)).tolist()
+                sub_freq_scaled = scale_frequency_exponential(sub_freq_data_raw, sub_freq_min, sub_freq_max)
                 sub_amp_scaled = np.interp(sub_amp_data_raw, (min(sub_amp_data_raw) if sub_amp_data_raw else 0, max(sub_amp_data_raw) if sub_amp_data_raw else 1), (sub_amp_min, sub_amp_max)).tolist()
 
                 st.markdown("##### Filtro Sottrattivo (vero)")
@@ -1453,7 +1474,7 @@ def main():
                     elif sub_cutoff_source == "Densità Contorni": sub_cutoff_data_raw = edge_density_data
                     elif sub_cutoff_source == "Variazione Colore": sub_cutoff_data_raw = color_variation_data
 
-                    sub_cutoff_scaled = np.interp(sub_cutoff_data_raw, (min(sub_cutoff_data_raw) if sub_cutoff_data_raw else 0, max(sub_cutoff_data_raw) if sub_cutoff_data_raw else 1), (sub_cutoff_min, sub_cutoff_max)).tolist()
+                    sub_cutoff_scaled = scale_frequency_exponential(sub_cutoff_data_raw, sub_cutoff_min, sub_cutoff_max)
                     sub_resonance_scaled = [sub_resonance] * max(len(sub_cutoff_scaled), 1)
                 else:
                     sub_cutoff_scaled = []
@@ -1535,8 +1556,8 @@ def main():
                 elif fm_amp_source == "Variazione Colore": fm_amp_data_raw = color_variation_data
 
 
-                fm_carrier_scaled = np.interp(fm_carrier_data_raw, (min(fm_carrier_data_raw) if fm_carrier_data_raw else 0, max(fm_carrier_data_raw) if fm_carrier_data_raw else 1), (fm_carrier_min, fm_carrier_max)).tolist()
-                fm_mod_scaled = np.interp(fm_mod_data_raw, (min(fm_mod_data_raw) if fm_mod_data_raw else 0, max(fm_mod_data_raw) if fm_mod_data_raw else 1), (fm_mod_min, fm_mod_max)).tolist()
+                fm_carrier_scaled = scale_frequency_exponential(fm_carrier_data_raw, fm_carrier_min, fm_carrier_max)
+                fm_mod_scaled = scale_frequency_exponential(fm_mod_data_raw, fm_mod_min, fm_mod_max)
                 fm_mod_idx_scaled = np.interp(fm_mod_idx_data_raw, (min(fm_mod_idx_data_raw) if fm_mod_idx_data_raw else 0, max(fm_mod_idx_data_raw) if fm_mod_idx_data_raw else 1), (fm_mod_idx_min, fm_mod_idx_max)).tolist()
                 fm_amp_scaled = np.interp(fm_amp_data_raw, (min(fm_amp_data_raw) if fm_amp_data_raw else 0, max(fm_amp_data_raw) if fm_amp_data_raw else 1), (fm_amp_min, fm_amp_max)).tolist()
             else: # Aggiunto else per gestire i casi in cui i dati non sono scalati
@@ -1609,7 +1630,7 @@ def main():
                 epiano_amp_data_raw = _epiano_source_data(epiano_amp_source)
 
                 epiano_density_scaled = np.interp(epiano_density_data_raw, (min(epiano_density_data_raw) if epiano_density_data_raw else 0, max(epiano_density_data_raw) if epiano_density_data_raw else 1), (epiano_density_min, epiano_density_max)).tolist()
-                epiano_pitch_scaled = np.interp(epiano_pitch_data_raw, (min(epiano_pitch_data_raw) if epiano_pitch_data_raw else 0, max(epiano_pitch_data_raw) if epiano_pitch_data_raw else 1), (epiano_pitch_min, epiano_pitch_max)).tolist()
+                epiano_pitch_scaled = scale_frequency_exponential(epiano_pitch_data_raw, epiano_pitch_min, epiano_pitch_max)
                 # Brillantezza normalizzata in [0,1] indipendentemente dal range della sorgente scelta
                 epiano_brightness_scaled = np.interp(epiano_brightness_data_raw, (min(epiano_brightness_data_raw) if epiano_brightness_data_raw else 0, max(epiano_brightness_data_raw) if epiano_brightness_data_raw else 1), (0.0, 1.0)).tolist()
                 epiano_amp_scaled = np.interp(epiano_amp_data_raw, (min(epiano_amp_data_raw) if epiano_amp_data_raw else 0, max(epiano_amp_data_raw) if epiano_amp_data_raw else 1), (epiano_amp_min, epiano_amp_max)).tolist()
@@ -1691,7 +1712,7 @@ def main():
                 gran_density_scaled = np.interp(gran_density_data_raw, (min(gran_density_data_raw) if gran_density_data_raw else 0, max(gran_density_data_raw) if gran_density_data_raw else 1), (gran_density_min, gran_density_max)).tolist()
                 gran_duration_scaled = np.interp(gran_duration_data_raw, (min(gran_duration_data_raw) if gran_duration_data_raw else 0, max(gran_duration_data_raw) if gran_duration_data_raw else 1), (gran_duration_min, gran_duration_max)).tolist()
                 gran_amp_scaled = np.interp(gran_amp_data_raw, (min(gran_amp_data_raw) if gran_amp_data_raw else 0, max(gran_amp_data_raw) if gran_amp_data_raw else 1), (gran_amp_min, gran_amp_max)).tolist()
-                gran_pitch_scaled = np.interp(gran_pitch_data_raw, (min(gran_pitch_data_raw) if gran_pitch_data_raw else 0, max(gran_pitch_data_raw) if gran_pitch_data_raw else 1), (gran_pitch_min, gran_pitch_max)).tolist()
+                gran_pitch_scaled = scale_frequency_exponential(gran_pitch_data_raw, gran_pitch_min, gran_pitch_max)
             else: # Aggiunto else per gestire i casi in cui i dati non sono scalati
                 gran_density_scaled = []
                 gran_duration_scaled = []
@@ -1782,7 +1803,7 @@ def main():
                 pluck_amp_data_raw = _pluck_source_data(pluck_amp_source)
 
                 pluck_density_scaled = np.interp(pluck_density_data_raw, (min(pluck_density_data_raw) if pluck_density_data_raw else 0, max(pluck_density_data_raw) if pluck_density_data_raw else 1), (pluck_density_min, pluck_density_max)).tolist()
-                pluck_pitch_scaled = np.interp(pluck_pitch_data_raw, (min(pluck_pitch_data_raw) if pluck_pitch_data_raw else 0, max(pluck_pitch_data_raw) if pluck_pitch_data_raw else 1), (pluck_pitch_min, pluck_pitch_max)).tolist()
+                pluck_pitch_scaled = scale_frequency_exponential(pluck_pitch_data_raw, pluck_pitch_min, pluck_pitch_max)
                 # Smorzamento normalizzato in [0,1] indipendentemente dal range della sorgente scelta
                 pluck_damping_scaled = np.interp(pluck_damping_data_raw, (min(pluck_damping_data_raw) if pluck_damping_data_raw else 0, max(pluck_damping_data_raw) if pluck_damping_data_raw else 1), (0.0, 1.0)).tolist()
                 pluck_amp_scaled = np.interp(pluck_amp_data_raw, (min(pluck_amp_data_raw) if pluck_amp_data_raw else 0, max(pluck_amp_data_raw) if pluck_amp_data_raw else 1), (pluck_amp_min, pluck_amp_max)).tolist()
