@@ -200,6 +200,67 @@ VIDEO_PRESETS = {
         'eq_gain_min': -10.0, 'eq_gain_max': 4.0,
         'panning_on': True, 'pan_src': "Variazione Movimento",
     },
+    "🎹 Piano Fantasma / E-Piano Ambient": {
+        # Layer E-Piano FM come protagonista: rapporto 1.4 (timbro caldo, non metallico — vedi
+        # help del rapporto per il riferimento al patch DX7 "E.Piano 1" originale), densità bassa
+        # per note isolate e distanziate, decadimento lungo, immerso in riverbero/delay ampi.
+        'subtractive_on': False, 'fm_on': False,
+        'epiano_on': True, 'epiano_gain': 1.0,
+        'epiano_dens_src': "Movimento", 'epiano_pitch_src': "Luminosità",
+        'epiano_bright_src': "Dettaglio", 'epiano_amp_src': "Movimento",
+        'epiano_dens_min': 0, 'epiano_dens_max': 2, 'epiano_pitch_min': 130, 'epiano_pitch_max': 500,
+        'epiano_amp_min': 0.3, 'epiano_amp_max': 0.8, 'epiano_note_dur': 1.6, 'epiano_mod_ratio': 1.4,
+        'granular_on': False, 'pluck_on': False, 'noise_on': False, 'glitch_on': False,
+        'delay_on': True, 'delay_time_src': "Luminosità", 'delay_feedback_src': "Movimento",
+        'delay_time_min': 0.15, 'delay_time_max': 0.35, 'delay_feedback_min': 0.3, 'delay_feedback_max': 0.55,
+        'reverb_on': True, 'reverb_decay_src': "Luminosità", 'reverb_mix_src': "Movimento",
+        'reverb_decay_min': 3.0, 'reverb_decay_max': 5.0, 'reverb_mix_min': 0.4, 'reverb_mix_max': 0.65,
+        'eq_on': False,
+        'panning_on': True, 'pan_src': "Centro di Massa Orizzontale",
+    },
+    "🪕 Arpa Eolica / Corde Sospese": {
+        # Layer Corde in modalità "arpa": durezza bassa (pizzicata morbida, non martellata),
+        # 3 voci all'unisono con scordatura contenuta per lo scintillio/battimento tipico di
+        # un'arpa o di corde multiple che risuonano insieme, densità bassa e registro alto.
+        'subtractive_on': False, 'fm_on': False, 'epiano_on': False,
+        'pluck_on': True, 'pluck_gain': 1.0,
+        'pluck_dens_src': "Movimento", 'pluck_pitch_src': "Luminosità",
+        'pluck_damp_src': "Luminosità", 'pluck_amp_src': "Movimento",
+        'pluck_dens_min': 0, 'pluck_dens_max': 2, 'pluck_pitch_min': 150, 'pluck_pitch_max': 900,
+        'pluck_amp_min': 0.3, 'pluck_amp_max': 0.7, 'pluck_duration': 0.8,
+        'pluck_hardness': 0.1, 'pluck_unison_voices': 3, 'pluck_unison_detune': 6.0,
+        'granular_on': False, 'noise_on': False, 'glitch_on': False,
+        'delay_on': True, 'delay_time_src': "Luminosità", 'delay_feedback_src': "Luminosità",
+        'delay_time_min': 0.2, 'delay_time_max': 0.4, 'delay_feedback_min': 0.35, 'delay_feedback_max': 0.6,
+        'reverb_on': True, 'reverb_decay_src': "Luminosità", 'reverb_mix_src': "Luminosità",
+        'reverb_decay_min': 3.5, 'reverb_decay_max': 5.0, 'reverb_mix_min': 0.5, 'reverb_mix_max': 0.75,
+        'eq_on': False,
+        'panning_on': True, 'pan_src': "Centro di Massa Orizzontale",
+    },
+    "🔨 Corde Martellate / Percussione Metallica": {
+        # Stesso layer Corde, carattere opposto: durezza alta (eccitazione quasi tutta rumore
+        # differenziato, molto più tagliente — vedi hammer_hardness), durata breve e densità più
+        # alta per un ritmo percussivo, decadimento rapido (g più basso). Niente riverbero: resta
+        # secco e diretto, coerente con un carattere industriale/metallico, non ambientale.
+        'subtractive_on': False, 'fm_on': False, 'epiano_on': False,
+        'pluck_on': True, 'pluck_gain': 1.1,
+        'pluck_dens_src': "Dettaglio", 'pluck_pitch_src': "Movimento",
+        'pluck_damp_src': "Dettaglio", 'pluck_amp_src': "Variazione Movimento",
+        'pluck_dens_min': 1, 'pluck_dens_max': 4, 'pluck_pitch_min': 80, 'pluck_pitch_max': 600,
+        'pluck_amp_min': 0.4, 'pluck_amp_max': 0.9, 'pluck_duration': 0.3,
+        'pluck_hardness': 0.85, 'pluck_unison_voices': 2, 'pluck_unison_detune': 12.0,
+        'granular_on': False,
+        'noise_on': True, 'noise_amp_src': "Variazione Movimento", 'noise_amp_min': 0.02, 'noise_amp_max': 0.1,
+        'glitch_on': True, 'glitch_character': "Pulito / Digitale (repeat + reverse, poco rumore)",
+        'glitch_factor_src': "Variazione Movimento", 'glitch_intensity_src': "Dettaglio",
+        'glitch_factor_min': 0.03, 'glitch_factor_max': 0.15, 'glitch_intensity_min': 0.2, 'glitch_intensity_max': 0.5,
+        'delay_on': True, 'delay_time_src': "Dettaglio", 'delay_feedback_src': "Dettaglio",
+        'delay_time_min': 0.04, 'delay_time_max': 0.1, 'delay_feedback_min': 0.15, 'delay_feedback_max': 0.35,
+        'reverb_on': False,
+        'eq_on': True, 'eq_low_src': "Movimento", 'eq_mid_src': "Dettaglio", 'eq_high_src': "Dettaglio",
+        'eq_gain_min': -6.0, 'eq_gain_max': 8.0,
+        'panning_on': True, 'pan_src': "Densità Contorni",
+    },
 }
 
 def check_ffmpeg() -> bool:
@@ -1281,6 +1342,16 @@ def main():
         selected_preset = st.selectbox("Preset", preset_options, key='preset_choice')
 
         if selected_preset != PRESET_MANUALE and st.session_state.get('_last_applied_preset') != selected_preset:
+            # Azzera tutti i toggle dei layer prima di applicare il preset specifico: altrimenti
+            # un layer abilitato da un preset precedente (o acceso manualmente) resterebbe attivo
+            # anche scegliendo un nuovo preset che non lo nomina esplicitamente nel suo dizionario.
+            all_layer_toggles = [
+                'subtractive_on', 'sub_filter_on', 'sub_band_limited', 'fm_on', 'epiano_on',
+                'granular_on', 'pluck_on', 'noise_on', 'glitch_on', 'delay_on', 'reverb_on',
+                'eq_on', 'panning_on', 'elevation_on',
+            ]
+            for toggle_key in all_layer_toggles:
+                st.session_state[toggle_key] = False
             for preset_key, preset_value in VIDEO_PRESETS[selected_preset].items():
                 st.session_state[preset_key] = preset_value
             st.session_state['_last_applied_preset'] = selected_preset
@@ -1508,9 +1579,10 @@ def main():
                     help="Quanto a lungo può risuonare la nota prima di essere tagliata."
                 )
                 epiano_mod_ratio = st.select_slider(
-                    "Rapporto Modulatore/Portante", options=[0.5, 1.0, 1.4, 2.0, 3.5, 7.0], value=1.0, key='epiano_mod_ratio',
+                    "Rapporto Modulatore/Portante", options=[0.5, 1.0, 1.4, 2.0, 3.5, 7.0, 14.0], value=1.0, key='epiano_mod_ratio',
                     help="Rapporti classici della sintesi FM: 1.0 e 1.4 danno timbri 'e-piano' morbidi, "
-                         "valori più alti (3.5, 7.0) timbri più metallici/campanellati."
+                         "3.5/7.0 timbri più metallici/campanellati, 14.0 è il rapporto usato nella terza "
+                         "coppia operatore del patch 'E.Piano 1' originale del DX7 per l'attacco a campana."
                 )
 
                 params['epiano_density_source'] = epiano_density_source
