@@ -504,6 +504,87 @@ class AudioGenerator:
         audio = waveform * amp_interp
         return audio
 
+    def generate_fm_epiano_layer(self, density_data: list, pitch_data: list, brightness_data: list, amp_data: list,
+                                  note_duration: float = 1.2, mod_ratio: float = 1.0,
+                                  trigger_window_seconds: float = 0.2) -> np.ndarray:
+        """Layer 'e-piano' FM (stile DX7/Rhodes): a differenza del layer FM continuo esistente,
+        qui la sintesi è per NOTE discrete con inviluppo. Il dettaglio che fa davvero la
+        differenza timbrica: l'indice di modulazione ha il suo inviluppo separato, che decade
+        PIÙ VELOCE di quello dell'ampiezza. All'attacco il suono è ricco di armoniche (indice
+        alto → timbro 'a campana'/metallico), poi mentre l'ampiezza è ancora sostenuta il suono
+        si 'ammorbidisce' verso una sinusoide quasi pura: è esattamente questo doppio decadimento
+        indipendente a dare il carattere riconoscibile degli e-piano FM classici, non solo
+        l'inviluppo di volume. Le note sono innescate su finestre temporali fisse (stesso motivo
+        già spiegato per il layer Corde: note più fitte di ~200ms si fonderebbero comunque)."""
+        audio = np.zeros(self.total_samples)
+        n_frames = len(density_data)
+
+        if n_frames == 0:
+            return audio
+
+        note_duration_samples = max(64, int(note_duration * self.sample_rate))
+        window_samples = max(1, int(trigger_window_seconds * self.sample_rate))
+        n_windows = max(1, (self.total_samples + window_samples - 1) // window_samples)
+
+        original_time_points = np.linspace(0, self.total_duration_seconds, n_frames, endpoint=True)
+        window_indices = np.minimum(np.arange(n_windows) * window_samples, self.total_samples - 1)
+        window_times = self.time_array[window_indices]
+
+        density_at_window = np.interp(window_times, original_time_points, density_data)
+        pitch_at_window = np.interp(window_times, original_time_points, pitch_data)
+        brightness_at_window = np.interp(window_times, original_time_points, brightness_data)
+        amp_at_window = np.interp(window_times, original_time_points, amp_data)
+
+        # Asse temporale della nota, condiviso (la forma dell'inviluppo dipende solo dal tempo
+        # trascorso dall'attacco, non dalla posizione assoluta nel brano).
+        t = np.arange(note_duration_samples) / self.sample_rate
+        attack_samples = max(1, int(0.005 * self.sample_rate))  # attacco percussivo, ~5ms
+        attack_ramp = np.linspace(0.0, 1.0, attack_samples)
+
+        amp_decay_tc = 1.2   # costante di tempo (sec) del decadimento d'ampiezza
+        mod_decay_tc = 0.25  # più corto: l'indice di modulazione (la "brillantezza") si smorza prima
+
+        base_amp_env = np.ones(note_duration_samples)
+        base_amp_env[:attack_samples] = attack_ramp
+        base_amp_env *= np.exp(-t / amp_decay_tc)
+        base_mod_env_shape = np.exp(-t / mod_decay_tc)  # moltiplicato poi per l'indice iniziale per-nota
+
+        for i in range(n_windows):
+            num_notes = int(density_at_window[i])
+            if num_notes == 0:
+                continue
+
+            start_w = i * window_samples
+            end_w = min(start_w + window_samples, self.total_samples)
+            if start_w >= end_w:
+                continue
+
+            current_pitch = max(20.0, float(pitch_at_window[i]))
+            current_brightness = float(np.clip(brightness_at_window[i], 0.0, 1.0))
+            current_amp = float(amp_at_window[i])
+
+            start_notes = np.random.randint(start_w, end_w, size=num_notes)
+            jitter = (np.random.rand(num_notes) - 0.5) * 0.02  # +/-1%: intonazione naturale, non stonata come le corde
+
+            # Indice di modulazione iniziale: range ~0.5 (timbro morbido) - 6.0 (timbro brillante/metallico)
+            mod_index0 = 0.5 + 5.5 * current_brightness
+            mod_index_env = mod_index0 * base_mod_env_shape
+
+            for k in range(num_notes):
+                freq = max(20.0, current_pitch * (1.0 + jitter[k]))
+                carrier_freq = freq
+                modulator_freq = freq * mod_ratio
+
+                modulator_phase = 2 * np.pi * modulator_freq * t
+                carrier_phase = 2 * np.pi * carrier_freq * t + mod_index_env * np.sin(modulator_phase)
+                note_signal = np.sin(carrier_phase) * base_amp_env * current_amp * 0.3
+
+                start = start_notes[k]
+                end = min(start + note_duration_samples, self.total_samples)
+                audio[start:end] += note_signal[:end - start]
+
+        return audio
+
     def generate_fm_layer(self, carrier_freq_data: list, mod_freq_data: list, mod_idx_data: list, amp_data: list) -> np.ndarray:
         """Genera un layer di sintesi FM con parametri dinamici."""
         carrier_freq_interp = self._interp_data_to_audio_length(carrier_freq_data)
@@ -525,21 +606,38 @@ class AudioGenerator:
         audio = carrier_signal * amp_interp * 0.5
         return audio
 
-    def _karplus_strong_pluck(self, D: int, duration_samples: int, g: float) -> np.ndarray:
-        """Calcola una singola pizzicata Karplus-Strong: y[n] = rumore[n] per n<D (l'eccitazione,
-        lunga quanto la linea di ritardo), poi y[n] = 0.5*g*(y[n-D] + y[n-D-1]) per n>=D.
+    def _karplus_strong_pluck(self, D: int, duration_samples: int, g: float, hammer_hardness: float = 0.0) -> np.ndarray:
+        """Calcola una singola pizzicata Karplus-Strong: y[n] = eccitazione[n] per n<D (lunga
+        quanto la linea di ritardo), poi y[n] = 0.5*g*(y[n-D] + y[n-D-1]) per n>=D.
 
         Questa è la stessa equazione IIR di prima, ma calcolata a blocchi di D campioni invece che
         con scipy.signal.lfilter: lfilter con un array 'a' lungo e quasi tutto zero elabora ogni
         campione di output usando TUTTI i coefficienti (costo O(durata * D) per pizzicata — con
         migliaia di pizzicate su un video lungo, minuti di attesa, verificato con un benchmark).
         Ogni blocco di D campioni qui legge solo dal blocco precedente (mai da se stesso), quindi
-        è vettorizzabile in un colpo solo con NumPy: costo O(durata) per pizzicata, indipendente da D."""
+        è vettorizzabile in un colpo solo con NumPy: costo O(durata) per pizzicata, indipendente da D.
+
+        hammer_hardness (0-1): l'eccitazione classica di Karplus-Strong è rumore bianco puro
+        (carattere di corda pizzicata, morbido). Miscelando la sua derivata prima (differenza tra
+        campioni consecutivi, che esalta le componenti ad alta frequenza) si ottiene un transiente
+        più duro e percussivo — più vicino a un martelletto di pianoforte/clavicembalo che a un dito
+        che pizzica una corda. hardness=0 → comportamento originale invariato."""
         # y_ext[0] rappresenta y[-1] = 0 (silenzio prima dell'eccitazione); serve per evitare
         # indici negativi quando il primo blocco legge un campione prima dell'inizio del rumore.
         y_ext = np.zeros(duration_samples + 1)
         burst_len = min(D, duration_samples)
-        y_ext[1:1 + burst_len] = np.random.uniform(-1.0, 1.0, burst_len)
+        noise_burst = np.random.uniform(-1.0, 1.0, burst_len)
+
+        if hammer_hardness > 0.0:
+            hard_burst = np.diff(noise_burst, prepend=0.0)
+            # np.diff raddoppia grosso modo l'ampiezza media (differenza di due valori indipendenti
+            # in [-1,1]): riscalata per restare paragonabile in livello al rumore bianco puro.
+            hard_burst = hard_burst / 1.6
+            excitation = (1.0 - hammer_hardness) * noise_burst + hammer_hardness * hard_burst
+        else:
+            excitation = noise_burst
+
+        y_ext[1:1 + burst_len] = excitation
 
         pos = D
         while pos < duration_samples:
@@ -551,7 +649,8 @@ class AudioGenerator:
         return y_ext[1:]
 
     def generate_pluck_layer(self, density_data: list, pitch_data: list, damping_data: list, amp_data: list,
-                              max_pluck_duration: float = 0.4, trigger_window_seconds: float = 0.15) -> np.ndarray:
+                              max_pluck_duration: float = 0.4, trigger_window_seconds: float = 0.15,
+                              hammer_hardness: float = 0.0, unison_voices: int = 1, unison_detune_cents: float = 0.0) -> np.ndarray:
         """Layer a modellazione fisica (Karplus-Strong): sintetizza 'pizzicate' di corda invece di
         onde/grani. Algoritmo classico: rumore bianco che eccita una linea di ritardo di lunghezza
         D = sample_rate/pitch, richiusa in retroazione con un filtro passa-basso a 2 campioni
@@ -568,12 +667,23 @@ class AudioGenerator:
         fitte di ~100-150ms diventerebbero comunque indistinguibili tra loro (perderebbero il
         carattere "corda pizzicata" per fondersi in una texture continua, che è già il ruolo del
         layer granulare), quindi agganciarle al frame rate del video non aggiungerebbe nulla di
-        espressivo — solo molte più pizzicate da calcolare per un video lungo e denso."""
+        espressivo — solo molte più pizzicate da calcolare per un video lungo e denso.
+
+        hammer_hardness (0-1): vedi _karplus_strong_pluck — 0 è la pizzicata originale (rumore
+        bianco puro), valori più alti danno un attacco più duro/percussivo (stile martelletto).
+
+        unison_voices (1-3) + unison_detune_cents: invece di una sola linea di ritardo per nota,
+        ne somma 2-3 leggermente scordate tra loro (come le corde multiple all'unisono di un
+        pianoforte vero), producendo il caratteristico 'battimento' che dà corpo e movimento al
+        suono invece di una pizzicata singola e statica. unison_voices=1 disattiva l'effetto
+        (comportamento identico a prima)."""
         audio = np.zeros(self.total_samples)
         n_frames = len(density_data)
 
         if n_frames == 0:
             return audio
+
+        unison_voices = max(1, min(3, int(unison_voices)))
 
         pluck_duration_samples = max(64, int(max_pluck_duration * self.sample_rate))
         window_samples = max(1, int(trigger_window_seconds * self.sample_rate))
@@ -590,6 +700,17 @@ class AudioGenerator:
         pitch_at_window = np.interp(window_times, original_time_points, pitch_data)
         damping_at_window = np.interp(window_times, original_time_points, damping_data)
         amp_at_window = np.interp(window_times, original_time_points, amp_data)
+
+        # Offset di intonazione (in rapporto di frequenza) per ciascuna voce all'unisono, centrati
+        # intorno a 0: con 1 voce non c'è offset, con 2-3 sono simmetrici intorno all'intonazione
+        # nominale (es. 3 voci a +/-detune e una centrale).
+        if unison_voices == 1:
+            voice_offsets_cents = np.array([0.0])
+        elif unison_voices == 2:
+            voice_offsets_cents = np.array([-unison_detune_cents / 2, unison_detune_cents / 2])
+        else:
+            voice_offsets_cents = np.array([-unison_detune_cents, 0.0, unison_detune_cents])
+        voice_ratios = 2.0 ** (voice_offsets_cents / 1200.0)
 
         for i in range(n_windows):
             num_plucks_in_window = int(density_at_window[i])
@@ -612,9 +733,13 @@ class AudioGenerator:
 
             for p in range(num_plucks_in_window):
                 pluck_freq = max(20.0, current_pitch * (1.0 + jitter[p]))
-                D = max(2, int(round(self.sample_rate / pluck_freq)))
 
-                pluck_audio = self._karplus_strong_pluck(D, pluck_duration_samples, g) * current_amp * 0.15
+                pluck_audio = np.zeros(pluck_duration_samples)
+                for ratio in voice_ratios:
+                    voice_freq = max(20.0, pluck_freq * ratio)
+                    D = max(2, int(round(self.sample_rate / voice_freq)))
+                    pluck_audio += self._karplus_strong_pluck(D, pluck_duration_samples, g, hammer_hardness=hammer_hardness)
+                pluck_audio = pluck_audio / np.sqrt(unison_voices) * current_amp * 0.15  # /sqrt(N): somma voci scorrelate, non /N che sarebbe troppo silenzioso
 
                 start = start_pluck_samples[p]
                 end = min(start + pluck_duration_samples, self.total_samples)
@@ -1167,8 +1292,8 @@ def main():
         audio_generator = AudioGenerator(sample_rate=AUDIO_SAMPLE_RATE, total_duration_seconds=duration_seconds)
 
         # Scheda per i parametri audio
-        tab_sub, tab_fm, tab_gran, tab_pluck, tab_noise, tab_fx, tab_eq, tab_pan = st.tabs([
-            "Sintesi Sottrattiva", "Sintesi FM", "Sintesi Granulare", "Corde (Karplus-Strong)", "Rumore", "Effetti Audio", "Equalizzatore", "Panning & Altezza"
+        tab_sub, tab_fm, tab_epiano, tab_gran, tab_pluck, tab_noise, tab_fx, tab_eq, tab_pan = st.tabs([
+            "Sintesi Sottrattiva", "Sintesi FM", "E-Piano (FM)", "Sintesi Granulare", "Corde (Karplus-Strong)", "Rumore", "Effetti Audio", "Equalizzatore", "Panning & Altezza"
         ])
 
         # Layer 1: Sintesi Sottrattiva (Basato su Luminosità e Dettaglio)
@@ -1350,6 +1475,83 @@ def main():
                 fm_amp_scaled = []
                 fm_layer_gain = 0.0
 
+        # Layer 2b: E-Piano FM (note discrete, stile DX7/Rhodes)
+        with tab_epiano:
+            st.markdown("### Layer: E-Piano (FM a note)")
+            st.caption(
+                "A differenza della Sintesi FM continua qui sopra, questo layer suona NOTE "
+                "discrete con inviluppo: attacco rapido, decadimento esponenziale, e un indice "
+                "di modulazione che si smorza più in fretta dell'ampiezza (il timbro si "
+                "'ammorbidisce' mentre la nota risuona) — il meccanismo classico degli e-piano "
+                "FM digitali (DX7 EPiano1, Rhodes)."
+            )
+            use_epiano = st.checkbox("Abilita Layer E-Piano", value=False, key='epiano_on')
+            params['epiano_enabled'] = use_epiano
+            if use_epiano:
+                epiano_layer_gain = st.slider("🎚️ Volume Layer E-Piano", 0.0, 2.0, 1.0, step=0.05, key='epiano_gain')
+                params['epiano_layer_gain'] = epiano_layer_gain
+
+                epiano_source_options = ["Luminosità", "Dettaglio", "Movimento", "Densità Contorni", "Variazione Colore"]
+                epiano_density_source = st.selectbox("Sorgente Densità Note", epiano_source_options, key='epiano_dens_src')
+                epiano_pitch_source = st.selectbox("Sorgente Intonazione", epiano_source_options, key='epiano_pitch_src', index=2)
+                epiano_brightness_source = st.selectbox("Sorgente Brillantezza (indice FM)", epiano_source_options, key='epiano_bright_src', index=1)
+                epiano_amp_source = st.selectbox("Sorgente Ampiezza", epiano_source_options, key='epiano_amp_src')
+
+                epiano_density_min = st.slider("Densità Minima (note/finestra)", 0, 5, 0, key='epiano_dens_min')
+                epiano_density_max = st.slider("Densità Massima (note/finestra)", 0, 5, 2, key='epiano_dens_max')
+                epiano_pitch_min = st.slider("Intonazione Minima (Hz)", 40, 800, 130, key='epiano_pitch_min')
+                epiano_pitch_max = st.slider("Intonazione Massima (Hz)", 40, 1500, 500, key='epiano_pitch_max')
+                epiano_amp_min = st.slider("Ampiezza Minima", 0.0, 1.0, 0.3, step=0.01, key='epiano_amp_min')
+                epiano_amp_max = st.slider("Ampiezza Massima", 0.0, 1.0, 1.0, step=0.01, key='epiano_amp_max')
+                epiano_note_duration = st.slider(
+                    "Durata Massima Nota (sec)", 0.3, 2.5, 1.2, step=0.1, key='epiano_note_dur',
+                    help="Quanto a lungo può risuonare la nota prima di essere tagliata."
+                )
+                epiano_mod_ratio = st.select_slider(
+                    "Rapporto Modulatore/Portante", options=[0.5, 1.0, 1.4, 2.0, 3.5, 7.0], value=1.0, key='epiano_mod_ratio',
+                    help="Rapporti classici della sintesi FM: 1.0 e 1.4 danno timbri 'e-piano' morbidi, "
+                         "valori più alti (3.5, 7.0) timbri più metallici/campanellati."
+                )
+
+                params['epiano_density_source'] = epiano_density_source
+                params['epiano_pitch_source'] = epiano_pitch_source
+                params['epiano_brightness_source'] = epiano_brightness_source
+                params['epiano_amp_source'] = epiano_amp_source
+                params['epiano_density_range'] = (epiano_density_min, epiano_density_max)
+                params['epiano_pitch_range'] = (epiano_pitch_min, epiano_pitch_max)
+                params['epiano_amp_range'] = (epiano_amp_min, epiano_amp_max)
+                params['epiano_note_duration'] = epiano_note_duration
+                params['epiano_mod_ratio'] = epiano_mod_ratio
+
+                def _epiano_source_data(name):
+                    if name == "Luminosità": return luminosity_data
+                    if name == "Dettaglio": return detail_data
+                    if name == "Movimento": return movement_data
+                    if name == "Densità Contorni": return edge_density_data
+                    if name == "Variazione Colore": return color_variation_data
+                    return []
+
+                epiano_density_data_raw = _epiano_source_data(epiano_density_source)
+                epiano_pitch_data_raw = _epiano_source_data(epiano_pitch_source)
+                epiano_brightness_data_raw = _epiano_source_data(epiano_brightness_source)
+                epiano_amp_data_raw = _epiano_source_data(epiano_amp_source)
+
+                epiano_density_scaled = np.interp(epiano_density_data_raw, (min(epiano_density_data_raw) if epiano_density_data_raw else 0, max(epiano_density_data_raw) if epiano_density_data_raw else 1), (epiano_density_min, epiano_density_max)).tolist()
+                epiano_pitch_scaled = np.interp(epiano_pitch_data_raw, (min(epiano_pitch_data_raw) if epiano_pitch_data_raw else 0, max(epiano_pitch_data_raw) if epiano_pitch_data_raw else 1), (epiano_pitch_min, epiano_pitch_max)).tolist()
+                # Brillantezza normalizzata in [0,1] indipendentemente dal range della sorgente scelta
+                epiano_brightness_scaled = np.interp(epiano_brightness_data_raw, (min(epiano_brightness_data_raw) if epiano_brightness_data_raw else 0, max(epiano_brightness_data_raw) if epiano_brightness_data_raw else 1), (0.0, 1.0)).tolist()
+                epiano_amp_scaled = np.interp(epiano_amp_data_raw, (min(epiano_amp_data_raw) if epiano_amp_data_raw else 0, max(epiano_amp_data_raw) if epiano_amp_data_raw else 1), (epiano_amp_min, epiano_amp_max)).tolist()
+            else:
+                epiano_layer_gain = 0.0
+                epiano_density_scaled = []
+                epiano_pitch_scaled = []
+                epiano_brightness_scaled = []
+                epiano_amp_scaled = []
+                epiano_note_duration = 1.2
+                epiano_mod_ratio = 1.0
+                params['epiano_note_duration'] = epiano_note_duration
+                params['epiano_mod_ratio'] = epiano_mod_ratio
+
         # Layer 3: Sintesi Granulare (Basato su Dettaglio e Movimento)
         with tab_gran:
             st.markdown("### Layer: Sintesi Granulare")
@@ -1461,6 +1663,27 @@ def main():
                     help="Quanto a lungo può risuonare una corda prima di essere tagliata."
                 )
 
+                st.markdown("##### Carattere")
+                pluck_hardness = st.slider(
+                    "Durezza Eccitazione (pizzicata → martellata)", 0.0, 1.0, 0.0, step=0.05, key='pluck_hardness',
+                    help="0 = pizzicata classica (rumore bianco, morbida). Valori più alti = attacco "
+                         "più duro e percussivo, più vicino a un martelletto di pianoforte/clavicembalo."
+                )
+                pluck_unison_voices = st.select_slider(
+                    "Corde all'Unisono", options=[1, 2, 3], value=1, key='pluck_unison_voices',
+                    help="Più di 1 somma 2-3 corde leggermente scordate per nota (come le corde "
+                         "multiple di un pianoforte vero), per un carattere più ricco/mosso invece "
+                         "di una pizzicata singola e statica. Aumenta il tempo di generazione."
+                )
+                if pluck_unison_voices > 1:
+                    pluck_unison_detune = st.slider(
+                        "Scordatura Unisono (cent)", 1.0, 25.0, 8.0, step=1.0, key='pluck_unison_detune',
+                        help="Quanto le corde extra sono scordate rispetto all'intonazione nominale. "
+                             "Valori bassi (5-10) danno un 'battimento' naturale, alti (20+) un chorus più marcato."
+                    )
+                else:
+                    pluck_unison_detune = 0.0
+
                 params['pluck_density_source'] = pluck_density_source
                 params['pluck_pitch_source'] = pluck_pitch_source
                 params['pluck_damping_source'] = pluck_damping_source
@@ -1469,6 +1692,9 @@ def main():
                 params['pluck_pitch_range'] = (pluck_pitch_min, pluck_pitch_max)
                 params['pluck_amp_range'] = (pluck_amp_min, pluck_amp_max)
                 params['pluck_duration'] = pluck_duration
+                params['pluck_hardness'] = pluck_hardness
+                params['pluck_unison_voices'] = pluck_unison_voices
+                params['pluck_unison_detune'] = pluck_unison_detune
 
                 def _pluck_source_data(name):
                     if name == "Luminosità": return luminosity_data
@@ -1495,7 +1721,13 @@ def main():
                 pluck_damping_scaled = []
                 pluck_amp_scaled = []
                 pluck_duration = 0.4
+                pluck_hardness = 0.0
+                pluck_unison_voices = 1
+                pluck_unison_detune = 0.0
                 params['pluck_duration'] = pluck_duration
+                params['pluck_hardness'] = pluck_hardness
+                params['pluck_unison_voices'] = pluck_unison_voices
+                params['pluck_unison_detune'] = pluck_unison_detune
 
         # Layer 4: Rumore (Basato su Variazione Movimento)
         with tab_noise:
@@ -1827,6 +2059,15 @@ def main():
                 if return_stems:
                     stems['fm'] = fm_audio
 
+            if use_epiano:
+                epiano_audio = audio_generator.generate_fm_epiano_layer(
+                    epiano_density_scaled, epiano_pitch_scaled, epiano_brightness_scaled, epiano_amp_scaled,
+                    note_duration=epiano_note_duration, mod_ratio=epiano_mod_ratio
+                ) * epiano_layer_gain
+                mixed_audio += epiano_audio
+                if return_stems:
+                    stems['epiano'] = epiano_audio
+
             if use_granular:
                 granular_audio = audio_generator.generate_granular_layer(gran_density_scaled, gran_duration_scaled, gran_amp_scaled, gran_pitch_scaled) * gran_layer_gain
                 mixed_audio += granular_audio
@@ -1834,7 +2075,11 @@ def main():
                     stems['granulare'] = granular_audio
 
             if use_pluck:
-                pluck_audio = audio_generator.generate_pluck_layer(pluck_density_scaled, pluck_pitch_scaled, pluck_damping_scaled, pluck_amp_scaled, max_pluck_duration=pluck_duration) * pluck_layer_gain
+                pluck_audio = audio_generator.generate_pluck_layer(
+                    pluck_density_scaled, pluck_pitch_scaled, pluck_damping_scaled, pluck_amp_scaled,
+                    max_pluck_duration=pluck_duration, hammer_hardness=pluck_hardness,
+                    unison_voices=pluck_unison_voices, unison_detune_cents=pluck_unison_detune
+                ) * pluck_layer_gain
                 mixed_audio += pluck_audio
                 if return_stems:
                     stems['corde'] = pluck_audio
@@ -2117,6 +2362,15 @@ def main():
                         report_lines.append(field("indice mod.", "mod. index", f"{params['fm_mod_idx_source']} ({params['fm_mod_idx_range'][0]:.1f}-{params['fm_mod_idx_range'][1]:.1f})", indent="  "))
                         report_lines.append(field("ampiezza", "amplitude", f"{params['fm_amp_source']} ({params['fm_amp_range'][0]:.2f}-{params['fm_amp_range'][1]:.2f})", indent="  "))
 
+                    report_lines.append(field("e-piano (fm a note)", "e-piano (fm notes)", onoff(params.get('epiano_enabled'))))
+                    if params.get('epiano_enabled'):
+                        report_lines.append(field("volume layer", "layer volume", f"{params.get('epiano_layer_gain', 1.0):.2f}", indent="  "))
+                        report_lines.append(field("densità", "density", f"{params.get('epiano_density_source', 'N/A')} ({params['epiano_density_range'][0]}-{params['epiano_density_range'][1]} note/finestra)", indent="  "))
+                        report_lines.append(field("intonazione", "pitch", f"{params.get('epiano_pitch_source', 'N/A')} ({params['epiano_pitch_range'][0]}-{params['epiano_pitch_range'][1]} Hz)", indent="  "))
+                        report_lines.append(field("brillantezza", "brightness", params.get('epiano_brightness_source', 'N/A'), indent="  "))
+                        report_lines.append(field("rapporto mod/portante", "mod/carrier ratio", f"{params.get('epiano_mod_ratio', 1.0):.1f}", indent="  "))
+                        report_lines.append(field("durata massima nota", "max note duration", f"{params.get('epiano_note_duration', 1.2):.2f} sec", indent="  "))
+
                     report_lines.append(field("sintesi granulare", "granular synthesis", onoff(params.get('granular_enabled'))))
                     if params.get('granular_enabled'):
                         report_lines.append(field("volume layer", "layer volume", f"{params.get('gran_layer_gain', 1.0):.2f}", indent="  "))
@@ -2133,6 +2387,11 @@ def main():
                         report_lines.append(field("intonazione", "pitch", f"{params.get('pluck_pitch_source', 'N/A')} ({params['pluck_pitch_range'][0]}-{params['pluck_pitch_range'][1]} Hz)", indent="  "))
                         report_lines.append(field("smorzamento", "damping", params.get('pluck_damping_source', 'N/A'), indent="  "))
                         report_lines.append(field("durata massima", "max duration", f"{params.get('pluck_duration', 0.4):.2f} sec", indent="  "))
+                        report_lines.append(field("carattere", "character", f"durezza {params.get('pluck_hardness', 0.0):.2f} (0=pizzicata, 1=martellata)", indent="  "))
+                        if params.get('pluck_unison_voices', 1) > 1:
+                            report_lines.append(field("unisono", "unison", f"{params['pluck_unison_voices']} corde, scordatura {params.get('pluck_unison_detune', 0.0):.0f} cent", indent="  "))
+                        else:
+                            report_lines.append(field("unisono", "unison", "disabilitato / disabled (1 corda)", indent="  "))
 
                     report_lines.append(field("rumore", "noise", onoff(params.get('noise_enabled'))))
                     if params.get('noise_enabled'):
