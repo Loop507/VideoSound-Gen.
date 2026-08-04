@@ -284,6 +284,51 @@ def scale_frequency_exponential(data_raw: list, freq_min: float, freq_max: float
     normalized_log = np.interp(data_raw, (lo, hi), (log_min, log_max))
     return np.exp2(normalized_log).tolist()
 
+# ── QUANTIZZAZIONE A SCALA MUSICALE ─────────────────────────────────────────
+# Intervalli in semitoni dalla fondamentale. La pentatonica è la scelta classica per musica
+# guidata da dati esterni imprevedibili (usata da Brian Eno nei suoi sistemi generativi, e in
+# progetti di data-sonification): qualsiasi combinazione di note pentatoniche resta consonante,
+# quindi il video può "suonare" la melodia senza mai produrre un intervallo dissonante.
+SCALE_NONE = "Nessuna (frequenza libera/continua)"
+MUSICAL_SCALES = {
+    "Pentatonica Maggiore": [0, 2, 4, 7, 9],
+    "Pentatonica Minore": [0, 3, 5, 7, 10],
+    "Maggiore (Ionica)": [0, 2, 4, 5, 7, 9, 11],
+    "Minore Naturale (Eolia)": [0, 2, 3, 5, 7, 8, 10],
+    "Minore Armonica": [0, 2, 3, 5, 7, 8, 11],
+    "Dorica": [0, 2, 3, 5, 7, 9, 10],
+    "Frigia": [0, 1, 3, 5, 7, 8, 10],
+    "Cromatica (tutti i semitoni)": list(range(12)),
+}
+
+def quantize_to_scale(freqs: list, root_freq: float, scale_name: str) -> list:
+    """Agganciano ('quantizzano') una serie di frequenze continue alla nota più vicina di una
+    scala musicale, invece di lasciarle libere di cadere ovunque nello spettro (microtonali).
+    Senza questo passaggio ogni 'nota' avrebbe comunque una sua frequenza distinta guidata dal
+    video, ma il risultato suonerebbe come un glissando continuo, non come una melodia
+    riconoscibile — è la quantizzazione a rendere l'altezza discreta e musicale."""
+    if not freqs or scale_name == SCALE_NONE or scale_name not in MUSICAL_SCALES:
+        return freqs
+
+    intervals = MUSICAL_SCALES[scale_name]
+    # Costruisce tutte le frequenze della scala su un ampio range di ottave (dal sub-basso
+    # all'acuto) così la ricerca del vicino più prossimo funziona per qualsiasi frequenza in
+    # ingresso, senza dover gestire manualmente i casi limite di ottava/wrap-around.
+    scale_freqs = sorted(
+        root_freq * (2.0 ** (octave_n + interval / 12.0))
+        for octave_n in range(-6, 7)
+        for interval in intervals
+    )
+    scale_freqs_arr = np.array(scale_freqs)
+    freqs_arr = np.array(freqs)
+
+    idx = np.searchsorted(scale_freqs_arr, freqs_arr)
+    idx = np.clip(idx, 1, len(scale_freqs_arr) - 1)
+    left = scale_freqs_arr[idx - 1]
+    right = scale_freqs_arr[idx]
+    quantized = np.where(np.abs(freqs_arr - left) <= np.abs(freqs_arr - right), left, right)
+    return quantized.tolist()
+
 def check_ffmpeg() -> bool:
     """Verifica se FFmpeg è installato e disponibile nel PATH."""
     return shutil.which("ffmpeg") is not None
@@ -1606,6 +1651,24 @@ def main():
                          "coppia operatore del patch 'E.Piano 1' originale del DX7 per l'attacco a campana."
                 )
 
+                st.markdown("##### Melodia")
+                st.caption(
+                    "Di default l'intonazione è continua (guidata liberamente dal video, come un "
+                    "glissando). Scegliendo una scala, ogni nota viene 'agganciata' alla nota più "
+                    "vicina di quella scala: il video continua a determinare quale nota suona, ma "
+                    "il risultato è una vera melodia invece di un'altezza libera/microtonale."
+                )
+                epiano_scale = st.selectbox("Scala Musicale", [SCALE_NONE] + list(MUSICAL_SCALES.keys()), key='epiano_scale')
+                if epiano_scale != SCALE_NONE:
+                    epiano_root_note = st.slider(
+                        "Nota Fondamentale (Hz)", 55.0, 440.0, 220.0, step=1.0, key='epiano_root_note',
+                        help="La 'tonica' della scala: 220Hz = La3, 110Hz = La2, 261.6Hz = Do4 (centrale)."
+                    )
+                else:
+                    epiano_root_note = 220.0
+                params['epiano_scale'] = epiano_scale
+                params['epiano_root_note'] = epiano_root_note
+
                 params['epiano_density_source'] = epiano_density_source
                 params['epiano_pitch_source'] = epiano_pitch_source
                 params['epiano_brightness_source'] = epiano_brightness_source
@@ -1631,6 +1694,7 @@ def main():
 
                 epiano_density_scaled = np.interp(epiano_density_data_raw, (min(epiano_density_data_raw) if epiano_density_data_raw else 0, max(epiano_density_data_raw) if epiano_density_data_raw else 1), (epiano_density_min, epiano_density_max)).tolist()
                 epiano_pitch_scaled = scale_frequency_exponential(epiano_pitch_data_raw, epiano_pitch_min, epiano_pitch_max)
+                epiano_pitch_scaled = quantize_to_scale(epiano_pitch_scaled, epiano_root_note, epiano_scale)
                 # Brillantezza normalizzata in [0,1] indipendentemente dal range della sorgente scelta
                 epiano_brightness_scaled = np.interp(epiano_brightness_data_raw, (min(epiano_brightness_data_raw) if epiano_brightness_data_raw else 0, max(epiano_brightness_data_raw) if epiano_brightness_data_raw else 1), (0.0, 1.0)).tolist()
                 epiano_amp_scaled = np.interp(epiano_amp_data_raw, (min(epiano_amp_data_raw) if epiano_amp_data_raw else 0, max(epiano_amp_data_raw) if epiano_amp_data_raw else 1), (epiano_amp_min, epiano_amp_max)).tolist()
@@ -1642,8 +1706,12 @@ def main():
                 epiano_amp_scaled = []
                 epiano_note_duration = 1.2
                 epiano_mod_ratio = 1.0
+                epiano_scale = SCALE_NONE
+                epiano_root_note = 220.0
                 params['epiano_note_duration'] = epiano_note_duration
                 params['epiano_mod_ratio'] = epiano_mod_ratio
+                params['epiano_scale'] = epiano_scale
+                params['epiano_root_note'] = epiano_root_note
 
         # Layer 3: Sintesi Granulare (Basato su Dettaglio e Movimento)
         with tab_gran:
@@ -1777,6 +1845,22 @@ def main():
                 else:
                     pluck_unison_detune = 0.0
 
+                st.markdown("##### Melodia")
+                st.caption(
+                    "Come per l'E-Piano: di default l'intonazione delle corde è continua/libera. "
+                    "Scegliendo una scala, ogni pizzicata si aggancia alla nota più vicina."
+                )
+                pluck_scale = st.selectbox("Scala Musicale", [SCALE_NONE] + list(MUSICAL_SCALES.keys()), key='pluck_scale')
+                if pluck_scale != SCALE_NONE:
+                    pluck_root_note = st.slider(
+                        "Nota Fondamentale (Hz)", 55.0, 440.0, 220.0, step=1.0, key='pluck_root_note',
+                        help="La 'tonica' della scala: 220Hz = La3, 110Hz = La2, 261.6Hz = Do4 (centrale)."
+                    )
+                else:
+                    pluck_root_note = 220.0
+                params['pluck_scale'] = pluck_scale
+                params['pluck_root_note'] = pluck_root_note
+
                 params['pluck_density_source'] = pluck_density_source
                 params['pluck_pitch_source'] = pluck_pitch_source
                 params['pluck_damping_source'] = pluck_damping_source
@@ -1804,6 +1888,7 @@ def main():
 
                 pluck_density_scaled = np.interp(pluck_density_data_raw, (min(pluck_density_data_raw) if pluck_density_data_raw else 0, max(pluck_density_data_raw) if pluck_density_data_raw else 1), (pluck_density_min, pluck_density_max)).tolist()
                 pluck_pitch_scaled = scale_frequency_exponential(pluck_pitch_data_raw, pluck_pitch_min, pluck_pitch_max)
+                pluck_pitch_scaled = quantize_to_scale(pluck_pitch_scaled, pluck_root_note, pluck_scale)
                 # Smorzamento normalizzato in [0,1] indipendentemente dal range della sorgente scelta
                 pluck_damping_scaled = np.interp(pluck_damping_data_raw, (min(pluck_damping_data_raw) if pluck_damping_data_raw else 0, max(pluck_damping_data_raw) if pluck_damping_data_raw else 1), (0.0, 1.0)).tolist()
                 pluck_amp_scaled = np.interp(pluck_amp_data_raw, (min(pluck_amp_data_raw) if pluck_amp_data_raw else 0, max(pluck_amp_data_raw) if pluck_amp_data_raw else 1), (pluck_amp_min, pluck_amp_max)).tolist()
@@ -1817,10 +1902,14 @@ def main():
                 pluck_hardness = 0.0
                 pluck_unison_voices = 1
                 pluck_unison_detune = 0.0
+                pluck_scale = SCALE_NONE
+                pluck_root_note = 220.0
                 params['pluck_duration'] = pluck_duration
                 params['pluck_hardness'] = pluck_hardness
                 params['pluck_unison_voices'] = pluck_unison_voices
                 params['pluck_unison_detune'] = pluck_unison_detune
+                params['pluck_scale'] = pluck_scale
+                params['pluck_root_note'] = pluck_root_note
 
         # Layer 4: Rumore (Basato su Variazione Movimento)
         with tab_noise:
@@ -2463,6 +2552,10 @@ def main():
                         report_lines.append(field("brillantezza", "brightness", params.get('epiano_brightness_source', 'N/A'), indent="  "))
                         report_lines.append(field("rapporto mod/portante", "mod/carrier ratio", f"{params.get('epiano_mod_ratio', 1.0):.1f}", indent="  "))
                         report_lines.append(field("durata massima nota", "max note duration", f"{params.get('epiano_note_duration', 1.2):.2f} sec", indent="  "))
+                        if params.get('epiano_scale', SCALE_NONE) != SCALE_NONE:
+                            report_lines.append(field("scala musicale", "musical scale", f"{params['epiano_scale']} (fondamentale {params.get('epiano_root_note', 220.0):.0f} Hz)", indent="  "))
+                        else:
+                            report_lines.append(field("scala musicale", "musical scale", "nessuna (intonazione libera) / none (free pitch)", indent="  "))
 
                     report_lines.append(field("sintesi granulare", "granular synthesis", onoff(params.get('granular_enabled'))))
                     if params.get('granular_enabled'):
@@ -2485,6 +2578,10 @@ def main():
                             report_lines.append(field("unisono", "unison", f"{params['pluck_unison_voices']} corde, scordatura {params.get('pluck_unison_detune', 0.0):.0f} cent", indent="  "))
                         else:
                             report_lines.append(field("unisono", "unison", "disabilitato / disabled (1 corda)", indent="  "))
+                        if params.get('pluck_scale', SCALE_NONE) != SCALE_NONE:
+                            report_lines.append(field("scala musicale", "musical scale", f"{params['pluck_scale']} (fondamentale {params.get('pluck_root_note', 220.0):.0f} Hz)", indent="  "))
+                        else:
+                            report_lines.append(field("scala musicale", "musical scale", "nessuna (intonazione libera) / none (free pitch)", indent="  "))
 
                     report_lines.append(field("rumore", "noise", onoff(params.get('noise_enabled'))))
                     if params.get('noise_enabled'):
