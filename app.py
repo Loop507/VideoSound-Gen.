@@ -6,6 +6,7 @@ import glob
 import subprocess
 import gc
 import shutil
+import zipfile
 import uuid
 from typing import Tuple
 import soundfile as sf
@@ -387,8 +388,93 @@ class AudioGenerator:
         original_time_points = np.linspace(0, self.total_duration_seconds, len(data_per_frame), endpoint=True)
         return np.interp(self.time_array, original_time_points, data_per_frame)
 
-    def generate_subtractive_waveform(self, freq_data: list, amp_data: list, waveform_type: str = "sine") -> np.ndarray:
-        """Genera una forma d'onda sottrattiva base con frequenza e ampiezza dinamiche."""
+    @staticmethod
+    def _poly_blep_vectorized(t: np.ndarray, dt: np.ndarray) -> np.ndarray:
+        """Correzione PolyBLEP (Polynomial Band-Limited Step), vettorizzata su tutto l'array
+        invece che campione per campione: attenua l'aliasing nelle discontinuità di square/
+        sawtooth senza un loop Python. t = fase normalizzata in [0,1), dt = frequenza normalizzata
+        (freq/sample_rate) nello stesso punto. Standard nella sintesi digitale di forme d'onda."""
+        dt_safe = np.maximum(dt, 1e-12)
+        y = np.zeros_like(t)
+
+        mask1 = t < dt
+        tt = np.where(mask1, t / dt_safe, 0.0)
+        y = np.where(mask1, tt + tt - tt * tt - 1.0, y)
+
+        mask2 = t > (1.0 - dt)
+        tt2 = np.where(mask2, (t - 1.0) / dt_safe, 0.0)
+        y = np.where(mask2, tt2 * tt2 + tt2 + tt2 + 1.0, y)
+
+        return y
+
+    def apply_resonant_filter(self, audio_array: np.ndarray, cutoff_data: list, resonance_data: list) -> np.ndarray:
+        """Filtro passa-basso risonante (biquad, formule RBJ Audio EQ Cookbook) con cutoff e
+        risonanza (Q) modulati dinamicamente nel tempo. Questa è la parte 'sottrattiva' vera
+        della sintesi sottrattiva: scolpisce le armoniche di un'onda già generata (tipicamente
+        square/sawtooth, ricche di armoniche) invece di limitarsi a modularne ampiezza e
+        frequenza fondamentale come faceva prima. Processato a blocchi, stesso schema già usato
+        per delay/reverb: i coefficienti sono ricalcolati periodicamente e lo stato interno del
+        filtro (zi) continua da un blocco al successivo, per evitare click alle giunzioni."""
+        n_samples = len(audio_array)
+        if n_samples == 0 or len(cutoff_data) == 0:
+            return audio_array
+
+        nyquist = 0.5 * self.sample_rate
+
+        # Aggiorna i coefficienti ogni ~20ms: abbastanza spesso da seguire la modulazione video,
+        # abbastanza raro da restare economico (stesso compromesso di delay/reverb).
+        chunk_size = max(1, int(0.02 * self.sample_rate))
+        n_chunks = (n_samples + chunk_size - 1) // chunk_size
+        chunk_start_indices = np.minimum(np.arange(n_chunks) * chunk_size, n_samples - 1)
+        chunk_times = self.time_array[chunk_start_indices]
+
+        cutoff_time_points = np.linspace(0, self.total_duration_seconds, len(cutoff_data), endpoint=True)
+        resonance_time_points = np.linspace(0, self.total_duration_seconds, len(resonance_data), endpoint=True)
+        # Il cutoff non può mai raggiungere/superare Nyquist (coefficienti non validi): tetto di
+        # sicurezza al 95% di Nyquist. Q limitato per evitare risonanze instabili (auto-oscillazione).
+        cutoff_at_chunk = np.clip(np.interp(chunk_times, cutoff_time_points, cutoff_data), 20.0, nyquist * 0.95)
+        resonance_at_chunk = np.clip(np.interp(chunk_times, resonance_time_points, resonance_data), 0.5, 10.0)
+
+        w0 = 2 * np.pi * cutoff_at_chunk / self.sample_rate
+        alpha = np.sin(w0) / (2 * resonance_at_chunk)
+        cosw0 = np.cos(w0)
+
+        b0 = (1 - cosw0) / 2
+        b1 = 1 - cosw0
+        b2 = (1 - cosw0) / 2
+        a0 = 1 + alpha
+        a1 = -2 * cosw0
+        a2 = 1 - alpha
+
+        filtered = np.empty_like(audio_array, dtype=np.float64)
+        zi = np.zeros(2)  # stato del biquad (2 poli), continua tra un blocco e il successivo
+
+        idx = 0
+        chunk_idx = 0
+        while idx < n_samples:
+            end = min(idx + chunk_size, n_samples)
+            b = np.array([b0[chunk_idx], b1[chunk_idx], b2[chunk_idx]]) / a0[chunk_idx]
+            a = np.array([1.0, a1[chunk_idx] / a0[chunk_idx], a2[chunk_idx] / a0[chunk_idx]])
+
+            out_chunk, zi = lfilter(b, a, audio_array[idx:end], zi=zi)
+            filtered[idx:end] = out_chunk
+
+            idx = end
+            chunk_idx += 1
+
+        return filtered
+
+    def generate_subtractive_waveform(self, freq_data: list, amp_data: list, waveform_type: str = "sine",
+                                       band_limited: bool = False) -> np.ndarray:
+        """Genera una forma d'onda sottrattiva base con frequenza e ampiezza dinamiche.
+
+        band_limited: square e sawtooth generati "al naturale" (np.sign/rampa lineare) aliasano
+        pesantemente alle frequenze medio-alte, perché contengono un salto discontinuo che il
+        campionamento digitale non può rappresentare correttamente. Questo è storicamente proprio
+        il tipo di artefatto ricercato in molta musica glitch/lo-fi, quindi resta il default
+        (band_limited=False). Se True, applica una correzione PolyBLEP alle discontinuità per
+        un suono più "pulito" in stile synth analogico/digitale professionale: è una scelta
+        estetica esplicita, non una correzione "giusta" da applicare sempre."""
         freq_interp = self._interp_data_to_audio_length(freq_data)
         amp_interp = self._interp_data_to_audio_length(amp_data)
 
@@ -399,10 +485,19 @@ class AudioGenerator:
         if waveform_type == "sine":
             waveform = np.sin(phase)
         elif waveform_type == "square":
-            waveform = np.sign(np.sin(phase))
+            normalized_phase = (phase / (2 * np.pi)) % 1.0
+            waveform = np.where(normalized_phase < 0.5, 1.0, -1.0)
+            if band_limited:
+                dt = phase_increment / (2 * np.pi)
+                waveform = (waveform
+                            + self._poly_blep_vectorized(normalized_phase, dt)
+                            - self._poly_blep_vectorized((normalized_phase - 0.5) % 1.0, dt))
         elif waveform_type == "sawtooth":
             normalized_phase = (phase / (2 * np.pi)) % 1.0
             waveform = 2 * (normalized_phase - 0.5)
+            if band_limited:
+                dt = phase_increment / (2 * np.pi)
+                waveform = waveform - self._poly_blep_vectorized(normalized_phase, dt)
         else: # default to sine
             waveform = np.sin(phase)
 
@@ -428,6 +523,103 @@ class AudioGenerator:
         carrier_signal = np.sin(carrier_phase + mod_idx_interp * modulator_signal)
 
         audio = carrier_signal * amp_interp * 0.5
+        return audio
+
+    def _karplus_strong_pluck(self, D: int, duration_samples: int, g: float) -> np.ndarray:
+        """Calcola una singola pizzicata Karplus-Strong: y[n] = rumore[n] per n<D (l'eccitazione,
+        lunga quanto la linea di ritardo), poi y[n] = 0.5*g*(y[n-D] + y[n-D-1]) per n>=D.
+
+        Questa è la stessa equazione IIR di prima, ma calcolata a blocchi di D campioni invece che
+        con scipy.signal.lfilter: lfilter con un array 'a' lungo e quasi tutto zero elabora ogni
+        campione di output usando TUTTI i coefficienti (costo O(durata * D) per pizzicata — con
+        migliaia di pizzicate su un video lungo, minuti di attesa, verificato con un benchmark).
+        Ogni blocco di D campioni qui legge solo dal blocco precedente (mai da se stesso), quindi
+        è vettorizzabile in un colpo solo con NumPy: costo O(durata) per pizzicata, indipendente da D."""
+        # y_ext[0] rappresenta y[-1] = 0 (silenzio prima dell'eccitazione); serve per evitare
+        # indici negativi quando il primo blocco legge un campione prima dell'inizio del rumore.
+        y_ext = np.zeros(duration_samples + 1)
+        burst_len = min(D, duration_samples)
+        y_ext[1:1 + burst_len] = np.random.uniform(-1.0, 1.0, burst_len)
+
+        pos = D
+        while pos < duration_samples:
+            block_len = min(D, duration_samples - pos)
+            ext_idx = np.arange(pos, pos + block_len) + 1
+            y_ext[ext_idx] = 0.5 * g * (y_ext[ext_idx - D] + y_ext[ext_idx - D - 1])
+            pos += block_len
+
+        return y_ext[1:]
+
+    def generate_pluck_layer(self, density_data: list, pitch_data: list, damping_data: list, amp_data: list,
+                              max_pluck_duration: float = 0.4, trigger_window_seconds: float = 0.15) -> np.ndarray:
+        """Layer a modellazione fisica (Karplus-Strong): sintetizza 'pizzicate' di corda invece di
+        onde/grani. Algoritmo classico: rumore bianco che eccita una linea di ritardo di lunghezza
+        D = sample_rate/pitch, richiusa in retroazione con un filtro passa-basso a 2 campioni
+        (media mobile), che simula lo smorzamento naturale di una corda che vibra.
+
+        y[n] = x[n] + g * 0.5 * (y[n-D] + y[n-D-1])
+
+        Questa è un'equazione alle differenze IIR standard, calcolata da _karplus_strong_pluck
+        a blocchi vettorizzati con NumPy (vedi il commento lì per il perché non usiamo né un loop
+        Python campione-per-campione né scipy.signal.lfilter direttamente).
+
+        A differenza del layer granulare, qui le pizzicate sono innescate su finestre temporali
+        fisse (trigger_window_seconds) invece che una per ogni fotogramma video: pizzicate più
+        fitte di ~100-150ms diventerebbero comunque indistinguibili tra loro (perderebbero il
+        carattere "corda pizzicata" per fondersi in una texture continua, che è già il ruolo del
+        layer granulare), quindi agganciarle al frame rate del video non aggiungerebbe nulla di
+        espressivo — solo molte più pizzicate da calcolare per un video lungo e denso."""
+        audio = np.zeros(self.total_samples)
+        n_frames = len(density_data)
+
+        if n_frames == 0:
+            return audio
+
+        pluck_duration_samples = max(64, int(max_pluck_duration * self.sample_rate))
+        window_samples = max(1, int(trigger_window_seconds * self.sample_rate))
+        n_windows = max(1, (self.total_samples + window_samples - 1) // window_samples)
+
+        # Stesso principio già applicato a granulare/glitch/delay/riverbero: si interpola solo
+        # nei punti che il loop legge davvero (un valore per finestra), non sull'intera lunghezza
+        # audio a risoluzione campione.
+        original_time_points = np.linspace(0, self.total_duration_seconds, n_frames, endpoint=True)
+        window_indices = np.minimum(np.arange(n_windows) * window_samples, self.total_samples - 1)
+        window_times = self.time_array[window_indices]
+
+        density_at_window = np.interp(window_times, original_time_points, density_data)
+        pitch_at_window = np.interp(window_times, original_time_points, pitch_data)
+        damping_at_window = np.interp(window_times, original_time_points, damping_data)
+        amp_at_window = np.interp(window_times, original_time_points, amp_data)
+
+        for i in range(n_windows):
+            num_plucks_in_window = int(density_at_window[i])
+            if num_plucks_in_window == 0:
+                continue
+
+            start_sample_window = i * window_samples
+            end_sample_window = min(start_sample_window + window_samples, self.total_samples)
+            if start_sample_window >= end_sample_window:
+                continue
+
+            current_pitch = max(20.0, float(pitch_at_window[i]))
+            # damping_at_window è in [0,1] guidato dal video: mappato al guadagno di
+            # retroazione g (0.90 = smorzamento rapido/percussivo, 0.999 = corda che risuona a lungo)
+            g = 0.90 + 0.099 * float(np.clip(damping_at_window[i], 0.0, 1.0))
+            current_amp = float(amp_at_window[i])
+
+            start_pluck_samples = np.random.randint(start_sample_window, end_sample_window, size=num_plucks_in_window)
+            jitter = (np.random.rand(num_plucks_in_window) - 0.5) * 0.1  # +/-5% intonazione, meno del layer granulare (le corde restano più "accordate")
+
+            for p in range(num_plucks_in_window):
+                pluck_freq = max(20.0, current_pitch * (1.0 + jitter[p]))
+                D = max(2, int(round(self.sample_rate / pluck_freq)))
+
+                pluck_audio = self._karplus_strong_pluck(D, pluck_duration_samples, g) * current_amp * 0.15
+
+                start = start_pluck_samples[p]
+                end = min(start + pluck_duration_samples, self.total_samples)
+                audio[start:end] += pluck_audio[:end - start]
+
         return audio
 
     def generate_granular_layer(self, density_data: list, grain_duration_data: list, amp_data: list, pitch_data: list) -> np.ndarray:
@@ -910,6 +1102,8 @@ def main():
     # Inizializza session_state per i download (persistono tra i rerun)
     if 'video_bytes' not in st.session_state:
         st.session_state['video_bytes'] = None
+    if 'stems_zip_bytes' not in st.session_state:
+        st.session_state['stems_zip_bytes'] = None
     if 'video_filename' not in st.session_state:
         st.session_state['video_filename'] = None
     if 'report_text' not in st.session_state:
@@ -973,8 +1167,8 @@ def main():
         audio_generator = AudioGenerator(sample_rate=AUDIO_SAMPLE_RATE, total_duration_seconds=duration_seconds)
 
         # Scheda per i parametri audio
-        tab_sub, tab_fm, tab_gran, tab_noise, tab_fx, tab_eq, tab_pan = st.tabs([
-            "Sintesi Sottrattiva", "Sintesi FM", "Sintesi Granulare", "Rumore", "Effetti Audio", "Equalizzatore", "Panning & Altezza"
+        tab_sub, tab_fm, tab_gran, tab_pluck, tab_noise, tab_fx, tab_eq, tab_pan = st.tabs([
+            "Sintesi Sottrattiva", "Sintesi FM", "Sintesi Granulare", "Corde (Karplus-Strong)", "Rumore", "Effetti Audio", "Equalizzatore", "Panning & Altezza"
         ])
 
         # Layer 1: Sintesi Sottrattiva (Basato su Luminosità e Dettaglio)
@@ -992,6 +1186,19 @@ def main():
                 sub_freq_source = st.selectbox("Sorgente Frequenza (Hz)", ["Luminosità", "Dettaglio", "Movimento", "Densità Contorni", "Variazione Colore"], key='sub_freq_src')
                 sub_amp_source = st.selectbox("Sorgente Ampiezza (0-1)", ["Luminosità", "Dettaglio", "Movimento", "Densità Contorni", "Variazione Colore"], key='sub_amp_src')
                 sub_waveform_type = st.selectbox("Tipo di Forma d'Onda", ["sine", "square", "sawtooth"], key='sub_waveform_type')
+
+                if sub_waveform_type in ("square", "sawtooth"):
+                    sub_band_limited = st.checkbox(
+                        "Band-limited (anti-aliasing PolyBLEP)", value=False, key='sub_band_limited',
+                        help="Di default square/sawtooth sono generate 'al naturale' e aliasano alle "
+                             "frequenze medio-alte: è l'artefatto lo-fi/glitch tipico ricercato in molta "
+                             "musica elettronica. Attiva questa opzione per un suono più pulito in stile "
+                             "synth analogico, senza aliasing."
+                    )
+                else:
+                    sub_band_limited = False
+                params['sub_band_limited'] = sub_band_limited
+
                 
                 sub_freq_min = st.slider("Frequenza Minima (Hz)", 20, 1000, 100, key='sub_freq_min')
                 sub_freq_max = st.slider("Frequenza Massima (Hz)", 20, 1000, 800, key='sub_freq_max')
@@ -1021,9 +1228,49 @@ def main():
                 # Normalizza e scala i dati delle sorgenti
                 sub_freq_scaled = np.interp(sub_freq_data_raw, (min(sub_freq_data_raw) if sub_freq_data_raw else 0, max(sub_freq_data_raw) if sub_freq_data_raw else 1), (sub_freq_min, sub_freq_max)).tolist()
                 sub_amp_scaled = np.interp(sub_amp_data_raw, (min(sub_amp_data_raw) if sub_amp_data_raw else 0, max(sub_amp_data_raw) if sub_amp_data_raw else 1), (sub_amp_min, sub_amp_max)).tolist()
+
+                st.markdown("##### Filtro Sottrattivo (vero)")
+                sub_filter_enabled = st.checkbox(
+                    "Applica filtro passa-basso risonante", value=False, key='sub_filter_on',
+                    help="'Sintesi sottrattiva' significa scolpire le armoniche con un filtro, non solo "
+                         "modulare ampiezza/frequenza dell'onda: questo aggiunge il filtro vero e proprio "
+                         "(risonante, con Q) sopra la forma d'onda già generata. Funziona meglio con "
+                         "square/sawtooth, che sono ricche di armoniche da tagliare."
+                )
+                params['sub_filter_enabled'] = sub_filter_enabled
+                if sub_filter_enabled:
+                    sub_cutoff_source = st.selectbox("Sorgente Cutoff (Hz)", ["Luminosità", "Dettaglio", "Movimento", "Densità Contorni", "Variazione Colore"], key='sub_cutoff_src')
+                    sub_cutoff_min = st.slider("Cutoff Minimo (Hz)", 50, 5000, 200, key='sub_cutoff_min')
+                    sub_cutoff_max = st.slider("Cutoff Massimo (Hz)", 50, 8000, 3000, key='sub_cutoff_max')
+                    sub_resonance = st.slider(
+                        "Risonanza (Q)", 0.5, 8.0, 1.5, step=0.1, key='sub_resonance',
+                        help="Q alto = picco più marcato intorno al cutoff (carattere più 'synth'/aggressivo)."
+                    )
+                    params['sub_cutoff_source'] = sub_cutoff_source
+                    params['sub_cutoff_range'] = (sub_cutoff_min, sub_cutoff_max)
+                    params['sub_resonance'] = sub_resonance
+
+                    sub_cutoff_data_raw = []
+                    if sub_cutoff_source == "Luminosità": sub_cutoff_data_raw = luminosity_data
+                    elif sub_cutoff_source == "Dettaglio": sub_cutoff_data_raw = detail_data
+                    elif sub_cutoff_source == "Movimento": sub_cutoff_data_raw = movement_data
+                    elif sub_cutoff_source == "Densità Contorni": sub_cutoff_data_raw = edge_density_data
+                    elif sub_cutoff_source == "Variazione Colore": sub_cutoff_data_raw = color_variation_data
+
+                    sub_cutoff_scaled = np.interp(sub_cutoff_data_raw, (min(sub_cutoff_data_raw) if sub_cutoff_data_raw else 0, max(sub_cutoff_data_raw) if sub_cutoff_data_raw else 1), (sub_cutoff_min, sub_cutoff_max)).tolist()
+                    sub_resonance_scaled = [sub_resonance] * max(len(sub_cutoff_scaled), 1)
+                else:
+                    sub_cutoff_scaled = []
+                    sub_resonance_scaled = []
             else: # Aggiunto else per gestire i casi in cui i dati non sono scalati
                 sub_freq_scaled = []
                 sub_amp_scaled = []
+                sub_band_limited = False
+                params['sub_band_limited'] = False
+                sub_filter_enabled = False
+                params['sub_filter_enabled'] = False
+                sub_cutoff_scaled = []
+                sub_resonance_scaled = []
 
         # Layer 2: Sintesi FM (Basato su Variazione Movimento e Centro di Massa Orizzontale)
         with tab_fm:
@@ -1178,6 +1425,77 @@ def main():
                 gran_pitch_scaled = []
                 gran_layer_gain = 0.0
 
+
+        # Layer 3b: Corde (Karplus-Strong, modellazione fisica)
+        with tab_pluck:
+            st.markdown("### Layer: Corde (Karplus-Strong)")
+            st.caption(
+                "Modellazione fisica: simula una corda pizzicata (rumore che circola in una linea "
+                "di ritardo accordata, con smorzamento) invece di un'onda o un grano. Carattere "
+                "percussivo/organico, diverso dagli altri layer."
+            )
+            use_pluck = st.checkbox("Abilita Layer Corde", value=False, key='pluck_on')
+            params['pluck_enabled'] = use_pluck
+            if use_pluck:
+                pluck_layer_gain = st.slider("🎚️ Volume Layer Corde", 0.0, 2.0, 1.0, step=0.05, key='pluck_gain')
+                params['pluck_layer_gain'] = pluck_layer_gain
+
+                pluck_source_options = ["Luminosità", "Dettaglio", "Movimento", "Densità Contorni", "Variazione Colore"]
+                pluck_density_source = st.selectbox("Sorgente Densità Pizzicate", pluck_source_options, key='pluck_dens_src')
+                pluck_pitch_source = st.selectbox("Sorgente Intonazione", pluck_source_options, key='pluck_pitch_src', index=2)
+                pluck_damping_source = st.selectbox("Sorgente Smorzamento", pluck_source_options, key='pluck_damp_src', index=1)
+                pluck_amp_source = st.selectbox("Sorgente Ampiezza", pluck_source_options, key='pluck_amp_src')
+
+                # Densità volutamente limitata (max 5, non 10 come il layer granulare): pizzicate
+                # più fitte di ~150ms perderebbero il carattere "corda" per fondersi in una texture
+                # continua (che è già il ruolo della sintesi granulare), quindi non aggiungerebbero
+                # nulla di espressivo — solo tempo di calcolo su un video lungo e denso.
+                pluck_density_min = st.slider("Densità Minima (pizzicate/finestra)", 0, 5, 0, key='pluck_dens_min')
+                pluck_density_max = st.slider("Densità Massima (pizzicate/finestra)", 0, 5, 2, key='pluck_dens_max')
+                pluck_pitch_min = st.slider("Intonazione Minima (Hz)", 40, 800, 80, key='pluck_pitch_min')
+                pluck_pitch_max = st.slider("Intonazione Massima (Hz)", 40, 1200, 400, key='pluck_pitch_max')
+                pluck_amp_min = st.slider("Ampiezza Minima", 0.0, 1.0, 0.3, step=0.01, key='pluck_amp_min')
+                pluck_amp_max = st.slider("Ampiezza Massima", 0.0, 1.0, 1.0, step=0.01, key='pluck_amp_max')
+                pluck_duration = st.slider(
+                    "Durata Massima Pizzicata (sec)", 0.1, 1.0, 0.4, step=0.05, key='pluck_duration',
+                    help="Quanto a lungo può risuonare una corda prima di essere tagliata."
+                )
+
+                params['pluck_density_source'] = pluck_density_source
+                params['pluck_pitch_source'] = pluck_pitch_source
+                params['pluck_damping_source'] = pluck_damping_source
+                params['pluck_amp_source'] = pluck_amp_source
+                params['pluck_density_range'] = (pluck_density_min, pluck_density_max)
+                params['pluck_pitch_range'] = (pluck_pitch_min, pluck_pitch_max)
+                params['pluck_amp_range'] = (pluck_amp_min, pluck_amp_max)
+                params['pluck_duration'] = pluck_duration
+
+                def _pluck_source_data(name):
+                    if name == "Luminosità": return luminosity_data
+                    if name == "Dettaglio": return detail_data
+                    if name == "Movimento": return movement_data
+                    if name == "Densità Contorni": return edge_density_data
+                    if name == "Variazione Colore": return color_variation_data
+                    return []
+
+                pluck_density_data_raw = _pluck_source_data(pluck_density_source)
+                pluck_pitch_data_raw = _pluck_source_data(pluck_pitch_source)
+                pluck_damping_data_raw = _pluck_source_data(pluck_damping_source)
+                pluck_amp_data_raw = _pluck_source_data(pluck_amp_source)
+
+                pluck_density_scaled = np.interp(pluck_density_data_raw, (min(pluck_density_data_raw) if pluck_density_data_raw else 0, max(pluck_density_data_raw) if pluck_density_data_raw else 1), (pluck_density_min, pluck_density_max)).tolist()
+                pluck_pitch_scaled = np.interp(pluck_pitch_data_raw, (min(pluck_pitch_data_raw) if pluck_pitch_data_raw else 0, max(pluck_pitch_data_raw) if pluck_pitch_data_raw else 1), (pluck_pitch_min, pluck_pitch_max)).tolist()
+                # Smorzamento normalizzato in [0,1] indipendentemente dal range della sorgente scelta
+                pluck_damping_scaled = np.interp(pluck_damping_data_raw, (min(pluck_damping_data_raw) if pluck_damping_data_raw else 0, max(pluck_damping_data_raw) if pluck_damping_data_raw else 1), (0.0, 1.0)).tolist()
+                pluck_amp_scaled = np.interp(pluck_amp_data_raw, (min(pluck_amp_data_raw) if pluck_amp_data_raw else 0, max(pluck_amp_data_raw) if pluck_amp_data_raw else 1), (pluck_amp_min, pluck_amp_max)).tolist()
+            else:
+                pluck_layer_gain = 0.0
+                pluck_density_scaled = []
+                pluck_pitch_scaled = []
+                pluck_damping_scaled = []
+                pluck_amp_scaled = []
+                pluck_duration = 0.4
+                params['pluck_duration'] = pluck_duration
 
         # Layer 4: Rumore (Basato su Variazione Movimento)
         with tab_noise:
@@ -1475,29 +1793,57 @@ def main():
                 params['original_audio_mix_level'] = original_audio_mix_level
             else:
                 params['original_audio_mix_level'] = 0.0
+            export_stems = st.checkbox(
+                "Esporta anche gli stems separati (ZIP)", value=False,
+                help="Oltre al video, genera uno ZIP con l'audio di ogni layer attivo separato "
+                     "(dry, prima degli effetti), da remixare in un DAW."
+            )
+            params['export_stems'] = export_stems
 
-        def build_combined_audio() -> np.ndarray:
+        def build_combined_audio(return_stems: bool = False):
             """Genera e mixa tutti i layer/effetti audio secondo i parametri già impostati
             nell'interfaccia (chiusura su tutte le variabili '..._scaled' calcolate sopra).
             Condivisa tra l'anteprima audio rapida e il render video finale, per non duplicare
-            la stessa logica in due punti che potrebbero disallinearsi nel tempo."""
+            la stessa logica in due punti che potrebbero disallinearsi nel tempo.
+
+            Se return_stems=True, restituisce anche un dizionario con l'audio 'dry' di ogni
+            singolo layer (già pesato dal proprio Volume Layer, ma prima di effetti/mix/master),
+            utile per un export stems separato da remixare in un DAW."""
             mixed_audio = np.zeros(audio_generator.total_samples, dtype=np.float32)
+            stems = {}
 
             if use_subtractive:
-                subtractive_audio = audio_generator.generate_subtractive_waveform(sub_freq_scaled, sub_amp_scaled, sub_waveform_type)
-                mixed_audio += subtractive_audio * sub_layer_gain
+                subtractive_audio = audio_generator.generate_subtractive_waveform(sub_freq_scaled, sub_amp_scaled, sub_waveform_type, band_limited=sub_band_limited)
+                if sub_filter_enabled:
+                    subtractive_audio = audio_generator.apply_resonant_filter(subtractive_audio, sub_cutoff_scaled, sub_resonance_scaled)
+                subtractive_audio = subtractive_audio * sub_layer_gain
+                mixed_audio += subtractive_audio
+                if return_stems:
+                    stems['sottrattiva'] = subtractive_audio
 
             if use_fm:
-                fm_audio = audio_generator.generate_fm_layer(fm_carrier_scaled, fm_mod_scaled, fm_mod_idx_scaled, fm_amp_scaled)
-                mixed_audio += fm_audio * fm_layer_gain
+                fm_audio = audio_generator.generate_fm_layer(fm_carrier_scaled, fm_mod_scaled, fm_mod_idx_scaled, fm_amp_scaled) * fm_layer_gain
+                mixed_audio += fm_audio
+                if return_stems:
+                    stems['fm'] = fm_audio
 
             if use_granular:
-                granular_audio = audio_generator.generate_granular_layer(gran_density_scaled, gran_duration_scaled, gran_amp_scaled, gran_pitch_scaled)
-                mixed_audio += granular_audio * gran_layer_gain
+                granular_audio = audio_generator.generate_granular_layer(gran_density_scaled, gran_duration_scaled, gran_amp_scaled, gran_pitch_scaled) * gran_layer_gain
+                mixed_audio += granular_audio
+                if return_stems:
+                    stems['granulare'] = granular_audio
+
+            if use_pluck:
+                pluck_audio = audio_generator.generate_pluck_layer(pluck_density_scaled, pluck_pitch_scaled, pluck_damping_scaled, pluck_amp_scaled, max_pluck_duration=pluck_duration) * pluck_layer_gain
+                mixed_audio += pluck_audio
+                if return_stems:
+                    stems['corde'] = pluck_audio
 
             if use_noise:
-                noise_audio = audio_generator.add_noise_layer(noise_amp_scaled)
-                mixed_audio += noise_audio * noise_layer_gain
+                noise_audio = audio_generator.add_noise_layer(noise_amp_scaled) * noise_layer_gain
+                mixed_audio += noise_audio
+                if return_stems:
+                    stems['rumore'] = noise_audio
 
             if use_glitch:
                 mixed_audio = audio_generator.apply_glitch_effect(mixed_audio, glitch_factor_scaled, glitch_intensity_data, glitch_type_weights)
@@ -1544,7 +1890,12 @@ def main():
                     mixed_audio = np.zeros_like(mixed_audio) # Mantieni a zero se già silenzioso
 
             # Assicurati che l'audio sia nel range [-1, 1] per soundfile
-            return np.clip(mixed_audio, -1.0, 1.0)
+            mixed_audio = np.clip(mixed_audio, -1.0, 1.0)
+
+            if return_stems:
+                stems = {name: np.clip(stem, -1.0, 1.0) for name, stem in stems.items()}
+                return mixed_audio, stems
+            return mixed_audio
 
         if st.button("🔊 Anteprima Audio (senza video)"):
             # Genera solo l'audio, senza toccare FFmpeg/video: pensata per iterare rapidamente
@@ -1565,7 +1916,7 @@ def main():
             progress_bar_audio.progress(10)
             status_text_audio.text("Generazione layer e applicazione effetti...")
 
-            combined_audio = build_combined_audio()
+            combined_audio, generated_stems = build_combined_audio(return_stems=True)
 
             progress_bar_audio.progress(90)
             status_text_audio.text("Scrittura file audio...")
@@ -1573,6 +1924,23 @@ def main():
             # audio_output_path è assegnato qui, sempre se il pulsante è cliccato
             audio_output_path = f"output_audio_{session_id}.wav"
             sf.write(audio_output_path, combined_audio, AUDIO_SAMPLE_RATE)
+
+            stems_zip_path = None
+            if export_stems and generated_stems:
+                stems_zip_path = f"stems_{session_id}.zip"
+                with zipfile.ZipFile(stems_zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+                    for stem_name, stem_audio in generated_stems.items():
+                        stem_wav_path = f"stem_{session_id}_{stem_name}.wav"
+                        sf.write(stem_wav_path, stem_audio, AUDIO_SAMPLE_RATE)
+                        zf.write(stem_wav_path, arcname=f"{stem_name}.wav")
+                        os.remove(stem_wav_path)  # il wav intermedio serve solo per scrivere nello zip
+                # Salva i bytes in session_state (stesso pattern del video finale), così il
+                # download persiste tra i rerun anche se il file su disco viene poi ripulito.
+                with open(stems_zip_path, "rb") as f:
+                    st.session_state['stems_zip_bytes'] = f.read()
+                os.remove(stems_zip_path)
+            else:
+                st.session_state['stems_zip_bytes'] = None
             
             progress_bar_audio.progress(100)
             status_text_audio.text("Audio generato!")
@@ -1734,6 +2102,12 @@ def main():
                         report_lines.append(field("frequenza", "frequency", f"{params['sub_freq_source']} ({params['sub_freq_range'][0]}-{params['sub_freq_range'][1]} Hz)", indent="  "))
                         report_lines.append(field("ampiezza", "amplitude", f"{params['sub_amp_source']} ({params['sub_amp_range'][0]:.2f}-{params['sub_amp_range'][1]:.2f})", indent="  "))
                         report_lines.append(field("forma d'onda", "waveform", params['sub_waveform_type'], indent="  "))
+                        if params['sub_waveform_type'] in ("square", "sawtooth"):
+                            report_lines.append(field("anti-aliasing", "anti-aliasing", "band-limited (PolyBLEP)" if params.get('sub_band_limited') else "grezzo / raw (aliasing voluto)", indent="  "))
+                        if params.get('sub_filter_enabled'):
+                            report_lines.append(field("filtro risonante", "resonant filter", f"cutoff {params.get('sub_cutoff_source', 'N/A')} ({params['sub_cutoff_range'][0]}-{params['sub_cutoff_range'][1]} Hz), Q {params.get('sub_resonance', 1.5):.1f}", indent="  "))
+                        else:
+                            report_lines.append(field("filtro risonante", "resonant filter", "disabilitato / disabled", indent="  "))
 
                     report_lines.append(field("sintesi fm", "fm synthesis", onoff(params.get('fm_enabled'))))
                     if params.get('fm_enabled'):
@@ -1751,6 +2125,14 @@ def main():
                         report_lines.append(field("ampiezza", "amplitude", f"{params['gran_amp_source']} ({params['gran_amp_range'][0]:.2f}-{params['gran_amp_range'][1]:.2f})", indent="  "))
                         if 'gran_pitch_range' in params:
                             report_lines.append(field("intonazione grani", "grain pitch", f"{params.get('gran_pitch_source', 'N/A')} ({params['gran_pitch_range'][0]}-{params['gran_pitch_range'][1]} Hz)", indent="  "))
+
+                    report_lines.append(field("corde (karplus-strong)", "strings (karplus-strong)", onoff(params.get('pluck_enabled'))))
+                    if params.get('pluck_enabled'):
+                        report_lines.append(field("volume layer", "layer volume", f"{params.get('pluck_layer_gain', 1.0):.2f}", indent="  "))
+                        report_lines.append(field("densità", "density", f"{params.get('pluck_density_source', 'N/A')} ({params['pluck_density_range'][0]}-{params['pluck_density_range'][1]} pizzicate/finestra)", indent="  "))
+                        report_lines.append(field("intonazione", "pitch", f"{params.get('pluck_pitch_source', 'N/A')} ({params['pluck_pitch_range'][0]}-{params['pluck_pitch_range'][1]} Hz)", indent="  "))
+                        report_lines.append(field("smorzamento", "damping", params.get('pluck_damping_source', 'N/A'), indent="  "))
+                        report_lines.append(field("durata massima", "max duration", f"{params.get('pluck_duration', 0.4):.2f} sec", indent="  "))
 
                     report_lines.append(field("rumore", "noise", onoff(params.get('noise_enabled'))))
                     if params.get('noise_enabled'):
@@ -1827,10 +2209,10 @@ def main():
         # ── PULSANTI DI DOWNLOAD PERSISTENTI ───────────────────────────────────
         # Sono fuori dal blocco if st.button → vengono renderizzati ad ogni rerun
         # senza riavviare la generazione. I dati vengono letti da session_state.
-        if st.session_state.get('video_bytes') or st.session_state.get('report_text'):
+        if st.session_state.get('video_bytes') or st.session_state.get('report_text') or st.session_state.get('stems_zip_bytes'):
             st.markdown("---")
             st.subheader("⬇️ Download")
-            dl_col1, dl_col2 = st.columns(2)
+            dl_col1, dl_col2, dl_col3 = st.columns(3)
             with dl_col1:
                 if st.session_state.get('video_bytes'):
                     st.download_button(
@@ -1848,6 +2230,15 @@ def main():
                         file_name=st.session_state.get('report_filename', f"{base_name_output}_report.txt"),
                         mime="text/plain",
                         key="dl_report"
+                    )
+            with dl_col3:
+                if st.session_state.get('stems_zip_bytes'):
+                    st.download_button(
+                        label="🎛️ Scarica Stems (ZIP)",
+                        data=st.session_state['stems_zip_bytes'],
+                        file_name=f"{base_name_output}_stems.zip",
+                        mime="application/zip",
+                        key="dl_stems"
                     )
 
 
