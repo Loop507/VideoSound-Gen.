@@ -7,6 +7,7 @@ import subprocess
 import gc
 import shutil
 import zipfile
+import hashlib
 import uuid
 from typing import Tuple
 import soundfile as sf
@@ -497,14 +498,28 @@ def analyze_video_frames(video_path: str) -> Tuple[list, list, list, list, list,
             vertical_mass_center_data, edge_density_data, color_variation_data, duration_seconds, fps)
 
 
+@st.cache_data(show_spinner="🎞️ Analisi del video in corso...")
+def analyze_video_frames_cached(video_path: str, file_hash: str) -> Tuple[list, list, list, list, list, list, list, list, float, float]:
+    """Wrapper cache di analyze_video_frames. Senza questa cache, Streamlit riesegue l'intero
+    script (e quindi anche l'analisi frame-per-frame del video, che decodifica ogni singolo
+    fotogramma con OpenCV) ad OGNI interazione con qualsiasi controllo dell'interfaccia — non solo
+    quando serve, ma anche solo spuntando una checkbox o spostando uno slider. Per un video di
+    qualche minuto questo significa ricalcolare tutto da capo più volte al secondo mentre l'utente
+    regola i parametri, rendendo l'interfaccia lenta e frustrante.
+
+    file_hash (non usato nel corpo della funzione) serve solo a rendere la chiave di cache dipendente
+    dal CONTENUTO del file, non solo dal suo path: il path include il nome del file originale, quindi
+    se un utente carica due video diversi con lo stesso nome nella stessa sessione, senza l'hash la
+    cache riuserebbe erroneamente l'analisi del primo video anche per il secondo."""
+    return analyze_video_frames(video_path)
+
+
 class AudioGenerator:
     def __init__(self, sample_rate: int, total_duration_seconds: float):
         self.sample_rate = sample_rate
         self.total_duration_seconds = total_duration_seconds
         self.total_samples = int(self.total_duration_seconds * self.sample_rate)
         self.time_array = np.linspace(0, self.total_duration_seconds, self.total_samples, endpoint=False)
-        # Calcola gli indici dei frame rispetto all'array temporale
-        self.frame_indices_in_time = np.linspace(0, len(self.time_array) - 1, len(self.time_array) // self.sample_rate + 1, endpoint=True, dtype=int)
 
 
     def _interp_data_to_audio_length(self, data_per_frame: list) -> np.ndarray:
@@ -1333,6 +1348,18 @@ class AudioGenerator:
         return np.stack([left_channel, right_channel], axis=1)
 
 
+@st.cache_resource(show_spinner=False)
+def get_audio_generator(sample_rate: int, total_duration_seconds: float) -> AudioGenerator:
+    """Crea (e riusa tra un rerun e l'altro) l'AudioGenerator per una data combinazione
+    sample_rate/durata. Costruire self.time_array nel costruttore — un array NumPy da milioni
+    di campioni per un video di qualche minuto — costa qualche centinaio di millisecondi;
+    senza questa cache verrebbe rifatto da capo ad OGNI interazione con l'interfaccia (ogni
+    checkbox o slider toccato fa ripartire l'intero script Streamlit), non solo quando serve
+    davvero. AudioGenerator non modifica mai il proprio stato dopo la costruzione (nessun
+    self.xxx = ... fuori da __init__), quindi riusare la stessa istanza tra i rerun è sicuro."""
+    return AudioGenerator(sample_rate=sample_rate, total_duration_seconds=total_duration_seconds)
+
+
 def main():
     st.set_page_config(layout="wide", page_title="VideoSound Gen. by Loop507", page_icon="🎵")
 
@@ -1390,7 +1417,12 @@ def main():
         with open(video_input_path, "wb") as f:
             f.write(uploaded_file.getbuffer())
 
-        luminosity_data, detail_data, movement_data, variation_movement_data, horizontal_mass_center_data, vertical_mass_center_data, edge_density_data, color_variation_data, duration_seconds, fps = analyze_video_frames(video_input_path)
+        # Hash del contenuto: usato come chiave di cache insieme al path (vedi il commento su
+        # analyze_video_frames_cached) per evitare che un video diverso con lo stesso nome file
+        # riusi per errore l'analisi di un video precedente nella stessa sessione.
+        file_hash = hashlib.md5(uploaded_file.getbuffer()).hexdigest()
+
+        luminosity_data, detail_data, movement_data, variation_movement_data, horizontal_mass_center_data, vertical_mass_center_data, edge_density_data, color_variation_data, duration_seconds, fps = analyze_video_frames_cached(video_input_path, file_hash)
 
         if duration_seconds == 0.0: # Se l'analisi fallisce o video troppo corto/lungo
             os.remove(video_input_path)
@@ -1426,7 +1458,7 @@ def main():
             st.session_state['_last_applied_preset'] = None
 
         # Inizializza AudioGenerator
-        audio_generator = AudioGenerator(sample_rate=AUDIO_SAMPLE_RATE, total_duration_seconds=duration_seconds)
+        audio_generator = get_audio_generator(AUDIO_SAMPLE_RATE, duration_seconds)
 
         # ── Melodia globale (quantizzazione a scala) ──────────────────────────────
         # Un unico controllo condiviso da tutti i layer con un'intonazione (sottrattiva, FM,
