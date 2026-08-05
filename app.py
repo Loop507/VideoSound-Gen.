@@ -514,6 +514,54 @@ def analyze_video_frames_cached(video_path: str, file_hash: str) -> Tuple[list, 
     return analyze_video_frames(video_path)
 
 
+def generate_synthetic_feature_curves(duration_seconds: float, fps: float = 30.0, seed: int = None
+                                       ) -> Tuple[list, list, list, list, list, list, list, list, float, float]:
+    """Genera 8 curve di controllo sintetiche al posto di quelle estratte da un video, per usare
+    VideoSound-Gen come strumento generativo standalone senza caricare alcun file. Restituisce
+    esattamente lo stesso formato di analyze_video_frames_cached (8 liste + durata + fps), quindi
+    tutto il resto della pipeline — layer, effetti, preset, Melodia — funziona invariato: non sa
+    (e non deve sapere) se sta 'guardando' un video vero o una traiettoria generata.
+
+    Ogni curva è una somma di 2-3 sinusoidi lente a frequenze/fasi indipendenti (diverse per ogni
+    feature, così luminosità/movimento/ecc. non si muovono mai in perfetto lock-step, che
+    suonerebbe artificiale) più un filo di rumore smussato, per un movimento organico e mai
+    esattamente periodico — lo stesso principio degli LFO multipli usati nei synth modulari."""
+    rng = np.random.RandomState(seed)
+    n_frames = max(2, int(duration_seconds * fps))
+    t = np.linspace(0, duration_seconds, n_frames)
+
+    def organic_curve(base_freq_hz: float, n_harmonics: int = 3, noise_amount: float = 0.15) -> list:
+        curve = np.zeros(n_frames)
+        for h in range(1, n_harmonics + 1):
+            freq = base_freq_hz * h * (0.7 + 0.6 * rng.rand())
+            phase = rng.uniform(0, 2 * np.pi)
+            curve += np.sin(2 * np.pi * freq * t + phase) / h
+        noise = rng.randn(n_frames)
+        smoothing_kernel = np.ones(5) / 5.0
+        noise = np.convolve(noise, smoothing_kernel, mode='same')
+        curve = curve + noise_amount * noise
+        curve = curve - curve.min()
+        if curve.max() > 1e-9:
+            curve = curve / curve.max()
+        return curve.tolist()
+
+    # Frequenze base diverse per ciascuna feature: più basse per quelle che nel video reale
+    # tendono a cambiare lentamente (luminosità, posizione), più alte per quelle più "nervose"
+    # (movimento, variazione movimento).
+    luminosity_data = organic_curve(0.05)
+    detail_data = organic_curve(0.08)
+    movement_data = organic_curve(0.12)
+    variation_movement_data = organic_curve(0.15)
+    horizontal_mass_center_data = organic_curve(0.03)
+    vertical_mass_center_data = organic_curve(0.04)
+    edge_density_data = organic_curve(0.07)
+    color_variation_data = organic_curve(0.06)
+
+    return (luminosity_data, detail_data, movement_data, variation_movement_data,
+            horizontal_mass_center_data, vertical_mass_center_data, edge_density_data,
+            color_variation_data, duration_seconds, fps)
+
+
 class AudioGenerator:
     def __init__(self, sample_rate: int, total_duration_seconds: float):
         self.sample_rate = sample_rate
@@ -1367,8 +1415,29 @@ def main():
     st.markdown("# VideoSound Gen. <small>by Loop507</small>", unsafe_allow_html=True)
     st.markdown("Crea colonne sonore uniche dai tuoi video, trasformando i dati visivi in paesaggi sonori dinamici.")
 
-    st.sidebar.header("Carica Video")
-    uploaded_file = st.sidebar.file_uploader("Scegli un file video (MP4, MOV, AVI, ecc.)", type=["mp4", "mov", "avi", "mkv"])
+    st.sidebar.header("Sorgente")
+    input_mode = st.sidebar.radio(
+        "Modalità", ["🎬 Da Video", "🎲 Generativa (senza video)"], key='input_mode',
+        help="'Generativa' usa VideoSound-Gen come sintetizzatore standalone: le stesse tecniche di "
+             "sintesi/effetti/preset, ma pilotate da curve procedurali (LFO + rumore smussato) invece "
+             "che dall'analisi di un video — comodo per creare un brano senza dover caricare nulla."
+    )
+    generative_mode = (input_mode == "🎲 Generativa (senza video)")
+
+    if generative_mode:
+        uploaded_file = None
+        st.sidebar.subheader("Impostazioni Generativa")
+        generative_duration = st.sidebar.slider("Durata Brano (sec)", 5, MAX_DURATION, 60, key='generative_duration')
+        generative_track_name = st.sidebar.text_input("Nome Traccia", value="traccia_generativa", key='generative_track_name')
+        generative_seed_enabled = st.sidebar.checkbox(
+            "Seed fisso (riproducibile)", value=False, key='generative_seed_on',
+            help="Se disattivo, ogni rigenerazione produce curve leggermente diverse. Se attivo, "
+                 "la stessa curva si ripete finché non cambi il seed."
+        )
+        generative_seed = st.sidebar.number_input("Seed", 0, 999999, 42, key='generative_seed') if generative_seed_enabled else None
+    else:
+        st.sidebar.header("Carica Video")
+        uploaded_file = st.sidebar.file_uploader("Scegli un file video (MP4, MOV, AVI, ecc.)", type=["mp4", "mov", "avi", "mkv"])
 
     # Variabili per memorizzare i parametri scelti dall'utente per la descrizione finale
     params = {}
@@ -1383,6 +1452,8 @@ def main():
         st.session_state['video_bytes'] = None
     if 'stems_zip_bytes' not in st.session_state:
         st.session_state['stems_zip_bytes'] = None
+    if 'generative_audio_bytes' not in st.session_state:
+        st.session_state['generative_audio_bytes'] = None
     if 'video_filename' not in st.session_state:
         st.session_state['video_filename'] = None
     if 'report_text' not in st.session_state:
@@ -1397,39 +1468,48 @@ def main():
         st.session_state['session_id'] = uuid.uuid4().hex[:8]
     session_id = st.session_state['session_id']
 
-    if uploaded_file is not None:
-        if not validate_video_file(uploaded_file):
-            # Se la validazione fallisce, pulisci il file caricato e termina
-            invalid_path = f"temp_input_{session_id}_{uploaded_file.name}"
-            if os.path.exists(invalid_path):
-                os.remove(invalid_path)
-            return
+    if uploaded_file is not None or generative_mode:
+        video_input_path = None  # resta None in modalità generativa: nessun file video reale
 
-        st.sidebar.success("✅ Video caricato con successo!")
+        if generative_mode:
+            luminosity_data, detail_data, movement_data, variation_movement_data, horizontal_mass_center_data, vertical_mass_center_data, edge_density_data, color_variation_data, duration_seconds, fps = generate_synthetic_feature_curves(
+                float(generative_duration), fps=30.0, seed=generative_seed
+            )
+            base_name_output = generative_track_name.strip() or "traccia_generativa"
 
-        # Pulisci eventuali file temporanei rimasti da un upload precedente in questa
-        # stessa sessione (es. utente carica un video, non completa la generazione,
-        # poi ne carica un altro: senza questa pulizia i vecchi file si accumulerebbero).
-        cleanup_session_temp_files(session_id)
+        else:
+            if not validate_video_file(uploaded_file):
+                # Se la validazione fallisce, pulisci il file caricato e termina
+                invalid_path = f"temp_input_{session_id}_{uploaded_file.name}"
+                if os.path.exists(invalid_path):
+                    os.remove(invalid_path)
+                return
 
-        # Salva il file temporaneamente, con nome univoco per sessione
-        video_input_path = f"temp_input_{session_id}_{uploaded_file.name}"
-        with open(video_input_path, "wb") as f:
-            f.write(uploaded_file.getbuffer())
+            st.sidebar.success("✅ Video caricato con successo!")
 
-        # Hash del contenuto: usato come chiave di cache insieme al path (vedi il commento su
-        # analyze_video_frames_cached) per evitare che un video diverso con lo stesso nome file
-        # riusi per errore l'analisi di un video precedente nella stessa sessione.
-        file_hash = hashlib.md5(uploaded_file.getbuffer()).hexdigest()
+            # Pulisci eventuali file temporanei rimasti da un upload precedente in questa
+            # stessa sessione (es. utente carica un video, non completa la generazione,
+            # poi ne carica un altro: senza questa pulizia i vecchi file si accumulerebbero).
+            cleanup_session_temp_files(session_id)
 
-        luminosity_data, detail_data, movement_data, variation_movement_data, horizontal_mass_center_data, vertical_mass_center_data, edge_density_data, color_variation_data, duration_seconds, fps = analyze_video_frames_cached(video_input_path, file_hash)
+            # Salva il file temporaneamente, con nome univoco per sessione
+            video_input_path = f"temp_input_{session_id}_{uploaded_file.name}"
+            with open(video_input_path, "wb") as f:
+                f.write(uploaded_file.getbuffer())
 
-        if duration_seconds == 0.0: # Se l'analisi fallisce o video troppo corto/lungo
-            os.remove(video_input_path)
-            return
+            # Hash del contenuto: usato come chiave di cache insieme al path (vedi il commento su
+            # analyze_video_frames_cached) per evitare che un video diverso con lo stesso nome file
+            # riusi per errore l'analisi di un video precedente nella stessa sessione.
+            file_hash = hashlib.md5(uploaded_file.getbuffer()).hexdigest()
 
-        # base_name_output è ora definito qui, prima dell'uso condizionale
-        base_name_output = os.path.splitext(uploaded_file.name)[0]
+            luminosity_data, detail_data, movement_data, variation_movement_data, horizontal_mass_center_data, vertical_mass_center_data, edge_density_data, color_variation_data, duration_seconds, fps = analyze_video_frames_cached(video_input_path, file_hash)
+
+            if duration_seconds == 0.0: # Se l'analisi fallisce o video troppo corto/lungo
+                os.remove(video_input_path)
+                return
+
+            # base_name_output è ora definito qui, prima dell'uso condizionale
+            base_name_output = os.path.splitext(uploaded_file.name)[0]
 
         st.subheader("Generazione Audio")
 
@@ -2208,9 +2288,15 @@ def main():
                 elevation_scaled = []
 
 
-        st.subheader("Impostazioni Output Video")
-        output_resolution_choice = st.selectbox("Formato Video Output", list(FORMAT_RESOLUTIONS.keys()))
-        params['output_resolution_choice'] = output_resolution_choice
+        if not generative_mode:
+            st.subheader("Impostazioni Output Video")
+            output_resolution_choice = st.selectbox("Formato Video Output", list(FORMAT_RESOLUTIONS.keys()))
+            params['output_resolution_choice'] = output_resolution_choice
+        else:
+            output_resolution_choice = None
+            params['output_resolution_choice'] = "N/A (modalità generativa)"
+
+        st.subheader("Impostazioni Output Audio")
 
         col_audio, col_video = st.columns(2)
         with col_audio:
@@ -2232,13 +2318,19 @@ def main():
             else:
                 params['saturation_drive'] = 1.0
         with col_video:
-            use_original_audio = st.checkbox("Mantieni Audio Originale del Video (Mix con quello generato)", value=False)
-            params['use_original_audio'] = use_original_audio
-            if use_original_audio:
-                original_audio_mix_level = st.slider("Livello Mix Audio Originale", 0.0, 1.0, 0.5, step=0.01)
-                params['original_audio_mix_level'] = original_audio_mix_level
+            if not generative_mode:
+                use_original_audio = st.checkbox("Mantieni Audio Originale del Video (Mix con quello generato)", value=False)
+                params['use_original_audio'] = use_original_audio
+                if use_original_audio:
+                    original_audio_mix_level = st.slider("Livello Mix Audio Originale", 0.0, 1.0, 0.5, step=0.01)
+                    params['original_audio_mix_level'] = original_audio_mix_level
+                else:
+                    params['original_audio_mix_level'] = 0.0
             else:
+                use_original_audio = False
+                params['use_original_audio'] = False
                 params['original_audio_mix_level'] = 0.0
+                st.caption("🎲 Modalità generativa: nessun audio originale da mantenere (nessun video caricato).")
             export_stems = st.checkbox(
                 "Esporta anche gli stems separati (ZIP)", value=False,
                 help="Oltre al video, genera uno ZIP con l'audio di ogni layer attivo separato "
@@ -2366,7 +2458,7 @@ def main():
             st.audio(preview_audio_path, format="audio/wav")
             gc.collect()
 
-        if st.button("Genera Video con Audio"):
+        if st.button("🎵 Genera Traccia Audio" if generative_mode else "Genera Video con Audio"):
             # Sempre tenta la generazione audio se il pulsante è cliccato
             st.info("🎵 Generazione e mixaggio audio in corso... Attendere.")
             progress_bar_audio = st.progress(0)
@@ -2407,8 +2499,24 @@ def main():
             
             gc.collect() # Libera memoria
 
-            # Ora controlla FFmpeg DOPO la generazione audio
-            if not check_ffmpeg():
+            # In modalità generativa non c'è nessun video da unire: offri direttamente l'audio,
+            # riusando lo stesso percorso già previsto per quando FFmpeg non è disponibile
+            # (stessa logica, messaggio diverso per non confondere "niente video" con un errore).
+            if generative_mode:
+                st.success(f"🎵 Traccia generativa pronta: '{base_name_output}'.")
+                with open(audio_output_path, "rb") as f:
+                    audio_bytes = f.read()
+                st.session_state['generative_audio_bytes'] = audio_bytes
+                st.download_button(
+                    "⬇️ Scarica Traccia Audio (WAV)",
+                    audio_bytes,
+                    file_name=f"{base_name_output}.wav",
+                    mime="audio/wav",
+                    key="dl_generative_audio_inline"
+                )
+                if os.path.exists(audio_output_path):
+                    os.remove(audio_output_path)
+            elif not check_ffmpeg():
                 st.warning(f"⚠️ FFmpeg non è installato o non è nel PATH. Impossibile unire il video con l'audio. L'audio generato è disponibile in '{audio_output_path}'.")
                 with open(audio_output_path, "rb") as f:
                     st.download_button(
@@ -2686,7 +2794,7 @@ def main():
         # ── PULSANTI DI DOWNLOAD PERSISTENTI ───────────────────────────────────
         # Sono fuori dal blocco if st.button → vengono renderizzati ad ogni rerun
         # senza riavviare la generazione. I dati vengono letti da session_state.
-        if st.session_state.get('video_bytes') or st.session_state.get('report_text') or st.session_state.get('stems_zip_bytes'):
+        if st.session_state.get('video_bytes') or st.session_state.get('report_text') or st.session_state.get('stems_zip_bytes') or st.session_state.get('generative_audio_bytes'):
             st.markdown("---")
             st.subheader("⬇️ Download")
             dl_col1, dl_col2, dl_col3 = st.columns(3)
@@ -2698,6 +2806,14 @@ def main():
                         file_name=st.session_state.get('video_filename', 'output_video.mp4'),
                         mime="video/mp4",
                         key="dl_video"
+                    )
+                if st.session_state.get('generative_audio_bytes'):
+                    st.download_button(
+                        label="🎵 Scarica Traccia Audio",
+                        data=st.session_state['generative_audio_bytes'],
+                        file_name=f"{base_name_output}.wav" if base_name_output else "traccia_generativa.wav",
+                        mime="audio/wav",
+                        key="dl_generative_audio"
                     )
             with dl_col2:
                 if st.session_state.get('report_text'):
