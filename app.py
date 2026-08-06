@@ -11,7 +11,7 @@ import hashlib
 import uuid
 from typing import Tuple
 import soundfile as sf
-from scipy.signal import butter, lfilter
+from scipy.signal import butter, lfilter, resample
 import re # Spostato qui per assicurare che sia importato all'inizio del modulo
 
 # Costanti globali (puoi modificarle)
@@ -560,6 +560,311 @@ def generate_synthetic_feature_curves(duration_seconds: float, fps: float = 30.0
     return (luminosity_data, detail_data, movement_data, variation_movement_data,
             horizontal_mass_center_data, vertical_mass_center_data, edge_density_data,
             color_variation_data, duration_seconds, fps)
+
+
+# ── SINTESI GRANULARE "A VIAGGIO" (audio in → audio out) ───────────────────
+# A differenza di generate_granular_layer (più sotto, nella classe AudioGenerator), che
+# sintetizza i grani da zero come onde sinusoidali pilotate dal video, questo motore preleva
+# i grani da un file audio realmente caricato dall'utente: è vera sintesi granulare per
+# ricampionamento, pensata per trasformare un suono esistente in un tappeto/texture continua
+# ("il viaggio"). Vive fuori dalla classe AudioGenerator perché non dipende dalle feature
+# video: la sua unica sorgente è il campione audio caricato.
+
+PRESET_GRANULAR_MANUALE = "🎛️ Manuale (nessun preset)"
+
+GRANULAR_JOURNEY_PRESETS = {
+    "🌫️ Deriva Ambientale": {
+        'grain_size_start_ms': 60, 'grain_size_end_ms': 140,
+        'density_start': 8, 'density_end': 14,
+        'position_mode': "Deriva (random walk)", 'position_drift_speed': 0.06,
+        'pitch_shift_start': 0.0, 'pitch_shift_end': 0.0, 'pitch_jitter_semitones': 0.3,
+        'stereo_spread': 0.6,
+    },
+    "🌊 Drone Denso": {
+        'grain_size_start_ms': 120, 'grain_size_end_ms': 280,
+        'density_start': 18, 'density_end': 28,
+        'position_mode': "Statica (punto fisso + jitter)", 'position_drift_speed': 0.01,
+        'pitch_shift_start': -2.0, 'pitch_shift_end': 2.0, 'pitch_jitter_semitones': 0.15,
+        'stereo_spread': 0.4,
+    },
+    "✨ Frammentato / Glitch": {
+        'grain_size_start_ms': 5, 'grain_size_end_ms': 25,
+        'density_start': 22, 'density_end': 40,
+        'position_mode': "Scatter (salti casuali)", 'position_drift_speed': 0.3,
+        'pitch_shift_start': 0.0, 'pitch_shift_end': 0.0, 'pitch_jitter_semitones': 2.5,
+        'stereo_spread': 0.9,
+    },
+    "🌀 Attraversamento Lineare": {
+        'grain_size_start_ms': 40, 'grain_size_end_ms': 90,
+        'density_start': 10, 'density_end': 18,
+        'position_mode': "Sweep (attraversa il campione)", 'position_drift_speed': 0.0,
+        'pitch_shift_start': 0.0, 'pitch_shift_end': 0.0, 'pitch_jitter_semitones': 0.5,
+        'stereo_spread': 0.5,
+    },
+    "🎐 Cristallino / Rarefatto": {
+        'grain_size_start_ms': 15, 'grain_size_end_ms': 45,
+        'density_start': 3, 'density_end': 7,
+        'position_mode': "Deriva (random walk)", 'position_drift_speed': 0.15,
+        'pitch_shift_start': 5.0, 'pitch_shift_end': 12.0, 'pitch_jitter_semitones': 1.0,
+        'stereo_spread': 0.7,
+    },
+}
+
+GRANULAR_POSITION_MODES = [
+    "Deriva (random walk)", "Sweep (attraversa il campione)",
+    "Scatter (salti casuali)", "Statica (punto fisso + jitter)",
+]
+
+
+def load_audio_mono(file_path: str, target_sr: int) -> Tuple[np.ndarray, int]:
+    """Carica un file audio qualsiasi (wav/mp3/flac/...) e lo restituisce mono, alla
+    sample rate target usata dal resto dell'app."""
+    data, sr = sf.read(file_path, always_2d=False)
+    if data.ndim > 1:
+        data = np.mean(data, axis=1)
+    data = data.astype(np.float32)
+    if sr != target_sr and len(data) > 1:
+        n_target = max(1, int(len(data) * target_sr / sr))
+        data = resample(data, n_target).astype(np.float32)
+        sr = target_sr
+    return data, sr
+
+
+def generate_granular_journey(source_audio: np.ndarray, sr: int, output_duration_sec: float,
+                               grain_size_start_ms: float, grain_size_end_ms: float,
+                               density_start: float, density_end: float,
+                               position_mode: str, position_drift_speed: float,
+                               pitch_shift_start: float, pitch_shift_end: float,
+                               pitch_jitter_semitones: float, stereo_spread: float,
+                               seed: int = None) -> np.ndarray:
+    """Motore di sintesi granulare a "viaggio": preleva grani (finestrati con inviluppo Hann,
+    come richiesto da qualunque sintesi granulare per evitare click) dal campione sorgente,
+    muovendo nel tempo posizione di lettura, densità, dimensione del grano e intonazione,
+    così la texture evolve invece di restare statica. La durata dell'audio generato è
+    indipendente dalla durata del campione sorgente: il puntatore di lettura può percorrerlo
+    più volte, restare fermo, o attraversarlo linearmente a seconda della modalità scelta.
+    Restituisce audio stereo (N, 2) in virgola mobile, range approssimativo [-1, 1]."""
+    rng = np.random.RandomState(seed)
+    n_source = len(source_audio)
+    n_out = max(1, int(sr * output_duration_sec))
+    output = np.zeros((n_out, 2), dtype=np.float32)
+
+    if n_source < 64:
+        return output
+
+    block_samples = 2048  # ~46ms a 44100Hz: granularità con cui evolvono i parametri nel tempo
+    n_blocks = max(1, int(np.ceil(n_out / block_samples)))
+
+    read_pos = rng.uniform(0, n_source * 0.3)  # punto di partenza casuale nel primo terzo del campione
+
+    for b in range(n_blocks):
+        block_start = b * block_samples
+        block_end = min(block_start + block_samples, n_out)
+        block_len = block_end - block_start
+        if block_len <= 0:
+            continue
+
+        t_norm = block_start / max(1, n_out - 1)  # 0..1 lungo il brano generato: guida l'automazione
+
+        grain_size_ms = grain_size_start_ms + (grain_size_end_ms - grain_size_start_ms) * t_norm
+        density = density_start + (density_end - density_start) * t_norm
+        pitch_shift = pitch_shift_start + (pitch_shift_end - pitch_shift_start) * t_norm
+
+        grain_dur_samples = max(16, int(sr * grain_size_ms / 1000.0))
+        num_grains = max(0, int(round(density * (block_len / sr))))
+
+        max_start_in_source = max(0, n_source - grain_dur_samples)
+        if position_mode == "Sweep (attraversa il campione)":
+            read_pos = t_norm * max_start_in_source
+        elif position_mode == "Scatter (salti casuali)":
+            if rng.rand() < 0.4:  # salto improvviso a un punto casuale, non un movimento continuo
+                read_pos = rng.uniform(0, max_start_in_source)
+        elif position_mode == "Statica (punto fisso + jitter)":
+            pass  # il jitter per-grano più sotto basta a dare micro-movimento
+        else:  # "Deriva (random walk)"
+            step = position_drift_speed * n_source * (block_len / sr) * rng.uniform(-1, 1)
+            read_pos = float(np.clip(read_pos + step, 0, max_start_in_source))
+
+        if num_grains == 0:
+            continue
+
+        hann = np.hanning(grain_dur_samples).astype(np.float32)
+        grain_starts_out = rng.randint(block_start, block_end, size=num_grains)
+        position_jitter_samples = grain_dur_samples * 2
+
+        for g in range(num_grains):
+            jitter_semis = rng.uniform(-pitch_jitter_semitones, pitch_jitter_semitones)
+            pitch_ratio = 2.0 ** ((pitch_shift + jitter_semis) / 12.0)
+
+            src_len = max(8, int(grain_dur_samples * pitch_ratio))
+            src_start = int(np.clip(
+                read_pos + rng.uniform(-position_jitter_samples, position_jitter_samples),
+                0, max(0, n_source - src_len)
+            ))
+            grain_src = source_audio[src_start:src_start + src_len]
+            if len(grain_src) < 8:
+                continue
+
+            grain = resample(grain_src, grain_dur_samples).astype(np.float32) if src_len != grain_dur_samples else grain_src.astype(np.float32)
+
+            win_len = min(len(grain), len(hann))
+            grain_windowed = grain[:win_len] * hann[:win_len]
+
+            pan = float(np.clip(0.5 + stereo_spread * rng.uniform(-0.5, 0.5), 0.0, 1.0))
+            gain_l, gain_r = np.sqrt(1.0 - pan), np.sqrt(pan)
+
+            out_start = grain_starts_out[g]
+            out_end = min(out_start + win_len, n_out)
+            actual_len = out_end - out_start
+            if actual_len <= 0:
+                continue
+
+            output[out_start:out_end, 0] += grain_windowed[:actual_len] * gain_l * 0.35
+            output[out_start:out_end, 1] += grain_windowed[:actual_len] * gain_r * 0.35
+
+    return output
+
+
+def handle_granular_audio_mode(session_id: str) -> None:
+    """UI + generazione completa per la modalità 'Granulare da Audio': carica un file audio,
+    lo trasforma in tappeto/texture tramite generate_granular_journey, offre download audio
+    e report. Percorso indipendente dal resto della pipeline video-driven/generativa."""
+    st.sidebar.header("Carica Audio")
+    uploaded_audio = st.sidebar.file_uploader(
+        "Scegli un file audio (WAV, MP3, FLAC, OGG, M4A)",
+        type=["wav", "mp3", "flac", "ogg", "m4a"], key='granular_audio_upload'
+    )
+
+    if 'granular_audio_bytes' not in st.session_state:
+        st.session_state['granular_audio_bytes'] = None
+    if 'granular_report_text' not in st.session_state:
+        st.session_state['granular_report_text'] = None
+
+    if uploaded_audio is None:
+        st.info("Carica un file audio dalla sidebar per iniziare a costruire il tuo tappeto granulare.")
+        return
+
+    st.subheader("🎧 Sintesi Granulare — Tappeto / Viaggio")
+    st.caption(
+        "Il motore preleva minuscoli frammenti (grani) dal file caricato e li ricompone in una "
+        "texture continua che evolve nel tempo: posizione di lettura, densità, dimensione dei "
+        "grani e intonazione si muovono lungo il brano generato invece di restare fissi — "
+        "il 'viaggio' attraverso il suono."
+    )
+
+    audio_input_path = f"temp_granular_input_{session_id}_{uploaded_audio.name}"
+    with open(audio_input_path, "wb") as f:
+        f.write(uploaded_audio.getbuffer())
+
+    try:
+        source_audio, sr = load_audio_mono(audio_input_path, AUDIO_SAMPLE_RATE)
+    except Exception as e:
+        st.error(f"Impossibile leggere il file audio: {e}")
+        return
+    finally:
+        if os.path.exists(audio_input_path):
+            os.remove(audio_input_path)
+
+    if len(source_audio) < 64:
+        st.error("File audio troppo corto o non leggibile.")
+        return
+
+    source_duration = len(source_audio) / sr
+    st.caption(f"Campione sorgente: {source_duration:.1f} sec, {sr} Hz (convertito internamente in mono).")
+
+    preset_options = [PRESET_GRANULAR_MANUALE] + list(GRANULAR_JOURNEY_PRESETS.keys())
+    selected_preset = st.selectbox("Preset di viaggio", preset_options, key='granular_preset_choice')
+    preset_vals = GRANULAR_JOURNEY_PRESETS.get(selected_preset, {})
+
+    def pv(key, default):
+        return preset_vals.get(key, default)
+
+    output_duration = st.slider("Durata del tappeto generato (sec)", 5, MAX_DURATION, 60, key='granular_output_duration')
+
+    with st.expander("🎛️ Parametri (override manuale)", expanded=(selected_preset == PRESET_GRANULAR_MANUALE)):
+        col1, col2 = st.columns(2)
+        with col1:
+            grain_size_start = st.slider("Dimensione grano — inizio (ms)", 2, 300, int(pv('grain_size_start_ms', 60)), key='gj_size_start')
+            grain_size_end = st.slider("Dimensione grano — fine (ms)", 2, 300, int(pv('grain_size_end_ms', 140)), key='gj_size_end')
+            density_start = st.slider("Densità — inizio (grani/sec)", 1, 50, int(pv('density_start', 8)), key='gj_dens_start')
+            density_end = st.slider("Densità — fine (grani/sec)", 1, 50, int(pv('density_end', 14)), key='gj_dens_end')
+        with col2:
+            position_mode = st.selectbox(
+                "Movimento della posizione di lettura", GRANULAR_POSITION_MODES,
+                index=GRANULAR_POSITION_MODES.index(pv('position_mode', "Deriva (random walk)")),
+                key='gj_position_mode'
+            )
+            position_drift_speed = st.slider("Velocità di deriva", 0.0, 1.0, float(pv('position_drift_speed', 0.05)), step=0.01, key='gj_drift_speed')
+            pitch_shift_start = st.slider("Intonazione — inizio (semitoni)", -24.0, 24.0, float(pv('pitch_shift_start', 0.0)), key='gj_pitch_start')
+            pitch_shift_end = st.slider("Intonazione — fine (semitoni)", -24.0, 24.0, float(pv('pitch_shift_end', 0.0)), key='gj_pitch_end')
+
+        pitch_jitter = st.slider("Jitter intonazione per grano (semitoni)", 0.0, 6.0, float(pv('pitch_jitter_semitones', 0.3)), step=0.1, key='gj_pitch_jitter')
+        stereo_spread = st.slider("Ampiezza stereo", 0.0, 1.0, float(pv('stereo_spread', 0.6)), step=0.05, key='gj_stereo_spread')
+
+    seed_enabled = st.checkbox("Seed fisso (riproducibile)", value=False, key='gj_seed_on')
+    seed = st.number_input("Seed", 0, 999999, 42, key='gj_seed') if seed_enabled else None
+
+    if st.button("🌫️ Genera Tappeto Granulare"):
+        with st.spinner("Generazione grani in corso..."):
+            result = generate_granular_journey(
+                source_audio, sr, float(output_duration),
+                grain_size_start, grain_size_end,
+                density_start, density_end,
+                position_mode, position_drift_speed,
+                pitch_shift_start, pitch_shift_end,
+                pitch_jitter, stereo_spread,
+                seed=seed,
+            )
+            peak = np.max(np.abs(result))
+            if peak > 1e-6:
+                result = result / peak * 0.95
+            result = np.clip(result, -1.0, 1.0)
+
+            base_name = os.path.splitext(uploaded_audio.name)[0]
+            out_filename = f"{base_name}_granular_journey.wav"
+            out_path = f"temp_granular_output_{session_id}.wav"
+            sf.write(out_path, result, sr)
+            with open(out_path, "rb") as f:
+                audio_bytes = f.read()
+            os.remove(out_path)
+
+            st.session_state['granular_audio_bytes'] = audio_bytes
+            st.session_state['granular_audio_filename'] = out_filename
+
+            report_lines = [
+                ":: loop507 :: sintesi granulare — tappeto / viaggio",
+                f":: sorgente / source: {uploaded_audio.name} ({source_duration:.1f}s)",
+                f":: durata generata / generated duration: {output_duration}s",
+                f":: preset: {selected_preset}",
+                f":: dimensione grano / grain size: {grain_size_start}–{grain_size_end} ms",
+                f":: densità / density: {density_start}–{density_end} grani/sec",
+                f":: movimento posizione / position movement: {position_mode}",
+                f":: velocità deriva / drift speed: {position_drift_speed}",
+                f":: intonazione / pitch: {pitch_shift_start}–{pitch_shift_end} semitoni",
+                f":: jitter intonazione / pitch jitter: ±{pitch_jitter} semitoni",
+                f":: ampiezza stereo / stereo spread: {stereo_spread}",
+                ":: #loop507 #glitchbrutalista #sintesigranulare #granularsynthesis",
+            ]
+            st.session_state['granular_report_text'] = "\n".join(report_lines)
+
+        st.success("Tappeto granulare generato!")
+
+    if st.session_state.get('granular_audio_bytes'):
+        st.markdown("---")
+        st.audio(st.session_state['granular_audio_bytes'], format='audio/wav')
+        dl_col1, dl_col2 = st.columns(2)
+        with dl_col1:
+            st.download_button(
+                "🎵 Scarica Tappeto Granulare", data=st.session_state['granular_audio_bytes'],
+                file_name=st.session_state.get('granular_audio_filename', 'tappeto_granulare.wav'),
+                mime="audio/wav", key="dl_granular_audio",
+            )
+        with dl_col2:
+            if st.session_state.get('granular_report_text'):
+                st.download_button(
+                    "📄 Scarica Report", data=st.session_state['granular_report_text'],
+                    file_name="report_granulare.txt", mime="text/plain", key="dl_granular_report",
+                )
 
 
 class AudioGenerator:
@@ -1417,14 +1722,20 @@ def main():
 
     st.sidebar.header("Sorgente")
     input_mode = st.sidebar.radio(
-        "Modalità", ["🎬 Da Video", "🎲 Generativa (senza video)"], key='input_mode',
+        "Modalità", ["🎬 Da Video", "🎲 Generativa (senza video)", "🎧 Granulare da Audio"], key='input_mode',
         help="'Generativa' usa VideoSound-Gen come sintetizzatore standalone: le stesse tecniche di "
              "sintesi/effetti/preset, ma pilotate da curve procedurali (LFO + rumore smussato) invece "
-             "che dall'analisi di un video — comodo per creare un brano senza dover caricare nulla."
+             "che dall'analisi di un video — comodo per creare un brano senza dover caricare nulla. "
+             "'Granulare da Audio' carica un file audio esistente e lo trasforma in un tappeto/texture "
+             "continua tramite vera sintesi granulare per ricampionamento (non sintetica): posizione, "
+             "densità, dimensione dei grani e intonazione evolvono nel tempo — il 'viaggio' attraverso il suono."
     )
     generative_mode = (input_mode == "🎲 Generativa (senza video)")
+    granular_mode = (input_mode == "🎧 Granulare da Audio")
 
-    if generative_mode:
+    if granular_mode:
+        uploaded_file = None
+    elif generative_mode:
         uploaded_file = None
         st.sidebar.subheader("Impostazioni Generativa")
         generative_duration = st.sidebar.slider("Durata Brano (sec)", 5, MAX_DURATION, 60, key='generative_duration')
@@ -1467,6 +1778,10 @@ def main():
     if 'session_id' not in st.session_state:
         st.session_state['session_id'] = uuid.uuid4().hex[:8]
     session_id = st.session_state['session_id']
+
+    if granular_mode:
+        handle_granular_audio_mode(session_id)
+        return
 
     if uploaded_file is not None or generative_mode:
         video_input_path = None  # resta None in modalità generativa: nessun file video reale
