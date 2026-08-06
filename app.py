@@ -671,7 +671,13 @@ def generate_granular_journey(source_audio: np.ndarray, sr: int, output_duration
         pitch_shift = pitch_shift_start + (pitch_shift_end - pitch_shift_start) * t_norm
 
         grain_dur_samples = max(16, int(sr * grain_size_ms / 1000.0))
-        num_grains = max(0, int(round(density * (block_len / sr))))
+        # Poisson invece di round(): con blocchi da ~46ms e densità basse (es. 8 grani/sec →
+        # ~0.37 grani/blocco), arrotondare azzererebbe sistematicamente i grani finché la
+        # densità non supera ~0.5/blocco (~10.8 grani/sec) — un intero preset "rado" può
+        # restare completamente muto per i primi secondi/decine di secondi. Poisson genera
+        # grani in modo probabilistico anche con densità frazionarie, come gocce di pioggia
+        # che cadono a un ritmo medio invece che tutte insieme o mai.
+        num_grains = int(rng.poisson(max(0.0, density * (block_len / sr))))
 
         max_start_in_source = max(0, n_source - grain_dur_samples)
         if position_mode == "Sweep (attraversa il campione)":
