@@ -19,6 +19,7 @@ MAX_DURATION = 300  # Durata massima del video in secondi
 MIN_DURATION = 1.0  # Durata minima del video in secondi
 MAX_FILE_SIZE = 50 * 1024 * 1024  # Dimensione massima del file (50 MB)
 AUDIO_SAMPLE_RATE = 44100 # Frequenza di campionamento per l'audio generato
+ANALYSIS_MAX_WIDTH = 0    # Larghezza massima dei frame usati SOLO per l'analisi (0 = fedele alla risoluzione originale; es. 480 = più veloce ma sposta un po' i valori di movimento/contorni)
 
 # Definizioni delle risoluzioni per i formati
 FORMAT_RESOLUTIONS = {
@@ -374,38 +375,39 @@ def analyze_video_frames(video_path: str) -> Tuple[list, list, list, list, list,
     """
     Analizza i frame di un video per estrarre dati visivi.
 
-    Args:
-        video_path (str): Il percorso del file video da analizzare.
+    Funzione PURA: non chiama nessun elemento di interfaccia Streamlit (è eseguita dentro una
+    funzione con st.cache_data, dove gli elementi UI verrebbero riprodotti ad ogni cache hit).
+    In caso di errore solleva ValueError con il messaggio da mostrare all'utente; il chiamante
+    si occupa di visualizzarlo.
+
+    Per velocità i frame più larghi di ANALYSIS_MAX_WIDTH vengono ridimensionati prima di
+    calcolare le feature (le feature sono tutte normalizzate 0-1, quindi non dipendono dalla
+    risoluzione assoluta, salvo piccole differenze su dettaglio e densità contorni).
 
     Returns:
-        Tuple[list, list, list, list, list, list, list, list, float, float]: Una tupla contenente liste di dati
-        per luminosità, dettaglio, movimento, variazione del movimento, centro di massa orizzontale,
-        centro di massa verticale, densità contorni, variazione colore, la durata effettiva del video in secondi,
-        e il frame rate (FPS) del video.
+        Tupla: luminosità, dettaglio, movimento, variazione del movimento, centro di massa
+        orizzontale, centro di massa verticale, densità contorni, variazione colore (liste),
+        durata effettiva in secondi e FPS.
     """
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
-        st.error(f"❌ Impossibile aprire il video: {video_path}")
-        return [], [], [], [], [], [], [], [], 0.0, 0.0
+        raise ValueError(f"❌ Impossibile aprire il video: {video_path}")
 
     frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     fps = cap.get(cv2.CAP_PROP_FPS)
 
     if not fps or fps <= 0 or frame_count <= 0:
-        st.error("❌ Impossibile leggere frame rate/numero di frame dal video. Il file potrebbe essere corrotto o in un formato non supportato.")
         cap.release()
-        return [], [], [], [], [], [], [], [], 0.0, 0.0
+        raise ValueError("❌ Impossibile leggere frame rate/numero di frame dal video. Il file potrebbe essere corrotto o in un formato non supportato.")
 
     duration_seconds = frame_count / fps
 
     if duration_seconds > MAX_DURATION:
-        st.error(f"❌ Video troppo lungo. Durata massima consentita: {MAX_DURATION} secondi. Il tuo video è di {duration_seconds:.2f} secondi.")
         cap.release()
-        return [], [], [], [], [], [], [], [], 0.0, 0.0
+        raise ValueError(f"❌ Video troppo lungo. Durata massima consentita: {MAX_DURATION} secondi. Il tuo video è di {duration_seconds:.2f} secondi.")
     if duration_seconds < MIN_DURATION:
-        st.error(f"❌ Video troppo corto. Durata minima consentita: {MIN_DURATION} secondi. Il tuo video è di {duration_seconds:.2f} secondi.")
         cap.release()
-        return [], [], [], [], [], [], [], [], 0.0, 0.0
+        raise ValueError(f"❌ Video troppo corto. Durata minima consentita: {MIN_DURATION} secondi. Il tuo video è di {duration_seconds:.2f} secondi.")
 
     luminosity_data = []
     detail_data = [] # Misurato come deviazione standard dell'intensità dei pixel
@@ -419,71 +421,62 @@ def analyze_video_frames(video_path: str) -> Tuple[list, list, list, list, list,
     prev_gray_frame = None
     prev_movement = 0.0
 
-    st.info("🎬 Analisi dei frame video in corso...")
-    progress_bar = st.progress(0)
-    status_text = st.empty()
-
-    current_frame_idx = 0
     while True:
         ret, frame = cap.read()
         if not ret:
             break
 
+        # Ridimensiona (solo per l'analisi) se il frame è più largo del limite
+        h, w = frame.shape[:2]
+        if ANALYSIS_MAX_WIDTH and w > ANALYSIS_MAX_WIDTH:
+            new_h = max(1, int(round(h * ANALYSIS_MAX_WIDTH / w)))
+            frame = cv2.resize(frame, (ANALYSIS_MAX_WIDTH, new_h), interpolation=cv2.INTER_AREA)
+            h, w = frame.shape[:2]
+
         gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-        # Luminosità (media intensità dei pixel)
-        luminosity = np.mean(gray_frame) / 255.0 # Normalizzato tra 0 e 1
-        luminosity_data.append(luminosity)
-
-        # Dettaglio (deviazione standard dell'intensità dei pixel)
-        detail = np.std(gray_frame) / 255.0 # Normalizzato tra 0 e 1
-        detail_data.append(detail)
+        # Luminosità (media intensità dei pixel) e dettaglio (deviazione standard) in un solo passaggio
+        mean_val, std_val = cv2.meanStdDev(gray_frame)
+        luminosity_data.append(float(mean_val[0][0]) / 255.0)
+        detail_data.append(float(std_val[0][0]) / 255.0)
 
         # Movimento (differenza assoluta media tra frame consecutivi)
         current_movement = 0.0
         if prev_gray_frame is not None:
             diff = cv2.absdiff(gray_frame, prev_gray_frame)
-            current_movement = np.mean(diff) / 255.0 # Normalizzato tra 0 e 1
+            current_movement = float(np.mean(diff)) / 255.0 # Normalizzato tra 0 e 1
         movement_data.append(current_movement)
 
         # Variazione del movimento (differenza tra movimento corrente e precedente)
         variation_movement_data.append(abs(current_movement - prev_movement))
 
-        # Centro di massa orizzontale (per il panning)
-        # Calcola i momenti di ordine 0 e 1 per trovare il centro
+        # Centro di massa (orizzontale per il panning, verticale per l'altezza)
         M = cv2.moments(gray_frame)
-        if M['m00'] != 0 and np.sum(gray_frame) > 0: # Evita divisione per zero e frame completamente neri
+        if M['m00'] != 0: # Evita divisione per zero e frame completamente neri
             cx = int(M['m10'] / M['m00'])
-            horizontal_mass_center_data.append(cx / frame.shape[1]) # Normalizzato tra 0 e 1
             cy = int(M['m01'] / M['m00'])
-            vertical_mass_center_data.append(cy / frame.shape[0]) # 0=alto del frame, 1=basso del frame
+            horizontal_mass_center_data.append(cx / w) # Normalizzato tra 0 e 1
+            vertical_mass_center_data.append(cy / h) # 0=alto del frame, 1=basso del frame
         else:
             horizontal_mass_center_data.append(0.5) # Centro se il frame è vuoto o scuro
             vertical_mass_center_data.append(0.5)
 
-        # Densità contorni (magnitudine media del gradiente Sobel) - utile per pattern/linee/geometrie
-        sobel_x = cv2.Sobel(gray_frame, cv2.CV_64F, 1, 0, ksize=3)
-        sobel_y = cv2.Sobel(gray_frame, cv2.CV_64F, 0, 1, ksize=3)
-        edge_magnitude = np.sqrt(sobel_x**2 + sobel_y**2)
-        edge_density = np.mean(edge_magnitude) / 255.0 # Normalizzato approssimativamente tra 0 e 1
+        # Densità contorni (magnitudine media del gradiente Sobel) - float32 invece di float64
+        sobel_x = cv2.Sobel(gray_frame, cv2.CV_32F, 1, 0, ksize=3)
+        sobel_y = cv2.Sobel(gray_frame, cv2.CV_32F, 0, 1, ksize=3)
+        edge_magnitude = cv2.magnitude(sobel_x, sobel_y)
+        edge_density = float(np.mean(edge_magnitude)) / 255.0 # Normalizzato approssimativamente tra 0 e 1
         edge_density_data.append(min(edge_density, 1.0))
 
         # Variazione colore (deviazione standard della tonalità/Hue) - utile per varietà cromatica
         hsv_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        hue_channel = hsv_frame[:, :, 0]
-        color_variation = np.std(hue_channel) / 180.0 # Hue in OpenCV va da 0 a 179
+        color_variation = float(np.std(hsv_frame[:, :, 0])) / 180.0 # Hue in OpenCV va da 0 a 179
         color_variation_data.append(min(color_variation, 1.0))
 
         prev_gray_frame = gray_frame
         prev_movement = current_movement
 
-        current_frame_idx += 1
-        progress = int((current_frame_idx / frame_count) * 100)
-        progress_bar.progress(progress)
-        status_text.text(f"Analisi frame: {current_frame_idx}/{frame_count}")
-
     cap.release()
-    st.success("✅ Analisi video completata!")
 
     # Assicurati che tutti gli array abbiano la stessa lunghezza finale
     max_len = len(luminosity_data)
@@ -1093,19 +1086,23 @@ class AudioGenerator:
         mod_idx_interp = self._interp_data_to_audio_length(mod_idx_data)
         amp_interp = self._interp_data_to_audio_length(amp_data)
 
-        audio = np.zeros(self.total_samples)
+        # Stessa matematica di prima, ma con operazioni in-place e liberando subito i temporanei:
+        # su 300 s ogni array float64 pesa ~106 MB e la versione precedente ne teneva ~10 vivi insieme.
+        mod_phase = np.cumsum(2 * np.pi * mod_freq_interp / self.sample_rate)
+        del mod_freq_interp
+        np.sin(mod_phase, out=mod_phase)              # segnale modulante
+        mod_idx_interp *= mod_phase                   # indice * modulante
+        del mod_phase
 
-        mod_phase_increment = 2 * np.pi * mod_freq_interp / self.sample_rate
-        carrier_phase_increment = 2 * np.pi * carrier_freq_interp / self.sample_rate
+        carrier_phase = np.cumsum(2 * np.pi * carrier_freq_interp / self.sample_rate)
+        del carrier_freq_interp
+        carrier_phase += mod_idx_interp
+        del mod_idx_interp
+        np.sin(carrier_phase, out=carrier_phase)      # segnale portante modulato
 
-        mod_phase = np.cumsum(mod_phase_increment)
-        carrier_phase = np.cumsum(carrier_phase_increment)
-
-        modulator_signal = np.sin(mod_phase)
-        carrier_signal = np.sin(carrier_phase + mod_idx_interp * modulator_signal)
-
-        audio = carrier_signal * amp_interp * 0.5
-        return audio
+        carrier_phase *= amp_interp
+        carrier_phase *= 0.5
+        return carrier_phase
 
     def _karplus_strong_pluck(self, D: int, duration_samples: int, g: float, hammer_hardness: float = 0.0) -> np.ndarray:
         """Calcola una singola pizzicata Karplus-Strong: y[n] = eccitazione[n] per n<D (lunga
@@ -1601,51 +1598,43 @@ class AudioGenerator:
         else:
             audio_array_processed = audio_array
 
-        eq_audio = np.copy(audio_array_processed)
-
-        low_gain_interp = self._interp_data_to_audio_length(low_gain_data)
-        mid_gain_interp = self._interp_data_to_audio_length(mid_gain_data)
-        high_gain_interp = self._interp_data_to_audio_length(high_gain_data)
+        # lfilter non modifica l'input: la copia completa dell'audio non serve.
+        eq_audio = audio_array_processed
 
         nyquist = 0.5 * self.sample_rate
 
-        # Frequenze di taglio per le bande (es. 200 Hz per bassi, 2000 Hz per alti)
+        # Frequenze di taglio per le bande (200 Hz per bassi, 2000 Hz per alti)
         low_cutoff_freq = 200 / nyquist
         high_cutoff_freq = 2000 / nyquist
 
-        # Filtri Butterworth per le bande (questi sono fissi per efficienza)
-        # Basse (passa-basso)
+        # Filtri Butterworth fissi per le bande (EQ globale con gain dinamico, non parametrico per-frame)
         b_low, a_low = butter(2, low_cutoff_freq, btype='low', analog=False)
-        # Alte (passa-alto)
         b_high, a_high = butter(2, high_cutoff_freq, btype='high', analog=False)
-        # Medie (banda passante, ottenuta sottraendo bassi e alti dal segnale originale)
 
-        # Applica i filtri alle intere tracce per efficienza
-        # Questo non è un EQ parametrico frame-per-frame, ma un EQ globale con gain dinamico.
-        # Per un EQ dinamico più preciso, avremmo bisogno di implementare filtri che possono cambiare coefficienti al volo (difficile con scipy.signal.lfilter)
-        # Alternativa: suddividere l'audio in blocchi e applicare EQ su ogni blocco con i coefficienti attuali.
-
-        # Versione semplificata: applica filtri e poi modula il guadagno delle bande.
         low_band = lfilter(b_low, a_low, eq_audio, axis=0)
         high_band = lfilter(b_high, a_high, eq_audio, axis=0)
 
-        # La banda media è il segnale originale meno le componenti basse e alte (approssimazione)
-        mid_band = eq_audio - low_band - high_band # Potrebbe introdurre artefatti per filtri non ideali
+        # Banda media = originale - bassi - alti (approssimazione), calcolata in-place
+        mid_band = eq_audio - low_band
+        mid_band -= high_band
 
-        # Applicazione vettorizzata del guadagno dinamico (dB -> lineare per l'intero array in un colpo solo,
-        # senza loop Python per-campione/per-canale: stesso risultato, molto più veloce su video lunghi)
-        low_gain_linear = 10 ** (low_gain_interp / 20.0)
-        mid_gain_linear = 10 ** (mid_gain_interp / 20.0)
-        high_gain_linear = 10 ** (high_gain_interp / 20.0)
+        # Guadagno dinamico dB -> lineare, applicato in-place una banda alla volta
+        # (stesso ordine di somma di prima: bassi + medi + alti; risultato identico).
+        def _apply_gain(band, gain_data):
+            gain_linear = 10 ** (self._interp_data_to_audio_length(gain_data) / 20.0)
+            if band.ndim == 2:
+                gain_linear = gain_linear[:, np.newaxis]
+            band *= gain_linear
 
-        if eq_audio.ndim == 2:
-            low_gain_linear = low_gain_linear[:, np.newaxis]
-            mid_gain_linear = mid_gain_linear[:, np.newaxis]
-            high_gain_linear = high_gain_linear[:, np.newaxis]
+        _apply_gain(low_band, low_gain_data)
+        _apply_gain(mid_band, mid_gain_data)
+        _apply_gain(high_band, high_gain_data)
 
-        eq_audio = (low_band * low_gain_linear +
-                    mid_band * mid_gain_linear +
-                    high_band * high_gain_linear)
+        low_band += mid_band
+        del mid_band
+        low_band += high_band
+        del high_band
+        eq_audio = low_band
 
         return eq_audio.squeeze() if eq_audio.shape[1] == 1 else eq_audio
 
@@ -1698,13 +1687,14 @@ class AudioGenerator:
         pan_interp = np.clip(pan_interp, 0.0, 1.0)
 
         angle = pan_interp * (np.pi / 2.0)
-        left_gain = np.cos(angle)
-        right_gain = np.sin(angle)
+        del pan_interp
 
-        left_channel = audio_array * left_gain
-        right_channel = audio_array * right_gain
-
-        return np.stack([left_channel, right_channel], axis=1)
+        # Scrive direttamente nell'array stereo finale (stesso risultato di np.stack, ma senza
+        # tenere vivi contemporaneamente i due canali separati + la copia stereo).
+        stereo = np.empty((audio_array.shape[0], 2), dtype=np.result_type(audio_array.dtype, angle.dtype))
+        np.multiply(audio_array, np.cos(angle), out=stereo[:, 0])
+        np.multiply(audio_array, np.sin(angle), out=stereo[:, 1])
+        return stereo
 
 
 @st.cache_resource(show_spinner=False)
@@ -1823,9 +1813,16 @@ def main():
             # riusi per errore l'analisi di un video precedente nella stessa sessione.
             file_hash = hashlib.md5(uploaded_file.getbuffer()).hexdigest()
 
-            luminosity_data, detail_data, movement_data, variation_movement_data, horizontal_mass_center_data, vertical_mass_center_data, edge_density_data, color_variation_data, duration_seconds, fps = analyze_video_frames_cached(video_input_path, file_hash)
+            try:
+                luminosity_data, detail_data, movement_data, variation_movement_data, horizontal_mass_center_data, vertical_mass_center_data, edge_density_data, color_variation_data, duration_seconds, fps = analyze_video_frames_cached(video_input_path, file_hash)
+            except ValueError as analysis_error: # Video non apribile, corrotto, troppo corto/lungo
+                st.error(str(analysis_error))
+                if os.path.exists(video_input_path):
+                    os.remove(video_input_path)
+                return
 
-            if duration_seconds == 0.0: # Se l'analisi fallisce o video troppo corto/lungo
+            if not luminosity_data: # Nessun frame decodificato
+                st.error("❌ Nessun frame leggibile nel video.")
                 os.remove(video_input_path)
                 return
 
@@ -2678,13 +2675,13 @@ def main():
                 subtractive_audio = subtractive_audio * sub_layer_gain
                 mixed_audio += subtractive_audio
                 if return_stems:
-                    stems['sottrattiva'] = subtractive_audio
+                    stems['sottrattiva'] = subtractive_audio.astype(np.float32)
 
             if use_fm:
                 fm_audio = audio_generator.generate_fm_layer(fm_carrier_scaled, fm_mod_scaled, fm_mod_idx_scaled, fm_amp_scaled) * fm_layer_gain
                 mixed_audio += fm_audio
                 if return_stems:
-                    stems['fm'] = fm_audio
+                    stems['fm'] = fm_audio.astype(np.float32)
 
             if use_epiano:
                 epiano_audio = audio_generator.generate_fm_epiano_layer(
@@ -2693,13 +2690,13 @@ def main():
                 ) * epiano_layer_gain
                 mixed_audio += epiano_audio
                 if return_stems:
-                    stems['epiano'] = epiano_audio
+                    stems['epiano'] = epiano_audio.astype(np.float32)
 
             if use_granular:
                 granular_audio = audio_generator.generate_granular_layer(gran_density_scaled, gran_duration_scaled, gran_amp_scaled, gran_pitch_scaled) * gran_layer_gain
                 mixed_audio += granular_audio
                 if return_stems:
-                    stems['granulare'] = granular_audio
+                    stems['granulare'] = granular_audio.astype(np.float32)
 
             if use_pluck:
                 pluck_audio = audio_generator.generate_pluck_layer(
@@ -2709,13 +2706,13 @@ def main():
                 ) * pluck_layer_gain
                 mixed_audio += pluck_audio
                 if return_stems:
-                    stems['corde'] = pluck_audio
+                    stems['corde'] = pluck_audio.astype(np.float32)
 
             if use_noise:
                 noise_audio = audio_generator.add_noise_layer(noise_amp_scaled) * noise_layer_gain
                 mixed_audio += noise_audio
                 if return_stems:
-                    stems['rumore'] = noise_audio
+                    stems['rumore'] = noise_audio.astype(np.float32)
 
             if use_glitch:
                 mixed_audio = audio_generator.apply_glitch_effect(mixed_audio, glitch_factor_scaled, glitch_intensity_data, glitch_type_weights)
@@ -2762,10 +2759,11 @@ def main():
                     mixed_audio = np.zeros_like(mixed_audio) # Mantieni a zero se già silenzioso
 
             # Assicurati che l'audio sia nel range [-1, 1] per soundfile
-            mixed_audio = np.clip(mixed_audio, -1.0, 1.0)
+            mixed_audio = np.clip(mixed_audio, -1.0, 1.0).astype(np.float32, copy=False)
 
             if return_stems:
-                stems = {name: np.clip(stem, -1.0, 1.0) for name, stem in stems.items()}
+                for stem in stems.values():
+                    np.clip(stem, -1.0, 1.0, out=stem)  # in-place: niente seconda copia di ogni stem
                 return mixed_audio, stems
             return mixed_audio
 
@@ -2776,6 +2774,7 @@ def main():
             preview_audio = build_combined_audio()
             preview_audio_path = f"preview_audio_{session_id}.wav"
             sf.write(preview_audio_path, preview_audio, AUDIO_SAMPLE_RATE)
+            del preview_audio
             st.audio(preview_audio_path, format="audio/wav")
             gc.collect()
 
@@ -2796,6 +2795,7 @@ def main():
             # audio_output_path è assegnato qui, sempre se il pulsante è cliccato
             audio_output_path = f"output_audio_{session_id}.wav"
             sf.write(audio_output_path, combined_audio, AUDIO_SAMPLE_RATE)
+            del combined_audio  # il WAV è su disco: libera il buffer (fino a ~100+ MB)
 
             stems_zip_path = None
             if export_stems and generated_stems:
@@ -2813,6 +2813,7 @@ def main():
                 os.remove(stems_zip_path)
             else:
                 st.session_state['stems_zip_bytes'] = None
+            generated_stems = None  # stems già scritti nello zip: libera la RAM
             
             progress_bar_audio.progress(100)
             status_text_audio.text("Audio generato!")
