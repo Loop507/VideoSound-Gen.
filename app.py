@@ -10,6 +10,7 @@ import zipfile
 import hashlib
 import uuid
 from typing import Tuple
+from dataclasses import dataclass, field
 import soundfile as sf
 from scipy.signal import butter, lfilter, resample
 import re # Spostato qui per assicurare che sia importato all'inizio del modulo
@@ -1709,13 +1710,835 @@ def get_audio_generator(sample_rate: int, total_duration_seconds: float) -> Audi
     return AudioGenerator(sample_rate=sample_rate, total_duration_seconds=total_duration_seconds)
 
 
-def main():
-    st.set_page_config(layout="wide", page_title="VideoSound Gen. by Loop507", page_icon="🎵")
+# ═══════════════════════════════════════════════════════════════════════════
+# INTERFACCIA — sorgenti dati, scaling e contesto condiviso
+# ═══════════════════════════════════════════════════════════════════════════
+# main() è stato spezzato in funzioni: una per ogni scheda dei controlli (che restituisce un
+# `Layer` con le curve già scalate), una per il mixaggio, una per render/report/descrizione.
+# Le chiavi dei widget e le chiavi di `params` sono rimaste identiche a prima, così preset,
+# report e descrizione continuano a funzionare senza modifiche.
 
-    # Modifica 1: Titolo con "by Loop507" più piccolo
-    st.markdown("# VideoSound Gen. <small>by Loop507</small>", unsafe_allow_html=True)
-    st.markdown("Crea colonne sonore uniche dai tuoi video, trasformando i dati visivi in paesaggi sonori dinamici.")
+# Opzioni delle "Sorgente ..." (le liste restano separate perché ogni widget offre un
+# sottoinsieme diverso di feature video).
+SRC_BASE = ["Luminosità", "Dettaglio", "Movimento", "Densità Contorni", "Variazione Colore"]
+SRC_FM = ["Luminosità", "Dettaglio", "Movimento", "Variazione Movimento", "Densità Contorni", "Variazione Colore"]
+SRC_GRAN = ["Dettaglio", "Movimento", "Variazione Movimento", "Densità Contorni", "Variazione Colore"]
+SRC_VARMOV_FIRST = ["Variazione Movimento", "Movimento", "Dettaglio", "Densità Contorni", "Variazione Colore"]
 
+
+@dataclass
+class Layer:
+    """Un layer audio o un effetto, così come configurato nell'interfaccia.
+
+    enabled : il layer/effetto è attivo?
+    gain    : volume del layer (solo per i layer sonori; 0.0 se disabilitato)
+    curves  : curve per-frame già scalate nel loro range (liste di float)
+    opts    : parametri non temporali (forma d'onda, durata note, pesi del glitch, ...)
+    """
+    enabled: bool = False
+    gain: float = 0.0
+    curves: dict = field(default_factory=dict)
+    opts: dict = field(default_factory=dict)
+
+
+def scale_to_range(raw: list, lo: float, hi: float) -> list:
+    """Rimappa linearmente una curva dal suo [min, max] reale a [lo, hi]."""
+    return np.interp(raw, (min(raw) if raw else 0, max(raw) if raw else 1), (lo, hi)).tolist()
+
+
+class UiContext:
+    """Dati del video (o sintetici) + melodia globale, condivisi da tutte le schede."""
+
+    def __init__(self, luminosity, detail, movement, variation_movement,
+                 horizontal_mass_center, vertical_mass_center, edge_density, color_variation):
+        # etichetta mostrata nei selectbox -> lista di valori per frame
+        self.features = {
+            "Luminosità": luminosity,
+            "Dettaglio": detail,
+            "Movimento": movement,
+            "Variazione Movimento": variation_movement,
+            "Centro di Massa Orizzontale": horizontal_mass_center,
+            "Centro di Massa Verticale": vertical_mass_center,
+            "Densità Contorni": edge_density,
+            "Variazione Colore": color_variation,
+        }
+        self.melody_enabled = False
+        self.melody_scale = SCALE_NONE
+        self.melody_root_note = 220.0
+
+    def source(self, label: str) -> list:
+        return self.features.get(label, [])
+
+    def scale(self, label: str, lo: float, hi: float) -> list:
+        """Sorgente -> [lo, hi] (lineare)."""
+        return scale_to_range(self.source(label), lo, hi)
+
+    def freq_curve(self, label: str, lo: float, hi: float) -> list:
+        """Sorgente -> frequenza esponenziale, agganciata alla scala musicale se la Melodia è attiva."""
+        return self.apply_melody(scale_frequency_exponential(self.source(label), lo, hi))
+
+    def freq_curve_free(self, label: str, lo: float, hi: float) -> list:
+        """Come freq_curve ma sempre libera (modulatore FM, cutoff del filtro: non sono note)."""
+        return scale_frequency_exponential(self.source(label), lo, hi)
+
+    def apply_melody(self, freqs: list) -> list:
+        """Quantizzazione a scala globale, se abilitata; altrimenti intonazione libera."""
+        if not self.melody_enabled:
+            return freqs
+        return quantize_to_scale(freqs, self.melody_root_note, self.melody_scale)
+
+
+def render_melody_controls(params: dict, ctx: UiContext) -> None:
+    """Melodia globale (quantizzazione a scala).
+
+    Un unico controllo condiviso da tutti i layer con un'intonazione (sottrattiva, FM,
+    granulare, e-piano, corde) invece di un controllo per-layer: se ogni layer avesse la
+    propria scala/tonica indipendente, potrebbero suonare in chiavi diverse simultaneamente.
+    Rumore e Glitch non compaiono qui: sono broadband/senza un'intonazione riconoscibile
+    (il rumore è per definizione energia distribuita su tutte le frequenze; il glitch lavora
+    su ripetizione/rumore/inversione del segnale, non su un pitch) — non c'è nulla da
+    agganciare a una nota, quindi "quantizzarli" non avrebbe alcun effetto reale."""
+    with st.expander("🎵 Melodia (quantizzazione a scala)", expanded=False):
+        st.caption(
+            "Di default l'intonazione di ogni layer è continua, guidata liberamente dal video "
+            "(come un glissando). Abilitando la quantizzazione, ogni nota/pizzicata/oscillatore "
+            "si aggancia alla nota più vicina della scala scelta: il video continua a decidere "
+            "quale nota suona, ma il risultato è una melodia riconoscibile invece di "
+            "un'intonazione libera/microtonale. Si applica a tutti i layer con un'intonazione "
+            "(Sottrattiva, FM, Granulare, E-Piano, Corde) usando la stessa tonica, così restano "
+            "sempre in accordo tra loro invece che ognuno per conto suo."
+        )
+        use_melody_quantization = st.checkbox("Abilita Melodia", value=False, key='melody_on')
+        params['melody_enabled'] = use_melody_quantization
+        if use_melody_quantization:
+            melody_scale = st.selectbox("Scala Musicale", list(MUSICAL_SCALES.keys()), key='melody_scale')
+            melody_root_note = st.slider(
+                "Nota Fondamentale (Hz)", 55.0, 440.0, 220.0, step=1.0, key='melody_root_note',
+                help="La 'tonica' condivisa da tutti i layer: 220Hz = La3, 110Hz = La2, 261.6Hz = Do4 (centrale)."
+            )
+        else:
+            melody_scale = SCALE_NONE
+            melody_root_note = 220.0
+        params['melody_scale'] = melody_scale
+        params['melody_root_note'] = melody_root_note
+    ctx.melody_enabled = use_melody_quantization
+    ctx.melody_scale = melody_scale
+    ctx.melody_root_note = melody_root_note
+
+
+# ── Schede dei layer sonori ──────────────────────────────────────────────────
+
+def render_subtractive_tab(params: dict, ctx: UiContext) -> Layer:
+    """Layer 1: Sintesi Sottrattiva (di default luminosità e dettaglio)."""
+    st.markdown("### Layer: Sintesi Sottrattiva")
+    use_subtractive = st.checkbox("Abilita Sintesi Sottrattiva", value=True, key='subtractive_on')
+    params['subtractive_enabled'] = use_subtractive
+    layer = Layer(enabled=use_subtractive)
+    if use_subtractive:
+        layer.gain = st.slider("🎚️ Volume Layer Sottrattivo", 0.0, 2.0, 1.0, step=0.05, key='sub_gain',
+                               help="Bilancia questo layer rispetto agli altri attivi contemporaneamente.")
+        params['sub_layer_gain'] = layer.gain
+
+        sub_freq_source = st.selectbox("Sorgente Frequenza (Hz)", SRC_BASE, key='sub_freq_src')
+        sub_amp_source = st.selectbox("Sorgente Ampiezza (0-1)", SRC_BASE, key='sub_amp_src')
+        sub_waveform_type = st.selectbox("Tipo di Forma d'Onda", ["sine", "square", "sawtooth"], key='sub_waveform_type')
+
+        if sub_waveform_type in ("square", "sawtooth"):
+            sub_band_limited = st.checkbox(
+                "Band-limited (anti-aliasing PolyBLEP)", value=False, key='sub_band_limited',
+                help="Di default square/sawtooth sono generate 'al naturale' e aliasano alle "
+                     "frequenze medio-alte: è l'artefatto lo-fi/glitch tipico ricercato in molta "
+                     "musica elettronica. Attiva questa opzione per un suono più pulito in stile "
+                     "synth analogico, senza aliasing."
+            )
+        else:
+            sub_band_limited = False
+        params['sub_band_limited'] = sub_band_limited
+
+        sub_freq_min = st.slider("Frequenza Minima (Hz)", 20, 1000, 100, key='sub_freq_min')
+        sub_freq_max = st.slider("Frequenza Massima (Hz)", 20, 1000, 800, key='sub_freq_max')
+        sub_amp_min = st.slider("Ampiezza Minima", 0.0, 1.0, 0.1, step=0.01, key='sub_amp_min')
+        sub_amp_max = st.slider("Ampiezza Massima", 0.0, 1.0, 0.5, step=0.01, key='sub_amp_max')
+
+        params['sub_freq_source'] = sub_freq_source
+        params['sub_amp_source'] = sub_amp_source
+        params['sub_waveform_type'] = sub_waveform_type
+        params['sub_freq_range'] = (sub_freq_min, sub_freq_max)
+        params['sub_amp_range'] = (sub_amp_min, sub_amp_max)
+
+        layer.curves['freq'] = ctx.freq_curve(sub_freq_source, sub_freq_min, sub_freq_max)
+        layer.curves['amp'] = ctx.scale(sub_amp_source, sub_amp_min, sub_amp_max)
+
+        st.markdown("##### Filtro Sottrattivo (vero)")
+        sub_filter_enabled = st.checkbox(
+            "Applica filtro passa-basso risonante", value=False, key='sub_filter_on',
+            help="'Sintesi sottrattiva' significa scolpire le armoniche con un filtro, non solo "
+                 "modulare ampiezza/frequenza dell'onda: questo aggiunge il filtro vero e proprio "
+                 "(risonante, con Q) sopra la forma d'onda già generata. Funziona meglio con "
+                 "square/sawtooth, che sono ricche di armoniche da tagliare."
+        )
+        params['sub_filter_enabled'] = sub_filter_enabled
+        if sub_filter_enabled:
+            sub_cutoff_source = st.selectbox("Sorgente Cutoff (Hz)", SRC_BASE, key='sub_cutoff_src')
+            sub_cutoff_min = st.slider("Cutoff Minimo (Hz)", 50, 5000, 200, key='sub_cutoff_min')
+            sub_cutoff_max = st.slider("Cutoff Massimo (Hz)", 50, 8000, 3000, key='sub_cutoff_max')
+            sub_resonance = st.slider(
+                "Risonanza (Q)", 0.5, 8.0, 1.5, step=0.1, key='sub_resonance',
+                help="Q alto = picco più marcato intorno al cutoff (carattere più 'synth'/aggressivo)."
+            )
+            params['sub_cutoff_source'] = sub_cutoff_source
+            params['sub_cutoff_range'] = (sub_cutoff_min, sub_cutoff_max)
+            params['sub_resonance'] = sub_resonance
+
+            cutoff = ctx.freq_curve_free(sub_cutoff_source, sub_cutoff_min, sub_cutoff_max)
+            layer.curves['cutoff'] = cutoff
+            layer.curves['resonance'] = [sub_resonance] * max(len(cutoff), 1)
+        else:
+            layer.curves['cutoff'] = []
+            layer.curves['resonance'] = []
+        layer.opts.update(waveform=sub_waveform_type, band_limited=sub_band_limited,
+                          filter_enabled=sub_filter_enabled)
+    else:
+        layer.curves.update(freq=[], amp=[], cutoff=[], resonance=[])
+        layer.opts.update(waveform="sine", band_limited=False, filter_enabled=False)
+        params['sub_band_limited'] = False
+        params['sub_filter_enabled'] = False
+    return layer
+
+
+def render_fm_tab(params: dict, ctx: UiContext) -> Layer:
+    """Layer 2: Sintesi FM continua."""
+    st.markdown("### Layer: Sintesi FM")
+    use_fm = st.checkbox("Abilita Sintesi FM", value=True, key='fm_on')
+    params['fm_enabled'] = use_fm
+    layer = Layer(enabled=use_fm)
+    if use_fm:
+        layer.gain = st.slider("🎚️ Volume Layer FM", 0.0, 2.0, 1.0, step=0.05, key='fm_gain',
+                               help="Bilancia questo layer rispetto agli altri attivi contemporaneamente.")
+        params['fm_layer_gain'] = layer.gain
+
+        fm_carrier_source = st.selectbox("Sorgente Frequenza Portante (Hz)", SRC_FM, key='fm_carr_src')
+        fm_mod_source = st.selectbox("Sorgente Frequenza Modulatore (Hz)", SRC_FM, key='fm_mod_src')
+        fm_mod_idx_source = st.selectbox("Sorgente Indice Modulazione", SRC_FM, key='fm_idx_src')
+        fm_amp_source = st.selectbox("Sorgente Ampiezza (0-1)", SRC_FM, key='fm_amp_src')
+
+        fm_carrier_min = st.slider("Portante Minima (Hz)", 50, 2000, 200, key='fm_carr_min')
+        fm_carrier_max = st.slider("Portante Massima (Hz)", 50, 2000, 1500, key='fm_carr_max')
+        fm_mod_min = st.slider("Modulatore Minimo (Hz)", 10, 500, 50, key='fm_mod_min')
+        fm_mod_max = st.slider("Modulatore Massimo (Hz)", 10, 500, 250, key='fm_mod_max')
+        fm_mod_idx_min = st.slider("Indice Modulazione Minimo", 0.0, 10.0, 0.5, step=0.1, key='fm_idx_min')
+        fm_mod_idx_max = st.slider("Indice Modulazione Massimo", 0.0, 10.0, 5.0, step=0.1, key='fm_idx_max')
+        fm_amp_min = st.slider("Ampiezza FM Minima", 0.0, 1.0, 0.05, step=0.01, key='fm_amp_min')
+        fm_amp_max = st.slider("Ampiezza FM Massima", 0.0, 1.0, 0.3, step=0.01, key='fm_amp_max')
+
+        params['fm_carrier_source'] = fm_carrier_source
+        params['fm_mod_source'] = fm_mod_source
+        params['fm_mod_idx_source'] = fm_mod_idx_source
+        params['fm_amp_source'] = fm_amp_source
+        params['fm_carrier_range'] = (fm_carrier_min, fm_carrier_max)
+        params['fm_mod_range'] = (fm_mod_min, fm_mod_max)
+        params['fm_mod_idx_range'] = (fm_mod_idx_min, fm_mod_idx_max)
+        params['fm_amp_range'] = (fm_amp_min, fm_amp_max)
+
+        layer.curves['carrier'] = ctx.freq_curve(fm_carrier_source, fm_carrier_min, fm_carrier_max)
+        layer.curves['mod'] = ctx.freq_curve_free(fm_mod_source, fm_mod_min, fm_mod_max)
+        layer.curves['mod_idx'] = ctx.scale(fm_mod_idx_source, fm_mod_idx_min, fm_mod_idx_max)
+        layer.curves['amp'] = ctx.scale(fm_amp_source, fm_amp_min, fm_amp_max)
+    else:
+        layer.curves.update(carrier=[], mod=[], mod_idx=[], amp=[])
+    return layer
+
+
+def render_epiano_tab(params: dict, ctx: UiContext) -> Layer:
+    """Layer 2b: E-Piano FM a note discrete (stile DX7/Rhodes)."""
+    st.markdown("### Layer: E-Piano (FM a note)")
+    st.caption(
+        "A differenza della Sintesi FM continua qui sopra, questo layer suona NOTE "
+        "discrete con inviluppo: attacco rapido, decadimento esponenziale, e un indice "
+        "di modulazione che si smorza più in fretta dell'ampiezza (il timbro si "
+        "'ammorbidisce' mentre la nota risuona) — il meccanismo classico degli e-piano "
+        "FM digitali (DX7 EPiano1, Rhodes)."
+    )
+    use_epiano = st.checkbox("Abilita Layer E-Piano", value=False, key='epiano_on')
+    params['epiano_enabled'] = use_epiano
+    layer = Layer(enabled=use_epiano)
+    if use_epiano:
+        layer.gain = st.slider("🎚️ Volume Layer E-Piano", 0.0, 2.0, 1.0, step=0.05, key='epiano_gain')
+        params['epiano_layer_gain'] = layer.gain
+
+        epiano_density_source = st.selectbox("Sorgente Densità Note", SRC_BASE, key='epiano_dens_src')
+        epiano_pitch_source = st.selectbox("Sorgente Intonazione", SRC_BASE, key='epiano_pitch_src', index=2)
+        epiano_brightness_source = st.selectbox("Sorgente Brillantezza (indice FM)", SRC_BASE, key='epiano_bright_src', index=1)
+        epiano_amp_source = st.selectbox("Sorgente Ampiezza", SRC_BASE, key='epiano_amp_src')
+
+        epiano_density_min = st.slider("Densità Minima (note/finestra)", 0, 5, 0, key='epiano_dens_min')
+        epiano_density_max = st.slider("Densità Massima (note/finestra)", 0, 5, 2, key='epiano_dens_max')
+        epiano_pitch_min = st.slider("Intonazione Minima (Hz)", 40, 800, 130, key='epiano_pitch_min')
+        epiano_pitch_max = st.slider("Intonazione Massima (Hz)", 40, 1500, 500, key='epiano_pitch_max')
+        epiano_amp_min = st.slider("Ampiezza Minima", 0.0, 1.0, 0.3, step=0.01, key='epiano_amp_min')
+        epiano_amp_max = st.slider("Ampiezza Massima", 0.0, 1.0, 1.0, step=0.01, key='epiano_amp_max')
+        epiano_note_duration = st.slider(
+            "Durata Massima Nota (sec)", 0.3, 2.5, 1.2, step=0.1, key='epiano_note_dur',
+            help="Quanto a lungo può risuonare la nota prima di essere tagliata."
+        )
+        epiano_mod_ratio = st.select_slider(
+            "Rapporto Modulatore/Portante", options=[0.5, 1.0, 1.4, 2.0, 3.5, 7.0, 14.0], value=1.0, key='epiano_mod_ratio',
+            help="Rapporti classici della sintesi FM: 1.0 e 1.4 danno timbri 'e-piano' morbidi, "
+                 "3.5/7.0 timbri più metallici/campanellati, 14.0 è il rapporto usato nella terza "
+                 "coppia operatore del patch 'E.Piano 1' originale del DX7 per l'attacco a campana."
+        )
+
+        params['epiano_density_source'] = epiano_density_source
+        params['epiano_pitch_source'] = epiano_pitch_source
+        params['epiano_brightness_source'] = epiano_brightness_source
+        params['epiano_amp_source'] = epiano_amp_source
+        params['epiano_density_range'] = (epiano_density_min, epiano_density_max)
+        params['epiano_pitch_range'] = (epiano_pitch_min, epiano_pitch_max)
+        params['epiano_amp_range'] = (epiano_amp_min, epiano_amp_max)
+        params['epiano_note_duration'] = epiano_note_duration
+        params['epiano_mod_ratio'] = epiano_mod_ratio
+
+        layer.curves['density'] = ctx.scale(epiano_density_source, epiano_density_min, epiano_density_max)
+        layer.curves['pitch'] = ctx.freq_curve(epiano_pitch_source, epiano_pitch_min, epiano_pitch_max)
+        # Brillantezza normalizzata in [0,1] indipendentemente dal range della sorgente scelta
+        layer.curves['brightness'] = ctx.scale(epiano_brightness_source, 0.0, 1.0)
+        layer.curves['amp'] = ctx.scale(epiano_amp_source, epiano_amp_min, epiano_amp_max)
+    else:
+        layer.curves.update(density=[], pitch=[], brightness=[], amp=[])
+        epiano_note_duration = 1.2
+        epiano_mod_ratio = 1.0
+        params['epiano_note_duration'] = epiano_note_duration
+        params['epiano_mod_ratio'] = epiano_mod_ratio
+    layer.opts.update(note_duration=epiano_note_duration, mod_ratio=epiano_mod_ratio)
+    return layer
+
+
+def render_granular_tab(params: dict, ctx: UiContext) -> Layer:
+    """Layer 3: Sintesi Granulare (di default dettaglio e movimento)."""
+    st.markdown("### Layer: Sintesi Granulare")
+    use_granular = st.checkbox("Abilita Sintesi Granulare", value=True, key='granular_on')
+    params['granular_enabled'] = use_granular
+    layer = Layer(enabled=use_granular)
+    if use_granular:
+        layer.gain = st.slider("🎚️ Volume Layer Granulare", 0.0, 2.0, 1.0, step=0.05, key='gran_gain',
+                               help="Bilancia questo layer rispetto agli altri attivi contemporaneamente.")
+        params['gran_layer_gain'] = layer.gain
+
+        gran_density_source = st.selectbox("Sorgente Densità Grani", SRC_GRAN, key='gran_dens_src')
+        gran_duration_source = st.selectbox("Sorgente Durata Grani (sec)", SRC_GRAN, key='gran_dur_src')
+        gran_amp_source = st.selectbox("Sorgente Ampiezza Grani (0-1)", SRC_GRAN, key='gran_amp_src')
+        gran_pitch_source = st.selectbox("Sorgente Intonazione Grani (Hz)", ["Luminosità"] + SRC_GRAN, key='gran_pitch_src',
+                                         help="Prima era sempre casuale: ora anche l'intonazione di ogni grano segue il video.")
+
+        gran_density_min = st.slider("Densità Minima Grani", 0, 10, 1, key='gran_dens_min')
+        gran_density_max = st.slider("Densità Massima Grani", 0, 10, 5, key='gran_dens_max')
+        gran_duration_min = st.slider("Durata Minima Grani (sec)", 0.01, 0.1, 0.02, step=0.005, key='gran_dur_min')
+        gran_duration_max = st.slider("Durata Massima Grani (sec)", 0.01, 0.1, 0.05, step=0.005, key='gran_dur_max')
+        gran_amp_min = st.slider("Ampiezza Grani Minima", 0.0, 1.0, 0.01, step=0.01, key='gran_amp_min')
+        gran_amp_max = st.slider("Ampiezza Grani Massima", 0.0, 1.0, 0.1, step=0.01, key='gran_amp_max')
+        gran_pitch_min = st.slider("Intonazione Minima Grani (Hz)", 50, 2000, 200, key='gran_pitch_min')
+        gran_pitch_max = st.slider("Intonazione Massima Grani (Hz)", 50, 2000, 1000, key='gran_pitch_max')
+
+        params['gran_density_source'] = gran_density_source
+        params['gran_duration_source'] = gran_duration_source
+        params['gran_amp_source'] = gran_amp_source
+        params['gran_pitch_source'] = gran_pitch_source
+        params['gran_density_range'] = (gran_density_min, gran_density_max)
+        params['gran_duration_range'] = (gran_duration_min, gran_duration_max)
+        params['gran_amp_range'] = (gran_amp_min, gran_amp_max)
+        params['gran_pitch_range'] = (gran_pitch_min, gran_pitch_max)
+
+        layer.curves['density'] = ctx.scale(gran_density_source, gran_density_min, gran_density_max)
+        layer.curves['duration'] = ctx.scale(gran_duration_source, gran_duration_min, gran_duration_max)
+        layer.curves['amp'] = ctx.scale(gran_amp_source, gran_amp_min, gran_amp_max)
+        layer.curves['pitch'] = ctx.freq_curve(gran_pitch_source, gran_pitch_min, gran_pitch_max)
+    else:
+        layer.curves.update(density=[], duration=[], amp=[], pitch=[])
+    return layer
+
+
+def render_pluck_tab(params: dict, ctx: UiContext) -> Layer:
+    """Layer 3b: Corde (Karplus-Strong, modellazione fisica)."""
+    st.markdown("### Layer: Corde (Karplus-Strong)")
+    st.caption(
+        "Modellazione fisica: simula una corda pizzicata (rumore che circola in una linea "
+        "di ritardo accordata, con smorzamento) invece di un'onda o un grano. Carattere "
+        "percussivo/organico, diverso dagli altri layer."
+    )
+    use_pluck = st.checkbox("Abilita Layer Corde", value=False, key='pluck_on')
+    params['pluck_enabled'] = use_pluck
+    layer = Layer(enabled=use_pluck)
+    if use_pluck:
+        layer.gain = st.slider("🎚️ Volume Layer Corde", 0.0, 2.0, 1.0, step=0.05, key='pluck_gain')
+        params['pluck_layer_gain'] = layer.gain
+
+        pluck_density_source = st.selectbox("Sorgente Densità Pizzicate", SRC_BASE, key='pluck_dens_src')
+        pluck_pitch_source = st.selectbox("Sorgente Intonazione", SRC_BASE, key='pluck_pitch_src', index=2)
+        pluck_damping_source = st.selectbox("Sorgente Smorzamento", SRC_BASE, key='pluck_damp_src', index=1)
+        pluck_amp_source = st.selectbox("Sorgente Ampiezza", SRC_BASE, key='pluck_amp_src')
+
+        # Densità volutamente limitata (max 5, non 10 come il layer granulare): pizzicate
+        # più fitte di ~150ms perderebbero il carattere "corda" per fondersi in una texture
+        # continua (che è già il ruolo della sintesi granulare), quindi non aggiungerebbero
+        # nulla di espressivo — solo tempo di calcolo su un video lungo e denso.
+        pluck_density_min = st.slider("Densità Minima (pizzicate/finestra)", 0, 5, 0, key='pluck_dens_min')
+        pluck_density_max = st.slider("Densità Massima (pizzicate/finestra)", 0, 5, 2, key='pluck_dens_max')
+        pluck_pitch_min = st.slider("Intonazione Minima (Hz)", 40, 800, 80, key='pluck_pitch_min')
+        pluck_pitch_max = st.slider("Intonazione Massima (Hz)", 40, 1200, 400, key='pluck_pitch_max')
+        pluck_amp_min = st.slider("Ampiezza Minima", 0.0, 1.0, 0.3, step=0.01, key='pluck_amp_min')
+        pluck_amp_max = st.slider("Ampiezza Massima", 0.0, 1.0, 1.0, step=0.01, key='pluck_amp_max')
+        pluck_duration = st.slider(
+            "Durata Massima Pizzicata (sec)", 0.1, 1.0, 0.4, step=0.05, key='pluck_duration',
+            help="Quanto a lungo può risuonare una corda prima di essere tagliata."
+        )
+
+        st.markdown("##### Carattere")
+        pluck_hardness = st.slider(
+            "Durezza Eccitazione (pizzicata → martellata)", 0.0, 1.0, 0.0, step=0.05, key='pluck_hardness',
+            help="0 = pizzicata classica (rumore bianco, morbida). Valori più alti = attacco "
+                 "più duro e percussivo, più vicino a un martelletto di pianoforte/clavicembalo."
+        )
+        pluck_unison_voices = st.select_slider(
+            "Corde all'Unisono", options=[1, 2, 3], value=1, key='pluck_unison_voices',
+            help="Più di 1 somma 2-3 corde leggermente scordate per nota (come le corde "
+                 "multiple di un pianoforte vero), per un carattere più ricco/mosso invece "
+                 "di una pizzicata singola e statica. Aumenta il tempo di generazione."
+        )
+        if pluck_unison_voices > 1:
+            pluck_unison_detune = st.slider(
+                "Scordatura Unisono (cent)", 1.0, 25.0, 8.0, step=1.0, key='pluck_unison_detune',
+                help="Quanto le corde extra sono scordate rispetto all'intonazione nominale. "
+                     "Valori bassi (5-10) danno un 'battimento' naturale, alti (20+) un chorus più marcato."
+            )
+        else:
+            pluck_unison_detune = 0.0
+
+        params['pluck_density_source'] = pluck_density_source
+        params['pluck_pitch_source'] = pluck_pitch_source
+        params['pluck_damping_source'] = pluck_damping_source
+        params['pluck_amp_source'] = pluck_amp_source
+        params['pluck_density_range'] = (pluck_density_min, pluck_density_max)
+        params['pluck_pitch_range'] = (pluck_pitch_min, pluck_pitch_max)
+        params['pluck_amp_range'] = (pluck_amp_min, pluck_amp_max)
+        params['pluck_duration'] = pluck_duration
+        params['pluck_hardness'] = pluck_hardness
+        params['pluck_unison_voices'] = pluck_unison_voices
+        params['pluck_unison_detune'] = pluck_unison_detune
+
+        layer.curves['density'] = ctx.scale(pluck_density_source, pluck_density_min, pluck_density_max)
+        layer.curves['pitch'] = ctx.freq_curve(pluck_pitch_source, pluck_pitch_min, pluck_pitch_max)
+        # Smorzamento normalizzato in [0,1] indipendentemente dal range della sorgente scelta
+        layer.curves['damping'] = ctx.scale(pluck_damping_source, 0.0, 1.0)
+        layer.curves['amp'] = ctx.scale(pluck_amp_source, pluck_amp_min, pluck_amp_max)
+    else:
+        layer.curves.update(density=[], pitch=[], damping=[], amp=[])
+        pluck_duration = 0.4
+        pluck_hardness = 0.0
+        pluck_unison_voices = 1
+        pluck_unison_detune = 0.0
+        params['pluck_duration'] = pluck_duration
+        params['pluck_hardness'] = pluck_hardness
+        params['pluck_unison_voices'] = pluck_unison_voices
+        params['pluck_unison_detune'] = pluck_unison_detune
+    layer.opts.update(duration=pluck_duration, hardness=pluck_hardness,
+                      unison_voices=pluck_unison_voices, unison_detune=pluck_unison_detune)
+    return layer
+
+
+def render_noise_tab(params: dict, ctx: UiContext) -> Layer:
+    """Layer 4: Rumore (di default variazione del movimento)."""
+    st.markdown("### Layer: Rumore")
+    use_noise = st.checkbox("Abilita Rumore", value=True, key='noise_on')
+    params['noise_enabled'] = use_noise
+    layer = Layer(enabled=use_noise)
+    if use_noise:
+        layer.gain = st.slider("🎚️ Volume Layer Rumore", 0.0, 2.0, 1.0, step=0.05, key='noise_gain',
+                               help="Bilancia questo layer rispetto agli altri attivi contemporaneamente.")
+        params['noise_layer_gain'] = layer.gain
+
+        noise_amp_source = st.selectbox("Sorgente Ampiezza Rumore", SRC_VARMOV_FIRST, key='noise_amp_src')
+        noise_amp_min = st.slider("Ampiezza Minima Rumore", 0.0, 1.0, 0.0, step=0.01, key='noise_amp_min')
+        noise_amp_max = st.slider("Ampiezza Massima Rumore", 0.0, 1.0, 0.1, step=0.01, key='noise_amp_max')
+
+        params['noise_amp_source'] = noise_amp_source
+        params['noise_amp_range'] = (noise_amp_min, noise_amp_max)
+
+        layer.curves['amp'] = ctx.scale(noise_amp_source, noise_amp_min, noise_amp_max)
+    else:
+        layer.curves['amp'] = []
+    return layer
+
+
+# ── Schede degli effetti, dell'EQ e della spazializzazione ───────────────────
+
+def render_effects_tab(params: dict, ctx: UiContext) -> Tuple[Layer, Layer, Layer]:
+    """Effetti audio: Glitch, Delay, Riverbero. Restituisce (glitch, delay, reverb)."""
+    st.markdown("### Effetti Audio")
+
+    # Glitch
+    st.subheader("Glitch")
+    use_glitch = st.checkbox("Abilita Glitch", value=False, key='glitch_on')
+    params['glitch_enabled'] = use_glitch
+    glitch = Layer(enabled=use_glitch)
+    if use_glitch:
+        glitch_character = st.selectbox(
+            "Carattere del Glitch",
+            ["Bilanciato (default)", "Pulito / Digitale (repeat + reverse, poco rumore)", "Sporco / Analogico (rumore dominante)"],
+            key='glitch_character',
+            help="Prima il tipo di glitch (repeat/noise/reverse) era sempre scelto a caso in modo uniforme, "
+                 "quindi 'VHS sporco' e 'Datamosh pulito' suonavano uguali nel carattere. Ora puoi pesare la scelta."
+        )
+        params['glitch_character'] = glitch_character
+
+        glitch_factor_source = st.selectbox("Sorgente Fattore Glitch (Probabilità)", SRC_VARMOV_FIRST, key='glitch_factor_src')
+        glitch_intensity_source = st.selectbox("Sorgente Intensità Glitch (Durata/Ampiezza)", SRC_VARMOV_FIRST, key='glitch_intensity_src')
+
+        glitch_factor_min = st.slider("Fattore Minimo Glitch (0-1)", 0.0, 1.0, 0.01, step=0.005, key='glitch_factor_min')
+        glitch_factor_max = st.slider("Fattore Massimo Glitch (0-1)", 0.0, 1.0, 0.1, step=0.005, key='glitch_factor_max')
+        glitch_intensity_min = st.slider("Intensità Minima Glitch (0-1)", 0.0, 1.0, 0.1, step=0.01, key='glitch_intensity_min')
+        glitch_intensity_max = st.slider("Intensità Massima Glitch (0-1)", 0.0, 1.0, 0.8, step=0.01, key='glitch_intensity_max')
+
+        if glitch_character.startswith("Pulito"):
+            glitch_type_weights = {"repeat": 0.45, "noise": 0.1, "reverse": 0.45}
+        elif glitch_character.startswith("Sporco"):
+            glitch_type_weights = {"repeat": 0.2, "noise": 0.65, "reverse": 0.15}
+        else:
+            glitch_type_weights = {"repeat": 1/3, "noise": 1/3, "reverse": 1/3}
+
+        params['glitch_factor_source'] = glitch_factor_source
+        params['glitch_intensity_source'] = glitch_intensity_source
+        params['glitch_factor_range'] = (glitch_factor_min, glitch_factor_max)
+        params['glitch_intensity_range'] = (glitch_intensity_min, glitch_intensity_max)
+
+        glitch.curves['factor'] = ctx.scale(glitch_factor_source, glitch_factor_min, glitch_factor_max)
+        glitch.curves['intensity'] = ctx.scale(glitch_intensity_source, glitch_intensity_min, glitch_intensity_max)
+    else:
+        glitch.curves.update(factor=[], intensity=[])
+        glitch_type_weights = {"repeat": 1/3, "noise": 1/3, "reverse": 1/3}
+    glitch.opts['weights'] = glitch_type_weights
+
+    # Delay
+    st.subheader("Delay")
+    use_delay = st.checkbox("Abilita Delay", value=False, key='delay_on')
+    params['delay_enabled'] = use_delay
+    delay = Layer(enabled=use_delay)
+    if use_delay:
+        delay_time_source = st.selectbox("Sorgente Tempo Delay (sec)", ["Movimento", "Variazione Movimento", "Luminosità", "Densità Contorni", "Variazione Colore"], key='delay_time_src')
+        delay_feedback_source = st.selectbox("Sorgente Feedback Delay (0-1)", ["Movimento", "Variazione Movimento", "Dettaglio", "Densità Contorni", "Variazione Colore"], key='delay_feedback_src')
+
+        delay_time_min = st.slider("Tempo Minimo Delay (sec)", 0.01, 0.5, 0.1, step=0.01, key='delay_time_min')
+        delay_time_max = st.slider("Tempo Massimo Delay (sec)", 0.01, 0.5, 0.3, step=0.01, key='delay_time_max')
+        delay_feedback_min = st.slider("Feedback Minimo Delay", 0.0, 0.95, 0.3, step=0.01, key='delay_feedback_min')
+        delay_feedback_max = st.slider("Feedback Massimo Delay", 0.0, 0.95, 0.7, step=0.01, key='delay_feedback_max')
+
+        params['delay_time_source'] = delay_time_source
+        params['delay_feedback_source'] = delay_feedback_source
+        params['delay_time_range'] = (delay_time_min, delay_time_max)
+        params['delay_feedback_range'] = (delay_feedback_min, delay_feedback_max)
+
+        delay.curves['time'] = ctx.scale(delay_time_source, delay_time_min, delay_time_max)
+        delay.curves['feedback'] = ctx.scale(delay_feedback_source, delay_feedback_min, delay_feedback_max)
+    else:
+        delay.curves.update(time=[], feedback=[])
+
+    # Reverb
+    st.subheader("Riverbero")
+    use_reverb = st.checkbox("Abilita Riverbero", value=False, key='reverb_on')
+    params['reverb_enabled'] = use_reverb
+    reverb = Layer(enabled=use_reverb)
+    if use_reverb:
+        reverb_decay_source = st.selectbox("Sorgente Tempo Decadimento (sec)", SRC_BASE, key='reverb_decay_src')
+        reverb_mix_source = st.selectbox("Sorgente Mix (Wet/Dry)", SRC_BASE, key='reverb_mix_src')
+
+        reverb_decay_min = st.slider("Decadimento Minimo (sec)", 0.1, 5.0, 1.0, step=0.1, key='reverb_decay_min')
+        reverb_decay_max = st.slider("Decadimento Massimo (sec)", 0.1, 5.0, 3.0, step=0.1, key='reverb_decay_max')
+        reverb_mix_min = st.slider("Mix Minimo (0-1)", 0.0, 1.0, 0.2, step=0.01, key='reverb_mix_min')
+        reverb_mix_max = st.slider("Mix Massimo (0-1)", 0.0, 1.0, 0.6, step=0.01, key='reverb_mix_max')
+
+        params['reverb_decay_source'] = reverb_decay_source
+        params['reverb_mix_source'] = reverb_mix_source
+        params['reverb_decay_range'] = (reverb_decay_min, reverb_decay_max)
+        params['reverb_mix_range'] = (reverb_mix_min, reverb_mix_max)
+
+        reverb.curves['decay'] = ctx.scale(reverb_decay_source, reverb_decay_min, reverb_decay_max)
+        reverb.curves['mix'] = ctx.scale(reverb_mix_source, reverb_mix_min, reverb_mix_max)
+    else:
+        reverb.curves.update(decay=[], mix=[])
+    return glitch, delay, reverb
+
+
+def render_eq_tab(params: dict, ctx: UiContext) -> Layer:
+    """Equalizzatore dinamico a 3 bande."""
+    st.markdown("### Equalizzatore Dinamico")
+    use_eq = st.checkbox("Abilita Equalizzatore", value=False, key='eq_on')
+    params['eq_enabled'] = use_eq
+    eq = Layer(enabled=use_eq)
+    if use_eq:
+        eq_low_source = st.selectbox("Sorgente Guadagno Bassi (dB)", ["Luminosità", "Movimento", "Variazione Movimento", "Densità Contorni", "Variazione Colore"], key='eq_low_src')
+        eq_mid_source = st.selectbox("Sorgente Guadagno Medi (dB)", ["Dettaglio", "Luminosità", "Movimento", "Densità Contorni", "Variazione Colore"], key='eq_mid_src')
+        eq_high_source = st.selectbox("Sorgente Guadagno Alti (dB)", ["Movimento", "Dettaglio", "Variazione Movimento", "Densità Contorni", "Variazione Colore"], key='eq_high_src')
+
+        eq_gain_min = st.slider("Guadagno Minimo (dB)", -20.0, 20.0, -10.0, step=0.5, key='eq_gain_min')
+        eq_gain_max = st.slider("Guadagno Massimo (dB)", -20.0, 20.0, 10.0, step=0.5, key='eq_gain_max')
+
+        params['eq_low_source'] = eq_low_source
+        params['eq_mid_source'] = eq_mid_source
+        params['eq_high_source'] = eq_high_source
+        params['eq_gain_range'] = (eq_gain_min, eq_gain_max)
+
+        eq.curves['low'] = ctx.scale(eq_low_source, eq_gain_min, eq_gain_max)
+        eq.curves['mid'] = ctx.scale(eq_mid_source, eq_gain_min, eq_gain_max)
+        eq.curves['high'] = ctx.scale(eq_high_source, eq_gain_min, eq_gain_max)
+    else:
+        eq.curves.update(low=[], mid=[], high=[])
+    return eq
+
+
+def render_spatial_tab(params: dict, ctx: UiContext) -> Tuple[Layer, Layer]:
+    """Panning stereo e simulazione di altezza. Restituisce (pan, elevation)."""
+    st.markdown("### Panning Stereo")
+    st.caption("Il centro di massa orizzontale del video (dove si concentra la 'massa' visiva nel frame) può spostare il suono nello spazio stereo: se il soggetto si muove a sinistra o a destra, il suono lo segue.")
+    use_panning = st.checkbox("Abilita Panning Stereo", value=False, key='panning_on')
+    params['panning_enabled'] = use_panning
+    pan = Layer(enabled=use_panning)
+    if use_panning:
+        pan_source = st.selectbox("Sorgente Panning", ["Centro di Massa Orizzontale", "Movimento", "Variazione Movimento", "Densità Contorni", "Variazione Colore"], key='pan_src',
+                                  help="Centro di Massa Orizzontale è la scelta più naturale: segue davvero dove si trova il soggetto nel frame.")
+        params['pan_source'] = pan_source
+
+        # Il centro di massa orizzontale è già normalizzato 0..1 (0=sinistra, 1=destra):
+        # per questa sorgente non serve rimappare min/max, altrimenti un soggetto che sta
+        # sempre a destra verrebbe "stirato" fino all'estrema sinistra.
+        if pan_source == "Centro di Massa Orizzontale":
+            pan.curves['data'] = ctx.source(pan_source)
+        else:
+            pan.curves['data'] = ctx.scale(pan_source, 0.0, 1.0)
+    else:
+        pan.curves['data'] = []
+
+    st.markdown("---")
+    st.markdown("### Altezza (Su/Giù)")
+    st.caption("Lo stereo non ha un canale fisico per 'sopra' e 'sotto': qui si usa un trucco psicoacustico — un suono più chiaro/brillante viene percepito come 'in alto', uno più scuro/attutito come 'in basso'. Basato sul centro di massa verticale del video.")
+    use_elevation = st.checkbox("Abilita Simulazione Altezza", value=False, key='elevation_on')
+    params['elevation_enabled'] = use_elevation
+    elevation = Layer(enabled=use_elevation)
+    if use_elevation:
+        elevation_source = st.selectbox("Sorgente Altezza", ["Centro di Massa Verticale", "Luminosità", "Densità Contorni", "Variazione Colore"], key='elevation_src',
+                                        help="Centro di Massa Verticale segue davvero se il soggetto è in alto o in basso nel frame. Le altre sono mappature più creative.")
+        params['elevation_source'] = elevation_source
+
+        if elevation_source == "Centro di Massa Verticale":
+            # Già normalizzato 0..1 (0=alto del frame, 1=basso): nessun rimappaggio min/max,
+            # altrimenti un soggetto sempre in alto verrebbe "stirato" fino in basso.
+            elevation.curves['data'] = ctx.source(elevation_source)
+        elif elevation_source == "Luminosità":  # video più luminoso = più "in alto" (elevation_data basso = luminosità alta)
+            elevation.curves['data'] = [1.0 - l for l in ctx.source("Luminosità")]
+        else:  # Densità Contorni / Variazione Colore: mappatura creativa, normalizzata 0..1 senza inversione
+            elevation.curves['data'] = ctx.scale(elevation_source, 0.0, 1.0)
+    else:
+        elevation.curves['data'] = []
+    return pan, elevation
+
+
+def render_output_settings(params: dict, generative_mode: bool) -> dict:
+    """Formato video, normalizzazione, saturazione, audio originale, export stems."""
+    if not generative_mode:
+        st.subheader("Impostazioni Output Video")
+        output_resolution_choice = st.selectbox("Formato Video Output", list(FORMAT_RESOLUTIONS.keys()))
+        params['output_resolution_choice'] = output_resolution_choice
+    else:
+        output_resolution_choice = None
+        params['output_resolution_choice'] = "N/A (modalità generativa)"
+
+    st.subheader("Impostazioni Output Audio")
+
+    col_audio, col_video = st.columns(2)
+    with col_audio:
+        normalize_audio = st.checkbox("Normalizza Audio Finale", value=True)
+        params['normalize_audio'] = normalize_audio
+        use_saturation = st.checkbox(
+            "Saturazione Soft (Analogica)", value=True,
+            help="Applica una leggera compressione morbida (tanh) prima della normalizzazione: "
+                 "addolcisce i picchi improvvisi (tipici quando grani/glitch/riverbero si sommano) "
+                 "con un carattere più 'analogico' invece di un clip digitale netto."
+        )
+        params['use_saturation'] = use_saturation
+        if use_saturation:
+            saturation_drive = st.slider(
+                "Intensità Saturazione", 1.0, 3.0, 1.5, step=0.1,
+                help="Valori più alti = compressione più marcata dei picchi (più 'calda'/satura)."
+            )
+            params['saturation_drive'] = saturation_drive
+        else:
+            saturation_drive = 1.0
+            params['saturation_drive'] = 1.0
+    with col_video:
+        original_audio_mix_level = 0.0
+        if not generative_mode:
+            use_original_audio = st.checkbox("Mantieni Audio Originale del Video (Mix con quello generato)", value=False)
+            params['use_original_audio'] = use_original_audio
+            if use_original_audio:
+                original_audio_mix_level = st.slider("Livello Mix Audio Originale", 0.0, 1.0, 0.5, step=0.01)
+                params['original_audio_mix_level'] = original_audio_mix_level
+            else:
+                params['original_audio_mix_level'] = 0.0
+        else:
+            use_original_audio = False
+            params['use_original_audio'] = False
+            params['original_audio_mix_level'] = 0.0
+            st.caption("🎲 Modalità generativa: nessun audio originale da mantenere (nessun video caricato).")
+        export_stems = st.checkbox(
+            "Esporta anche gli stems separati (ZIP)", value=False,
+            help="Oltre al video, genera uno ZIP con l'audio di ogni layer attivo separato "
+                 "(dry, prima degli effetti), da remixare in un DAW."
+        )
+        params['export_stems'] = export_stems
+
+    return {
+        'output_resolution_choice': output_resolution_choice,
+        'normalize_audio': normalize_audio,
+        'use_saturation': use_saturation,
+        'saturation_drive': saturation_drive,
+        'use_original_audio': use_original_audio,
+        'original_audio_mix_level': original_audio_mix_level,
+        'export_stems': export_stems,
+    }
+
+
+# ── Mixaggio ─────────────────────────────────────────────────────────────────
+
+def _generate_subtractive(ag: "AudioGenerator", L: Layer) -> np.ndarray:
+    audio = ag.generate_subtractive_waveform(L.curves['freq'], L.curves['amp'], L.opts['waveform'], band_limited=L.opts['band_limited'])
+    if L.opts['filter_enabled']:
+        audio = ag.apply_resonant_filter(audio, L.curves['cutoff'], L.curves['resonance'])
+    return audio
+
+
+def _generate_fm(ag: "AudioGenerator", L: Layer) -> np.ndarray:
+    return ag.generate_fm_layer(L.curves['carrier'], L.curves['mod'], L.curves['mod_idx'], L.curves['amp'])
+
+
+def _generate_epiano(ag: "AudioGenerator", L: Layer) -> np.ndarray:
+    return ag.generate_fm_epiano_layer(
+        L.curves['density'], L.curves['pitch'], L.curves['brightness'], L.curves['amp'],
+        note_duration=L.opts['note_duration'], mod_ratio=L.opts['mod_ratio']
+    )
+
+
+def _generate_granular(ag: "AudioGenerator", L: Layer) -> np.ndarray:
+    return ag.generate_granular_layer(L.curves['density'], L.curves['duration'], L.curves['amp'], L.curves['pitch'])
+
+
+def _generate_pluck(ag: "AudioGenerator", L: Layer) -> np.ndarray:
+    return ag.generate_pluck_layer(
+        L.curves['density'], L.curves['pitch'], L.curves['damping'], L.curves['amp'],
+        max_pluck_duration=L.opts['duration'], hammer_hardness=L.opts['hardness'],
+        unison_voices=L.opts['unison_voices'], unison_detune_cents=L.opts['unison_detune']
+    )
+
+
+def _generate_noise(ag: "AudioGenerator", L: Layer) -> np.ndarray:
+    return ag.add_noise_layer(L.curves['amp'])
+
+
+# (chiave in `layers`, nome dello stem esportato, funzione generatrice) — l'ordine è quello di mix.
+SOUND_LAYERS = [
+    ('sub', 'sottrattiva', _generate_subtractive),
+    ('fm', 'fm', _generate_fm),
+    ('epiano', 'epiano', _generate_epiano),
+    ('gran', 'granulare', _generate_granular),
+    ('pluck', 'corde', _generate_pluck),
+    ('noise', 'rumore', _generate_noise),
+]
+
+
+def build_combined_audio(audio_generator: "AudioGenerator", layers: dict, output: dict, return_stems: bool = False):
+    """Genera e mixa tutti i layer/effetti audio secondo i parametri impostati nell'interfaccia.
+    Condivisa tra l'anteprima audio rapida e il render finale, per non duplicare la stessa
+    logica in due punti che potrebbero disallinearsi nel tempo.
+
+    layers : dict chiave -> Layer (vedi SOUND_LAYERS per i layer sonori; 'glitch', 'delay',
+             'reverb', 'eq', 'elev', 'pan' per gli effetti)
+    output : impostazioni di master (normalize_audio, use_saturation, saturation_drive)
+
+    Se return_stems=True, restituisce anche un dizionario con l'audio 'dry' di ogni singolo
+    layer (già pesato dal proprio Volume Layer, ma prima di effetti/mix/master), utile per un
+    export stems separato da remixare in un DAW."""
+    mixed_audio = np.zeros(audio_generator.total_samples, dtype=np.float32)
+    stems = {}
+
+    for key, stem_name, generate in SOUND_LAYERS:
+        layer = layers[key]
+        if not layer.enabled:
+            continue
+        layer_audio = generate(audio_generator, layer) * layer.gain
+        mixed_audio += layer_audio
+        if return_stems:
+            stems[stem_name] = layer_audio.astype(np.float32)
+        del layer_audio
+
+    glitch, delay, reverb, eq = layers['glitch'], layers['delay'], layers['reverb'], layers['eq']
+    if glitch.enabled:
+        mixed_audio = audio_generator.apply_glitch_effect(mixed_audio, glitch.curves['factor'], glitch.curves['intensity'], glitch.opts['weights'])
+
+    if delay.enabled:
+        mixed_audio = audio_generator.apply_delay_effect(mixed_audio, delay.curves['time'], delay.curves['feedback'])
+
+    if reverb.enabled:
+        mixed_audio = audio_generator.apply_reverb_effect(mixed_audio, reverb.curves['decay'], reverb.curves['mix'])
+
+    if eq.enabled:
+        mixed_audio = audio_generator.apply_eq_effect(mixed_audio, eq.curves['low'], eq.curves['mid'], eq.curves['high'])
+
+    # Altezza (su/giù): applicata prima del panning, mentre l'audio è ancora mono
+    # (illusione timbrica, non di posizione).
+    if layers['elev'].enabled:
+        mixed_audio = audio_generator.apply_elevation_filter(mixed_audio, layers['elev'].curves['data'])
+
+    # Panning stereo: applicato per ultimo, dopo tutti gli effetti mono, così converte
+    # l'audio in stereo (samples, 2) solo alla fine della catena.
+    if layers['pan'].enabled:
+        mixed_audio = audio_generator.apply_stereo_panning(mixed_audio, layers['pan'].curves['data'])
+
+    if output['use_saturation']:
+        # Saturazione soft (tanh) prima della normalizzazione: comprime morbidamente i
+        # picchi (es. quando più grani/glitch/riverbero si sovrappongono nello stesso
+        # istante) invece di lasciare che un clip rigido più avanti li tagli di netto.
+        # tanh(x) è per costruzione sempre in (-1, 1) qualunque sia l'ampiezza in ingresso:
+        # 'drive' controlla quanto la non-linearità entra in gioco (più alto = più
+        # compressione/calore) e, come effetto collaterale voluto, anche il volume
+        # percepito dei passaggi più quieti (comportamento standard per un saturatore
+        # in stile analogico/nastro).
+        mixed_audio = np.tanh(mixed_audio * output['saturation_drive'])
+
+    if output['normalize_audio']:
+        # Prevenire divisione per zero se l'audio è silenzioso.
+        # Usiamo il picco GLOBALE (non per-canale) per non alterare il bilanciamento
+        # stereo introdotto dal panning: normalizzare i due canali in modo indipendente
+        # appiattirebbe la differenza di volume tra sinistra e destra.
+        peak = np.max(np.abs(mixed_audio))
+        if peak > 1e-6:
+            mixed_audio = mixed_audio / peak
+        else:
+            mixed_audio = np.zeros_like(mixed_audio)  # Mantieni a zero se già silenzioso
+
+    # Assicurati che l'audio sia nel range [-1, 1] per soundfile
+    mixed_audio = np.clip(mixed_audio, -1.0, 1.0).astype(np.float32, copy=False)
+
+    if return_stems:
+        for stem in stems.values():
+            np.clip(stem, -1.0, 1.0, out=stem)  # in-place: niente seconda copia di ogni stem
+        return mixed_audio, stems
+    return mixed_audio
+
+
+# ── Sorgente, preset, download, report ───────────────────────────────────────
+
+def render_source_sidebar() -> dict:
+    """Sidebar: modalità di input e relative impostazioni. Restituisce i valori scelti."""
+    generative_duration = None
+    generative_track_name = None
+    generative_seed = None
     st.sidebar.header("Sorgente")
     input_mode = st.sidebar.radio(
         "Modalità", ["🎬 Da Video", "🎲 Generativa (senza video)", "🎧 Granulare da Audio"], key='input_mode',
@@ -1745,15 +2568,19 @@ def main():
     else:
         st.sidebar.header("Carica Video")
         uploaded_file = st.sidebar.file_uploader("Scegli un file video (MP4, MOV, AVI, ecc.)", type=["mp4", "mov", "avi", "mkv"])
+    return {
+        'input_mode': input_mode,
+        'generative_mode': generative_mode,
+        'granular_mode': granular_mode,
+        'uploaded_file': uploaded_file,
+        'generative_duration': generative_duration,
+        'generative_track_name': generative_track_name,
+        'generative_seed': generative_seed,
+    }
 
-    # Variabili per memorizzare i parametri scelti dall'utente per la descrizione finale
-    params = {}
 
-    # Inizializza audio_output_path e base_name_output a None per evitare UnboundLocalError
-    # Saranno sovrascritti se il pulsante viene cliccato e la generazione audio avviene.
-    audio_output_path = None
-    base_name_output = None
-
+def init_session_state() -> str:
+    """Prepara i valori di session_state usati dai download e restituisce l'ID di sessione."""
     # Inizializza session_state per i download (persistono tra i rerun)
     if 'video_bytes' not in st.session_state:
         st.session_state['video_bytes'] = None
@@ -1774,1466 +2601,698 @@ def main():
     if 'session_id' not in st.session_state:
         st.session_state['session_id'] = uuid.uuid4().hex[:8]
     session_id = st.session_state['session_id']
+    return session_id
 
-    if granular_mode:
+
+def load_features(source: dict, session_id: str):
+    """Ottiene le 8 curve di feature (da video analizzato o sintetiche) e le impacchetta in un UiContext.
+
+    Restituisce (ctx, duration_seconds, video_input_path, base_name_output), oppure None se il
+    caricamento fallisce (l'errore è già stato mostrato all'utente e i file temporanei puliti)."""
+    generative_mode = source['generative_mode']
+    uploaded_file = source['uploaded_file']
+    generative_duration = source['generative_duration']
+    generative_track_name = source['generative_track_name']
+    generative_seed = source['generative_seed']
+    video_input_path = None  # resta None in modalità generativa: nessun file video reale
+
+    if generative_mode:
+        luminosity_data, detail_data, movement_data, variation_movement_data, horizontal_mass_center_data, vertical_mass_center_data, edge_density_data, color_variation_data, duration_seconds, fps = generate_synthetic_feature_curves(
+            float(generative_duration), fps=30.0, seed=generative_seed
+        )
+        base_name_output = generative_track_name.strip() or "traccia_generativa"
+
+    else:
+        if not validate_video_file(uploaded_file):
+            # Se la validazione fallisce, pulisci il file caricato e termina
+            invalid_path = f"temp_input_{session_id}_{uploaded_file.name}"
+            if os.path.exists(invalid_path):
+                os.remove(invalid_path)
+            return None
+
+        st.sidebar.success("✅ Video caricato con successo!")
+
+        # Pulisci eventuali file temporanei rimasti da un upload precedente in questa
+        # stessa sessione (es. utente carica un video, non completa la generazione,
+        # poi ne carica un altro: senza questa pulizia i vecchi file si accumulerebbero).
+        cleanup_session_temp_files(session_id)
+
+        # Salva il file temporaneamente, con nome univoco per sessione
+        video_input_path = f"temp_input_{session_id}_{uploaded_file.name}"
+        with open(video_input_path, "wb") as f:
+            f.write(uploaded_file.getbuffer())
+
+        # Hash del contenuto: usato come chiave di cache insieme al path (vedi il commento su
+        # analyze_video_frames_cached) per evitare che un video diverso con lo stesso nome file
+        # riusi per errore l'analisi di un video precedente nella stessa sessione.
+        file_hash = hashlib.md5(uploaded_file.getbuffer()).hexdigest()
+
+        try:
+            luminosity_data, detail_data, movement_data, variation_movement_data, horizontal_mass_center_data, vertical_mass_center_data, edge_density_data, color_variation_data, duration_seconds, fps = analyze_video_frames_cached(video_input_path, file_hash)
+        except ValueError as analysis_error: # Video non apribile, corrotto, troppo corto/lungo
+            st.error(str(analysis_error))
+            if os.path.exists(video_input_path):
+                os.remove(video_input_path)
+            return None
+
+        if not luminosity_data: # Nessun frame decodificato
+            st.error("❌ Nessun frame leggibile nel video.")
+            os.remove(video_input_path)
+            return None
+
+        # base_name_output è ora definito qui, prima dell'uso condizionale
+        base_name_output = os.path.splitext(uploaded_file.name)[0]
+    ctx = UiContext(luminosity_data, detail_data, movement_data, variation_movement_data,
+                    horizontal_mass_center_data, vertical_mass_center_data, edge_density_data,
+                    color_variation_data)
+    return ctx, duration_seconds, video_input_path, base_name_output
+
+
+def render_preset_box() -> None:
+    """Selettore dei preset per tipo di video; applicandone uno riscrive i widget via session_state."""
+    st.markdown("#### 🎨 Preset per tipo di video")
+    st.caption("Scegli un punto di partenza in base al tipo di footage, poi ritocca liberamente i parametri nei tab sotto.")
+    preset_options = [PRESET_MANUALE] + list(VIDEO_PRESETS.keys())
+    selected_preset = st.selectbox("Preset", preset_options, key='preset_choice')
+
+    if selected_preset != PRESET_MANUALE and st.session_state.get('_last_applied_preset') != selected_preset:
+        # Azzera tutti i toggle dei layer prima di applicare il preset specifico: altrimenti
+        # un layer abilitato da un preset precedente (o acceso manualmente) resterebbe attivo
+        # anche scegliendo un nuovo preset che non lo nomina esplicitamente nel suo dizionario.
+        all_layer_toggles = [
+            'subtractive_on', 'sub_filter_on', 'sub_band_limited', 'fm_on', 'epiano_on',
+            'granular_on', 'pluck_on', 'noise_on', 'glitch_on', 'delay_on', 'reverb_on',
+            'eq_on', 'panning_on', 'elevation_on', 'melody_on',
+        ]
+        for toggle_key in all_layer_toggles:
+            st.session_state[toggle_key] = False
+        for preset_key, preset_value in VIDEO_PRESETS[selected_preset].items():
+            st.session_state[preset_key] = preset_value
+        st.session_state['_last_applied_preset'] = selected_preset
+        st.rerun()
+    elif selected_preset == PRESET_MANUALE:
+        st.session_state['_last_applied_preset'] = None
+
+
+def build_report_text(params: dict, generative_info: dict = None) -> str:
+    """Report dei parametri in stile archivio Loop507: campi bilingue IT/EN con prefisso '::'.
+
+    generative_info (solo modalità generativa): {'duration': secondi, 'seed': int o None}."""
+    # Costruisci il report in stile archivio Loop507: campi bilingue IT/EN
+    # con prefisso "::", coerente con la documentazione degli altri progetti.
+    def field(it_label: str, en_label: str, value, indent: str = "") -> str:
+        return f"{indent}:: {it_label} / {en_label} :: {value}"
+
+    def onoff(flag: bool) -> str:
+        return "abilitata / enabled" if flag else "disabilitata / disabled"
+
+    report_lines = []
+    report_lines.append(":: VIDEOSOUND GEN — REPORT")
+    report_lines.append(":: by Loop507")
+    report_lines.append("")
+
+    preset_used = st.session_state.get('preset_choice', PRESET_MANUALE)
+    report_lines.append(field("preset di partenza", "starting preset", preset_used))
+    report_lines.append(field("formato output video", "video output format", params.get('output_resolution_choice', 'N/A')))
+    if params.get('use_original_audio'):
+        report_lines.append(field("audio originale", "original audio", f"mantenuto / kept (mix {params.get('original_audio_mix_level', 0):.2f})"))
+    else:
+        report_lines.append(field("audio originale", "original audio", "non mantenuto / not kept"))
+    report_lines.append(field("normalizzazione audio finale", "final audio normalization", "sì / yes" if params.get('normalize_audio') else "no / no"))
+    if params.get('use_saturation'):
+        report_lines.append(field("saturazione soft", "soft saturation", f"abilitata / enabled (drive {params.get('saturation_drive', 1.5):.1f})"))
+    else:
+        report_lines.append(field("saturazione soft", "soft saturation", "disabilitata / disabled"))
+    if params.get('melody_enabled'):
+        report_lines.append(field("melodia (quantizzazione a scala)", "melody (scale quantization)", f"{params.get('melody_scale', 'N/A')} (fondamentale {params.get('melody_root_note', 220.0):.0f} Hz)"))
+    else:
+        report_lines.append(field("melodia (quantizzazione a scala)", "melody (scale quantization)", "disabilitata / disabled (intonazione libera / free pitch)"))
+
+    report_lines.append("")
+    report_lines.append(":: --- layer audio / audio layers ---")
+
+    report_lines.append(field("sintesi sottrattiva", "subtractive synthesis", onoff(params.get('subtractive_enabled'))))
+    if params.get('subtractive_enabled'):
+        report_lines.append(field("volume layer", "layer volume", f"{params.get('sub_layer_gain', 1.0):.2f}", indent="  "))
+        report_lines.append(field("frequenza", "frequency", f"{params['sub_freq_source']} ({params['sub_freq_range'][0]}-{params['sub_freq_range'][1]} Hz)", indent="  "))
+        report_lines.append(field("ampiezza", "amplitude", f"{params['sub_amp_source']} ({params['sub_amp_range'][0]:.2f}-{params['sub_amp_range'][1]:.2f})", indent="  "))
+        report_lines.append(field("forma d'onda", "waveform", params['sub_waveform_type'], indent="  "))
+        if params['sub_waveform_type'] in ("square", "sawtooth"):
+            report_lines.append(field("anti-aliasing", "anti-aliasing", "band-limited (PolyBLEP)" if params.get('sub_band_limited') else "grezzo / raw (aliasing voluto)", indent="  "))
+        if params.get('sub_filter_enabled'):
+            report_lines.append(field("filtro risonante", "resonant filter", f"cutoff {params.get('sub_cutoff_source', 'N/A')} ({params['sub_cutoff_range'][0]}-{params['sub_cutoff_range'][1]} Hz), Q {params.get('sub_resonance', 1.5):.1f}", indent="  "))
+        else:
+            report_lines.append(field("filtro risonante", "resonant filter", "disabilitato / disabled", indent="  "))
+
+    report_lines.append(field("sintesi fm", "fm synthesis", onoff(params.get('fm_enabled'))))
+    if params.get('fm_enabled'):
+        report_lines.append(field("volume layer", "layer volume", f"{params.get('fm_layer_gain', 1.0):.2f}", indent="  "))
+        report_lines.append(field("portante", "carrier", f"{params['fm_carrier_source']} ({params['fm_carrier_range'][0]}-{params['fm_carrier_range'][1]} Hz)", indent="  "))
+        report_lines.append(field("modulatore", "modulator", f"{params['fm_mod_source']} ({params['fm_mod_range'][0]}-{params['fm_mod_range'][1]} Hz)", indent="  "))
+        report_lines.append(field("indice mod.", "mod. index", f"{params['fm_mod_idx_source']} ({params['fm_mod_idx_range'][0]:.1f}-{params['fm_mod_idx_range'][1]:.1f})", indent="  "))
+        report_lines.append(field("ampiezza", "amplitude", f"{params['fm_amp_source']} ({params['fm_amp_range'][0]:.2f}-{params['fm_amp_range'][1]:.2f})", indent="  "))
+
+    report_lines.append(field("e-piano (fm a note)", "e-piano (fm notes)", onoff(params.get('epiano_enabled'))))
+    if params.get('epiano_enabled'):
+        report_lines.append(field("volume layer", "layer volume", f"{params.get('epiano_layer_gain', 1.0):.2f}", indent="  "))
+        report_lines.append(field("densità", "density", f"{params.get('epiano_density_source', 'N/A')} ({params['epiano_density_range'][0]}-{params['epiano_density_range'][1]} note/finestra)", indent="  "))
+        report_lines.append(field("intonazione", "pitch", f"{params.get('epiano_pitch_source', 'N/A')} ({params['epiano_pitch_range'][0]}-{params['epiano_pitch_range'][1]} Hz)", indent="  "))
+        report_lines.append(field("brillantezza", "brightness", params.get('epiano_brightness_source', 'N/A'), indent="  "))
+        report_lines.append(field("rapporto mod/portante", "mod/carrier ratio", f"{params.get('epiano_mod_ratio', 1.0):.1f}", indent="  "))
+        report_lines.append(field("durata massima nota", "max note duration", f"{params.get('epiano_note_duration', 1.2):.2f} sec", indent="  "))
+
+    report_lines.append(field("sintesi granulare", "granular synthesis", onoff(params.get('granular_enabled'))))
+    if params.get('granular_enabled'):
+        report_lines.append(field("volume layer", "layer volume", f"{params.get('gran_layer_gain', 1.0):.2f}", indent="  "))
+        report_lines.append(field("densità", "density", f"{params['gran_density_source']} ({params['gran_density_range'][0]}-{params['gran_density_range'][1]} grani/grains)", indent="  "))
+        report_lines.append(field("durata", "duration", f"{params['gran_duration_source']} ({params['gran_duration_range'][0]:.3f}-{params['gran_duration_range'][1]:.3f} sec)", indent="  "))
+        report_lines.append(field("ampiezza", "amplitude", f"{params['gran_amp_source']} ({params['gran_amp_range'][0]:.2f}-{params['gran_amp_range'][1]:.2f})", indent="  "))
+        if 'gran_pitch_range' in params:
+            report_lines.append(field("intonazione grani", "grain pitch", f"{params.get('gran_pitch_source', 'N/A')} ({params['gran_pitch_range'][0]}-{params['gran_pitch_range'][1]} Hz)", indent="  "))
+
+    report_lines.append(field("corde (karplus-strong)", "strings (karplus-strong)", onoff(params.get('pluck_enabled'))))
+    if params.get('pluck_enabled'):
+        report_lines.append(field("volume layer", "layer volume", f"{params.get('pluck_layer_gain', 1.0):.2f}", indent="  "))
+        report_lines.append(field("densità", "density", f"{params.get('pluck_density_source', 'N/A')} ({params['pluck_density_range'][0]}-{params['pluck_density_range'][1]} pizzicate/finestra)", indent="  "))
+        report_lines.append(field("intonazione", "pitch", f"{params.get('pluck_pitch_source', 'N/A')} ({params['pluck_pitch_range'][0]}-{params['pluck_pitch_range'][1]} Hz)", indent="  "))
+        report_lines.append(field("smorzamento", "damping", params.get('pluck_damping_source', 'N/A'), indent="  "))
+        report_lines.append(field("durata massima", "max duration", f"{params.get('pluck_duration', 0.4):.2f} sec", indent="  "))
+        report_lines.append(field("carattere", "character", f"durezza {params.get('pluck_hardness', 0.0):.2f} (0=pizzicata, 1=martellata)", indent="  "))
+        if params.get('pluck_unison_voices', 1) > 1:
+            report_lines.append(field("unisono", "unison", f"{params['pluck_unison_voices']} corde, scordatura {params.get('pluck_unison_detune', 0.0):.0f} cent", indent="  "))
+        else:
+            report_lines.append(field("unisono", "unison", "disabilitato / disabled (1 corda)", indent="  "))
+
+    report_lines.append(field("rumore", "noise", onoff(params.get('noise_enabled'))))
+    if params.get('noise_enabled'):
+        report_lines.append(field("volume layer", "layer volume", f"{params.get('noise_layer_gain', 1.0):.2f}", indent="  "))
+        report_lines.append(field("ampiezza", "amplitude", f"{params['noise_amp_source']} ({params['noise_amp_range'][0]:.2f}-{params['noise_amp_range'][1]:.2f})", indent="  "))
+
+    report_lines.append("")
+    report_lines.append(":: --- effetti audio / audio effects ---")
+
+    report_lines.append(field("glitch", "glitch", onoff(params.get('glitch_enabled'))))
+    if params.get('glitch_enabled'):
+        report_lines.append(field("carattere", "character", params.get('glitch_character', 'Bilanciato (default)'), indent="  "))
+        report_lines.append(field("fattore", "factor", f"{params['glitch_factor_source']} ({params['glitch_factor_range'][0]:.3f}-{params['glitch_factor_range'][1]:.3f})", indent="  "))
+        report_lines.append(field("intensità", "intensity", f"{params['glitch_intensity_source']} ({params['glitch_intensity_range'][0]:.2f}-{params['glitch_intensity_range'][1]:.2f})", indent="  "))
+
+    report_lines.append(field("delay", "delay", onoff(params.get('delay_enabled'))))
+    if params.get('delay_enabled'):
+        report_lines.append(field("tempo", "time", f"{params['delay_time_source']} ({params['delay_time_range'][0]:.2f}-{params['delay_time_range'][1]:.2f} sec)", indent="  "))
+        report_lines.append(field("feedback", "feedback", f"{params['delay_feedback_source']} ({params['delay_feedback_range'][0]:.2f}-{params['delay_feedback_range'][1]:.2f})", indent="  "))
+
+    report_lines.append(field("riverbero", "reverb", onoff(params.get('reverb_enabled'))))
+    if params.get('reverb_enabled'):
+        report_lines.append(field("decadimento", "decay", f"{params['reverb_decay_source']} ({params['reverb_decay_range'][0]:.1f}-{params['reverb_decay_range'][1]:.1f} sec)", indent="  "))
+        report_lines.append(field("mix", "mix", f"{params['reverb_mix_source']} ({params['reverb_mix_range'][0]:.2f}-{params['reverb_mix_range'][1]:.2f})", indent="  "))
+
+    report_lines.append(field("equalizzatore dinamico", "dynamic equalizer", onoff(params.get('eq_enabled'))))
+    if params.get('eq_enabled'):
+        report_lines.append(field("bassi", "low", f"{params['eq_low_source']} ({params['eq_gain_range'][0]:.1f}-{params['eq_gain_range'][1]:.1f} dB)", indent="  "))
+        report_lines.append(field("medi", "mid", f"{params['eq_mid_source']} ({params['eq_gain_range'][0]:.1f}-{params['eq_gain_range'][1]:.1f} dB)", indent="  "))
+        report_lines.append(field("alti", "high", f"{params['eq_high_source']} ({params['eq_gain_range'][0]:.1f}-{params['eq_gain_range'][1]:.1f} dB)", indent="  "))
+
+    report_lines.append("")
+    report_lines.append(":: --- spazializzazione / spatialization ---")
+    if params.get('panning_enabled'):
+        report_lines.append(field("panning stereo", "stereo panning", f"abilitato / enabled (sorgente/source: {params.get('pan_source', 'N/A')})"))
+    else:
+        report_lines.append(field("panning stereo", "stereo panning", "disabilitato / disabled"))
+    if params.get('elevation_enabled'):
+        report_lines.append(field("simulazione altezza", "elevation simulation", f"abilitata / enabled (sorgente/source: {params.get('elevation_source', 'N/A')})"))
+    else:
+        report_lines.append(field("simulazione altezza", "elevation simulation", "disabilitata / disabled"))
+
+    report_lines.append("")
+    report_lines.append("#loop507 #videosoundgen #glitchbrutalista #minimalismocomputazionale")
+    if generative_info:
+        # Dopo le prime tre righe (titolo, firma, riga vuota): come è stata prodotta la traccia.
+        seed = generative_info.get('seed')
+        report_lines[3:3] = [
+            field("modalità", "mode", "generativa (senza video) / generative (no video)"),
+            field("durata", "duration", f"{generative_info.get('duration', 0):.0f} sec"),
+            field("seed delle curve procedurali", "procedural curves seed",
+                  str(seed) if seed is not None else "non fissato / not fixed"),
+        ]
+    return "\n".join(report_lines)
+
+
+def render_download_section(base_name_output: str) -> None:
+    """Pulsanti di download persistenti.
+
+    Sono fuori dal blocco `if st.button` → vengono renderizzati ad ogni rerun senza riavviare la
+    generazione. I dati vengono letti da session_state."""
+    if st.session_state.get('video_bytes') or st.session_state.get('report_text') or st.session_state.get('stems_zip_bytes') or st.session_state.get('generative_audio_bytes'):
+        st.markdown("---")
+        st.subheader("⬇️ Download")
+        dl_col1, dl_col2, dl_col3 = st.columns(3)
+        with dl_col1:
+            if st.session_state.get('video_bytes'):
+                st.download_button(
+                    label="🎬 Scarica Video Finale",
+                    data=st.session_state['video_bytes'],
+                    file_name=st.session_state.get('video_filename', 'output_video.mp4'),
+                    mime="video/mp4",
+                    key="dl_video"
+                )
+            if st.session_state.get('generative_audio_bytes'):
+                st.download_button(
+                    label="🎵 Scarica Traccia Audio",
+                    data=st.session_state['generative_audio_bytes'],
+                    file_name=f"{base_name_output}.wav" if base_name_output else "traccia_generativa.wav",
+                    mime="audio/wav",
+                    key="dl_generative_audio"
+                )
+        with dl_col2:
+            if st.session_state.get('report_text'):
+                st.download_button(
+                    label="📄 Scarica Report Parametri",
+                    data=st.session_state['report_text'],
+                    file_name=st.session_state.get('report_filename', f"{base_name_output}_report.txt"),
+                    mime="text/plain",
+                    key="dl_report"
+                )
+        with dl_col3:
+            if st.session_state.get('stems_zip_bytes'):
+                st.download_button(
+                    label="🎛️ Scarica Stems (ZIP)",
+                    data=st.session_state['stems_zip_bytes'],
+                    file_name=f"{base_name_output}_stems.zip",
+                    mime="application/zip",
+                    key="dl_stems"
+                )
+
+
+def render_description_expander(params: dict) -> None:
+    """Riepilogo leggibile dei parametri usati (expander in fondo alla pagina)."""
+    with st.expander("✨ Descrizione del Brano Generato"):
+        st.write("Questa è una descrizione dettagliata dei parametri usati per generare il tuo brano:")
+
+        st.markdown("#### Impostazioni Video:")
+        st.write(f"- Formato Output Video: **{params['output_resolution_choice']}**")
+        if params['use_original_audio']:
+            st.write(f"- Audio Originale del Video: **Mantenuto** (Livello Mix: **{params['original_audio_mix_level']:.2f}**)")
+        else:
+            st.write("- Audio Originale del Video: **Non mantenuto**")
+        st.write(f"- Normalizzazione Audio Finale: **{'Sì' if params['normalize_audio'] else 'No'}**")
+
+        st.markdown("#### Layer Audio:")
+        if params['subtractive_enabled']:
+            st.markdown("##### Sintesi Sottrattiva (Abilitata):")
+            st.write(f"- Frequenza Controllata da: **{params['sub_freq_source']}** ({params['sub_freq_range'][0]} - {params['sub_freq_range'][1]} Hz)")
+            st.write(f"- Ampiezza Controllata da: **{params['sub_amp_source']}** ({params['sub_amp_range'][0]:.2f} - {params['sub_amp_range'][1]:.2f})")
+            st.write(f"- Tipo Onda: **{params['sub_waveform_type']}**")
+        else:
+            st.write("##### Sintesi Sottrattiva: Disabilitata")
+
+        if params['fm_enabled']:
+            st.markdown("##### Sintesi FM (Abilitata):")
+            st.write(f"- Frequenza Portante Controllata da: **{params['fm_carrier_source']}** ({params['fm_carrier_range'][0]} - {params['fm_carrier_range'][1]} Hz)")
+            st.write(f"- Frequenza Modulatore Controllata da: **{params['fm_mod_source']}** ({params['fm_mod_range'][0]} - {params['fm_mod_range'][1]} Hz)")
+            st.write(f"- Indice Modulazione Controllato da: **{params['fm_mod_idx_source']}** ({params['fm_mod_idx_range'][0]:.1f} - {params['fm_mod_idx_range'][1]:.1f})")
+            st.write(f"- Ampiezza FM Controllata da: **{params['fm_amp_source']}** ({params['fm_amp_range'][0]:.2f} - {params['fm_amp_range'][1]:.2f})")
+        else:
+            st.write("##### Sintesi FM: Disabilitata")
+
+        if params['granular_enabled']:
+            st.markdown("##### Sintesi Granulare (Abilitata):")
+            st.write(f"- Densità Grani Controllata da: **{params['gran_density_source']}** ({params['gran_density_range'][0]} - {params['gran_density_range'][1]} grani)")
+            st.write(f"- Durata Grani Controllata da: **{params['gran_duration_source']}** ({params['gran_duration_range'][0]:.3f} - {params['gran_duration_range'][1]:.3f} sec)")
+            st.write(f"- Ampiezza Grani Controllata da: **{params['gran_amp_source']}** ({params['gran_amp_range'][0]:.2f} - {params['gran_amp_range'][1]:.2f})")
+        else:
+            st.write("##### Sintesi Granulare: Disabilitata")
+
+        if params['noise_enabled']:
+            st.markdown("##### Rumore (Abilitato):")
+            st.write(f"- Ampiezza Rumore Controllata da: **{params['noise_amp_source']}** ({params['noise_amp_range'][0]:.2f} - {params['noise_amp_range'][1]:.2f})")
+        else:
+            st.write("##### Rumore: Disabilitato")
+
+        st.markdown("#### Effetti Audio:")
+        if params['glitch_enabled']:
+            st.markdown("##### Glitch (Abilitato):")
+            st.write(f"- Fattore Glitch (Probabilità) Controllato da: **{params['glitch_factor_source']}** ({params['glitch_factor_range'][0]:.3f} - {params['glitch_factor_range'][1]:.3f})")
+            st.write(f"- Intensità Glitch (Durata/Ampiezza) Controllata da: **{params['glitch_intensity_source']}** ({params['glitch_intensity_range'][0]:.2f} - {params['glitch_intensity_range'][1]:.2f})")
+        else:
+            st.write("##### Glitch: Disabilitato")
+
+        if params['delay_enabled']:
+            st.markdown("##### Delay (Abilitato):")
+            st.write(f"- Tempo Delay Controllato da: **{params['delay_time_source']}** ({params['delay_time_range'][0]:.2f} - {params['delay_time_range'][1]:.2f} sec)")
+            st.write(f"- Feedback Delay Controllato da: **{params['delay_feedback_source']}** ({params['delay_feedback_range'][0]:.2f} - {params['delay_feedback_range'][1]:.2f})")
+        else:
+            st.write("##### Delay: Disabilitato")
+
+        if params['reverb_enabled']:
+            st.markdown("##### Riverbero (Abilitato):")
+            st.write(f"- Tempo Decadimento Controllato da: **{params['reverb_decay_source']}** ({params['reverb_decay_range'][0]:.1f} - {params['reverb_decay_range'][1]:.1f} sec)")
+            st.write(f"- Mix Riverbero Controllato da: **{params['reverb_mix_source']}** ({params['reverb_mix_range'][0]:.2f} - {params['reverb_mix_range'][1]:.2f})")
+        else:
+            st.write("##### Riverbero: Disabilitato")
+
+        if params['eq_enabled']:
+            st.markdown("##### Equalizzatore Dinamico (Abilitato):")
+            st.write(f"- Guadagno Bassi Controllato da: **{params['eq_low_source']}** ({params['eq_gain_range'][0]:.1f} - {params['eq_gain_range'][1]:.1f} dB)")
+            st.write(f"- Guadagno Medi Controllato da: **{params['eq_mid_source']}** ({params['eq_gain_range'][0]:.1f} - {params['eq_gain_range'][1]:.1f} dB)")
+            st.write(f"- Guadagno Alti Controllato da: **{params['eq_high_source']}** ({params['eq_gain_range'][0]:.1f} - {params['eq_gain_range'][1]:.1f} dB)")
+        else:
+            st.write("##### Equalizzatore Dinamico: Disabilitato")
+
+
+# ── Generazione, esportazione e render video ─────────────────────────────────
+
+def _as_text(value) -> str:
+    """Stderr/stdout di un subprocess come testo, che sia bytes o str (dipende da text=True)."""
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode(errors="replace")
+    return str(value)
+
+
+def export_stems_zip(stems: dict, session_id: str) -> bytes:
+    """Scrive ogni stem come WAV dentro uno ZIP e restituisce i byte dello ZIP."""
+    stems_zip_path = f"stems_{session_id}.zip"
+    with zipfile.ZipFile(stems_zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for stem_name, stem_audio in stems.items():
+            stem_wav_path = f"stem_{session_id}_{stem_name}.wav"
+            sf.write(stem_wav_path, stem_audio, AUDIO_SAMPLE_RATE)
+            zf.write(stem_wav_path, arcname=f"{stem_name}.wav")
+            os.remove(stem_wav_path)  # il wav intermedio serve solo per scrivere nello zip
+    # I byte vanno in session_state (stesso pattern del video finale), così il download
+    # persiste tra i rerun anche se il file su disco viene poi ripulito.
+    with open(stems_zip_path, "rb") as f:
+        zip_bytes = f.read()
+    os.remove(stems_zip_path)
+    return zip_bytes
+
+
+def run_audio_preview(audio_generator, layers: dict, output: dict, session_id: str) -> None:
+    """Genera solo l'audio, senza toccare FFmpeg/video: pensata per iterare rapidamente sui
+    parametri ad orecchio, senza aspettare ogni volta il render+mux del video intero."""
+    st.info("🎵 Generazione anteprima audio in corso...")
+    preview_audio = build_combined_audio(audio_generator, layers, output)
+    preview_audio_path = f"preview_audio_{session_id}.wav"
+    sf.write(preview_audio_path, preview_audio, AUDIO_SAMPLE_RATE)
+    del preview_audio
+    st.audio(preview_audio_path, format="audio/wav")
+    gc.collect()
+
+
+def render_final_video(params: dict, output: dict, session_id: str, base_name_output: str,
+                       video_input_path: str, audio_output_path: str, duration_seconds: float) -> None:
+    """Unisce video e audio generato con FFmpeg (opzionalmente mixando l'audio originale),
+    mostra il progresso, prepara il report e ripulisce i file temporanei."""
+    output_resolution_choice = output['output_resolution_choice']
+    use_original_audio = output['use_original_audio']
+    original_audio_mix_level = output['original_audio_mix_level']
+    st.info("🎥 Unione audio/video e ricodifica in corso... Potrebbe richiedere del tempo.")
+    progress_bar_video = st.progress(0)
+    status_text_video = st.empty()
+
+    final_video_path = f"output_{base_name_output}_{session_id}_{output_resolution_choice.replace(' ', '_')}.mp4"
+
+    ffmpeg_command = ["ffmpeg", "-y"]
+
+    temp_original_audio_path = None
+    if use_original_audio:
+        # Estrai audio originale. Il video caricato potrebbe non avere una
+        # traccia audio (es. screen recording muto) o avere un codec che
+        # ffmpeg non riesce a rimappare in AAC: in quel caso non crashare,
+        # avvisa l'utente e prosegui usando solo l'audio generato.
+        temp_original_audio_path = f"temp_original_audio_{session_id}.aac"
+        try:
+            subprocess.run([
+                "ffmpeg", "-y", "-i", video_input_path, "-vn", "-acodec", "aac", temp_original_audio_path
+            ], check=True, capture_output=True)
+        except subprocess.CalledProcessError:
+            st.warning("⚠️ Impossibile estrarre l'audio originale dal video (potrebbe non avere una traccia audio). Procedo usando solo l'audio generato.")
+            use_original_audio = False
+            params['use_original_audio'] = False
+            if os.path.exists(temp_original_audio_path):
+                os.remove(temp_original_audio_path)
+            temp_original_audio_path = None
+
+    if use_original_audio:
+        # Mix e ricodifica
+        ffmpeg_command.extend([
+            "-i", video_input_path,
+            "-i", audio_output_path,
+            "-i", temp_original_audio_path,
+            "-filter_complex",
+            f"[1:a]volume=1.0[generated_audio];" # volume fisso per audio generato
+            f"[2:a]volume={original_audio_mix_level}[original_audio];" # volume per audio originale
+            f"[generated_audio][original_audio]amix=inputs=2:duration=longest[aout]", # mix
+            "-map", "0:v",
+            "-map", "[aout]",
+            "-c:v", "libx264",
+            "-preset", "medium",
+            "-crf", "23",
+            "-c:a", "aac",
+            "-b:a", "192k",
+        ])
+    else:
+        ffmpeg_command.extend([
+            "-i", video_input_path,
+            "-i", audio_output_path,
+            "-map", "0:v",
+            "-map", "1:a",
+            "-c:v", "libx264",
+            "-preset", "medium",
+            "-crf", "23",
+            "-c:a", "aac",
+            "-b:a", "192k",
+        ])
+
+    if output_resolution_choice != "Originale":
+        width, height = FORMAT_RESOLUTIONS[output_resolution_choice]
+        ffmpeg_command.extend(["-vf", f"scale={width}:{height},setsar=1:1"])
+
+    ffmpeg_command.append(final_video_path)
+
+    try:
+        process = subprocess.Popen(ffmpeg_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+        # Cerca il progresso corrente nell'output di FFmpeg (la durata totale
+        # è già nota da duration_seconds, quindi non serve riestrarla dallo stderr)
+        time_pattern = r"time=(\d{2}):(\d{2}):(\d{2}\.\d{2})"
+
+        total_seconds = duration_seconds # Già calcolato prima
+
+        while True:
+            output = process.stderr.readline()
+            if not output and process.poll() is not None:
+                break
+            if output:
+                time_match = re.search(time_pattern, output)
+                if time_match:
+                    hours, minutes, seconds = map(float, time_match.groups())
+                    current_seconds = hours * 3600 + minutes * 60 + seconds
+                    if total_seconds > 0:
+                        progress = int((current_seconds / total_seconds) * 100)
+                        progress_bar_video.progress(min(progress, 99)) # Non arrivare al 100% finché non è finito
+                        status_text_video.text(f"Elaborazione video: {current_seconds:.2f}/{total_seconds:.2f}s")
+
+        stdout, stderr = process.communicate()
+        if process.returncode != 0:
+            raise subprocess.CalledProcessError(process.returncode, process.args, stdout, stderr)
+
+        progress_bar_video.progress(100)
+        status_text_video.text("Video completato!")
+        st.success("✅ Video con audio generato con successo! Scarica qui sotto:")
+
+        # Salva video in session_state (così il download non riavvia la generazione)
+        with open(final_video_path, "rb") as f:
+            st.session_state['video_bytes'] = f.read()
+        preset_slug = preset_to_filename_slug(st.session_state.get('preset_choice', PRESET_MANUALE))
+        name_suffix = f"_{preset_slug}" if preset_slug else ""
+        st.session_state['video_filename'] = f"{base_name_output}{name_suffix}_video.mp4"
+        st.session_state['report_filename'] = f"{base_name_output}{name_suffix}_report.txt"
+
+        st.session_state['report_text'] = build_report_text(params)
+
+        # Pulisci i file temporanei
+        for temp_f in [video_input_path, audio_output_path, temp_original_audio_path if use_original_audio else None, final_video_path]:
+            if temp_f and os.path.exists(temp_f):
+                os.remove(temp_f)
+        st.info("🗑️ File temporanei puliti.")
+
+    except subprocess.CalledProcessError as e:
+        st.error(f"❌ Errore FFmpeg durante l'unione/ricodifica: {_as_text(e.stderr)}")
+        st.code(_as_text(e.stdout) + _as_text(e.stderr))
+        # Pulisci i file temporanei anche in caso di errore FFmpeg
+        for temp_f in [video_input_path, audio_output_path, temp_original_audio_path if use_original_audio else None]:
+            if temp_f and os.path.exists(temp_f):
+                os.remove(temp_f)
+        st.info("🗑️ File temporanei puliti.")
+    except Exception as e:
+        st.error(f"❌ Errore generico durante l'unione/ricodifica: {str(e)}")
+        # Pulisci i file temporanei anche in caso di errore generico
+        for temp_f in [video_input_path, audio_output_path, temp_original_audio_path if use_original_audio else None]:
+            if temp_f and os.path.exists(temp_f):
+                os.remove(temp_f)
+        st.info("🗑️ File temporanei puliti.")
+
+
+def run_audio_generation(audio_generator, layers: dict, output: dict, params: dict, *,
+                         generative_mode: bool, session_id: str, base_name_output: str,
+                         video_input_path: str, duration_seconds: float,
+                         generative_info: dict = None) -> None:
+    """Click su "Genera ...": mixa l'audio, scrive WAV (+ stems) e poi, a seconda della
+    modalità, offre la traccia generativa o produce il video finale."""
+    st.info("🎵 Generazione e mixaggio audio in corso... Attendere.")
+    progress_bar_audio = st.progress(0)
+    status_text_audio = st.empty()
+
+    progress_bar_audio.progress(10)
+    status_text_audio.text("Generazione layer e applicazione effetti...")
+
+    combined_audio, generated_stems = build_combined_audio(audio_generator, layers, output, return_stems=True)
+
+    progress_bar_audio.progress(90)
+    status_text_audio.text("Scrittura file audio...")
+
+    audio_output_path = f"output_audio_{session_id}.wav"
+    sf.write(audio_output_path, combined_audio, AUDIO_SAMPLE_RATE)
+    del combined_audio  # il WAV è su disco: libera il buffer (fino a ~100+ MB)
+
+    if output['export_stems'] and generated_stems:
+        st.session_state['stems_zip_bytes'] = export_stems_zip(generated_stems, session_id)
+    else:
+        st.session_state['stems_zip_bytes'] = None
+    generated_stems = None  # stems già scritti nello zip: libera la RAM
+
+    progress_bar_audio.progress(100)
+    status_text_audio.text("Audio generato!")
+    st.success("✅ Audio generato con successo!")
+
+    gc.collect()  # Libera memoria
+
+    # In modalità generativa non c'è nessun video da unire: offri direttamente l'audio,
+    # riusando lo stesso percorso già previsto per quando FFmpeg non è disponibile
+    # (stessa logica, messaggio diverso per non confondere "niente video" con un errore).
+    if generative_mode:
+        st.success(f"🎵 Traccia generativa pronta: '{base_name_output}'.")
+        with open(audio_output_path, "rb") as f:
+            audio_bytes = f.read()
+        st.session_state['generative_audio_bytes'] = audio_bytes
+        # Report dei parametri anche per la traccia generativa (prima c'era solo per il video).
+        preset_slug = preset_to_filename_slug(st.session_state.get('preset_choice', PRESET_MANUALE))
+        name_suffix = f"_{preset_slug}" if preset_slug else ""
+        st.session_state['report_text'] = build_report_text(params, generative_info)
+        st.session_state['report_filename'] = f"{base_name_output}{name_suffix}_report.txt"
+        st.download_button(
+            "⬇️ Scarica Traccia Audio (WAV)",
+            audio_bytes,
+            file_name=f"{base_name_output}.wav",
+            mime="audio/wav",
+            key="dl_generative_audio_inline"
+        )
+        if os.path.exists(audio_output_path):
+            os.remove(audio_output_path)
+    elif not check_ffmpeg():
+        st.warning(f"⚠️ FFmpeg non è installato o non è nel PATH. Impossibile unire il video con l'audio. L'audio generato è disponibile in '{audio_output_path}'.")
+        with open(audio_output_path, "rb") as f:
+            st.download_button(
+                "⬇️ Scarica Solo Audio (WAV temporaneo)",
+                f,
+                file_name=f"videosound_generato_audio_{base_name_output}.wav",
+                mime="audio/wav"
+            )
+        # Pulisci i file temporanei ANCHE se FFmpeg non è stato trovato
+        for temp_f in [video_input_path, audio_output_path]:
+            if temp_f and os.path.exists(temp_f):
+                os.remove(temp_f)
+        st.info("🗑️ File temporanei puliti.")
+    else:  # FFmpeg è disponibile, procedi con l'unione di video e audio
+        render_final_video(params, output, session_id, base_name_output,
+                           video_input_path, audio_output_path, duration_seconds)
+
+
+# ── Entry point ──────────────────────────────────────────────────────────────
+
+def main():
+    st.set_page_config(layout="wide", page_title="VideoSound Gen. by Loop507", page_icon="🎵")
+
+    # Modifica 1: Titolo con "by Loop507" più piccolo
+    st.markdown("# VideoSound Gen. <small>by Loop507</small>", unsafe_allow_html=True)
+    st.markdown("Crea colonne sonore uniche dai tuoi video, trasformando i dati visivi in paesaggi sonori dinamici.")
+
+    source = render_source_sidebar()
+    generative_mode = source['generative_mode']
+
+    # Parametri scelti dall'utente, raccolti dalle schede per report e descrizione finale
+    params = {}
+
+    # ID univoco per sessione (nomi dei file temporanei) + valori di session_state dei download
+    session_id = init_session_state()
+
+    if source['granular_mode']:
         handle_granular_audio_mode(session_id)
         return
 
-    if uploaded_file is not None or generative_mode:
-        video_input_path = None  # resta None in modalità generativa: nessun file video reale
+    if source['uploaded_file'] is None and not generative_mode:
+        return  # niente da mostrare finché non c'è un video (o la modalità generativa)
+
+    loaded = load_features(source, session_id)
+    if loaded is None:
+        return
+    ctx, duration_seconds, video_input_path, base_name_output = loaded
+
+    st.subheader("Generazione Audio")
+    render_preset_box()
+
+    audio_generator = get_audio_generator(AUDIO_SAMPLE_RATE, duration_seconds)
+
+    render_melody_controls(params, ctx)
+
+    # Scheda per i parametri audio
+    tab_sub, tab_fm, tab_epiano, tab_gran, tab_pluck, tab_noise, tab_fx, tab_eq, tab_pan = st.tabs([
+        "Sintesi Sottrattiva", "Sintesi FM", "E-Piano (FM)", "Sintesi Granulare", "Corde (Karplus-Strong)", "Rumore", "Effetti Audio", "Equalizzatore", "Panning & Altezza"
+    ])
+    layers = {}
+    with tab_sub:
+        layers['sub'] = render_subtractive_tab(params, ctx)
+    with tab_fm:
+        layers['fm'] = render_fm_tab(params, ctx)
+    with tab_epiano:
+        layers['epiano'] = render_epiano_tab(params, ctx)
+    with tab_gran:
+        layers['gran'] = render_granular_tab(params, ctx)
+    with tab_pluck:
+        layers['pluck'] = render_pluck_tab(params, ctx)
+    with tab_noise:
+        layers['noise'] = render_noise_tab(params, ctx)
+    with tab_fx:
+        layers['glitch'], layers['delay'], layers['reverb'] = render_effects_tab(params, ctx)
+    with tab_eq:
+        layers['eq'] = render_eq_tab(params, ctx)
+    with tab_pan:
+        layers['pan'], layers['elev'] = render_spatial_tab(params, ctx)
+
+    output = render_output_settings(params, generative_mode)
+
+    generative_info = ({'duration': source['generative_duration'], 'seed': source['generative_seed']}
+                       if generative_mode else None)
+
+    if st.button("🔊 Anteprima Audio (senza video)"):
+        run_audio_preview(audio_generator, layers, output, session_id)
+
+    if st.button("🎵 Genera Traccia Audio" if generative_mode else "Genera Video con Audio"):
+        run_audio_generation(audio_generator, layers, output, params,
+                             generative_mode=generative_mode, session_id=session_id,
+                             base_name_output=base_name_output, video_input_path=video_input_path,
+                             duration_seconds=duration_seconds,
+                             generative_info=generative_info)
+
+    render_download_section(base_name_output)
+
+    st.markdown("---")
+    render_description_expander(params)
+
+    gc.collect()
 
-        if generative_mode:
-            luminosity_data, detail_data, movement_data, variation_movement_data, horizontal_mass_center_data, vertical_mass_center_data, edge_density_data, color_variation_data, duration_seconds, fps = generate_synthetic_feature_curves(
-                float(generative_duration), fps=30.0, seed=generative_seed
-            )
-            base_name_output = generative_track_name.strip() or "traccia_generativa"
-
-        else:
-            if not validate_video_file(uploaded_file):
-                # Se la validazione fallisce, pulisci il file caricato e termina
-                invalid_path = f"temp_input_{session_id}_{uploaded_file.name}"
-                if os.path.exists(invalid_path):
-                    os.remove(invalid_path)
-                return
-
-            st.sidebar.success("✅ Video caricato con successo!")
-
-            # Pulisci eventuali file temporanei rimasti da un upload precedente in questa
-            # stessa sessione (es. utente carica un video, non completa la generazione,
-            # poi ne carica un altro: senza questa pulizia i vecchi file si accumulerebbero).
-            cleanup_session_temp_files(session_id)
-
-            # Salva il file temporaneamente, con nome univoco per sessione
-            video_input_path = f"temp_input_{session_id}_{uploaded_file.name}"
-            with open(video_input_path, "wb") as f:
-                f.write(uploaded_file.getbuffer())
-
-            # Hash del contenuto: usato come chiave di cache insieme al path (vedi il commento su
-            # analyze_video_frames_cached) per evitare che un video diverso con lo stesso nome file
-            # riusi per errore l'analisi di un video precedente nella stessa sessione.
-            file_hash = hashlib.md5(uploaded_file.getbuffer()).hexdigest()
-
-            try:
-                luminosity_data, detail_data, movement_data, variation_movement_data, horizontal_mass_center_data, vertical_mass_center_data, edge_density_data, color_variation_data, duration_seconds, fps = analyze_video_frames_cached(video_input_path, file_hash)
-            except ValueError as analysis_error: # Video non apribile, corrotto, troppo corto/lungo
-                st.error(str(analysis_error))
-                if os.path.exists(video_input_path):
-                    os.remove(video_input_path)
-                return
-
-            if not luminosity_data: # Nessun frame decodificato
-                st.error("❌ Nessun frame leggibile nel video.")
-                os.remove(video_input_path)
-                return
-
-            # base_name_output è ora definito qui, prima dell'uso condizionale
-            base_name_output = os.path.splitext(uploaded_file.name)[0]
-
-        st.subheader("Generazione Audio")
-
-        # ── BOX PRESET PER TIPO DI VIDEO ────────────────────────────────────
-        st.markdown("#### 🎨 Preset per tipo di video")
-        st.caption("Scegli un punto di partenza in base al tipo di footage, poi ritocca liberamente i parametri nei tab sotto.")
-        preset_options = [PRESET_MANUALE] + list(VIDEO_PRESETS.keys())
-        selected_preset = st.selectbox("Preset", preset_options, key='preset_choice')
-
-        if selected_preset != PRESET_MANUALE and st.session_state.get('_last_applied_preset') != selected_preset:
-            # Azzera tutti i toggle dei layer prima di applicare il preset specifico: altrimenti
-            # un layer abilitato da un preset precedente (o acceso manualmente) resterebbe attivo
-            # anche scegliendo un nuovo preset che non lo nomina esplicitamente nel suo dizionario.
-            all_layer_toggles = [
-                'subtractive_on', 'sub_filter_on', 'sub_band_limited', 'fm_on', 'epiano_on',
-                'granular_on', 'pluck_on', 'noise_on', 'glitch_on', 'delay_on', 'reverb_on',
-                'eq_on', 'panning_on', 'elevation_on', 'melody_on',
-            ]
-            for toggle_key in all_layer_toggles:
-                st.session_state[toggle_key] = False
-            for preset_key, preset_value in VIDEO_PRESETS[selected_preset].items():
-                st.session_state[preset_key] = preset_value
-            st.session_state['_last_applied_preset'] = selected_preset
-            st.rerun()
-        elif selected_preset == PRESET_MANUALE:
-            st.session_state['_last_applied_preset'] = None
-
-        # Inizializza AudioGenerator
-        audio_generator = get_audio_generator(AUDIO_SAMPLE_RATE, duration_seconds)
-
-        # ── Melodia globale (quantizzazione a scala) ──────────────────────────────
-        # Un unico controllo condiviso da tutti i layer con un'intonazione (sottrattiva, FM,
-        # granulare, e-piano, corde) invece di un controllo per-layer: se ogni layer avesse la
-        # propria scala/tonica indipendente, potrebbero suonare in chiavi diverse simultaneamente.
-        # Rumore e Glitch non compaiono qui: sono broadband/senza un'intonazione riconoscibile
-        # (il rumore è per definizione energia distribuita su tutte le frequenze; il glitch lavora
-        # su ripetizione/rumore/inversione del segnale, non su un pitch) — non c'è nulla da
-        # agganciare a una nota, quindi "quantizzarli" non avrebbe alcun effetto reale.
-        with st.expander("🎵 Melodia (quantizzazione a scala)", expanded=False):
-            st.caption(
-                "Di default l'intonazione di ogni layer è continua, guidata liberamente dal video "
-                "(come un glissando). Abilitando la quantizzazione, ogni nota/pizzicata/oscillatore "
-                "si aggancia alla nota più vicina della scala scelta: il video continua a decidere "
-                "quale nota suona, ma il risultato è una melodia riconoscibile invece di "
-                "un'intonazione libera/microtonale. Si applica a tutti i layer con un'intonazione "
-                "(Sottrattiva, FM, Granulare, E-Piano, Corde) usando la stessa tonica, così restano "
-                "sempre in accordo tra loro invece che ognuno per conto suo."
-            )
-            use_melody_quantization = st.checkbox("Abilita Melodia", value=False, key='melody_on')
-            params['melody_enabled'] = use_melody_quantization
-            if use_melody_quantization:
-                melody_scale = st.selectbox("Scala Musicale", list(MUSICAL_SCALES.keys()), key='melody_scale')
-                melody_root_note = st.slider(
-                    "Nota Fondamentale (Hz)", 55.0, 440.0, 220.0, step=1.0, key='melody_root_note',
-                    help="La 'tonica' condivisa da tutti i layer: 220Hz = La3, 110Hz = La2, 261.6Hz = Do4 (centrale)."
-                )
-            else:
-                melody_scale = SCALE_NONE
-                melody_root_note = 220.0
-            params['melody_scale'] = melody_scale
-            params['melody_root_note'] = melody_root_note
-
-        def apply_melody(freqs: list) -> list:
-            """Applica la quantizzazione a scala globale, se abilitata, altrimenti restituisce
-            le frequenze invariate (intonazione libera)."""
-            if not use_melody_quantization:
-                return freqs
-            return quantize_to_scale(freqs, melody_root_note, melody_scale)
-
-        # Scheda per i parametri audio
-        tab_sub, tab_fm, tab_epiano, tab_gran, tab_pluck, tab_noise, tab_fx, tab_eq, tab_pan = st.tabs([
-            "Sintesi Sottrattiva", "Sintesi FM", "E-Piano (FM)", "Sintesi Granulare", "Corde (Karplus-Strong)", "Rumore", "Effetti Audio", "Equalizzatore", "Panning & Altezza"
-        ])
-
-        # Layer 1: Sintesi Sottrattiva (Basato su Luminosità e Dettaglio)
-        with tab_sub:
-            st.markdown("### Layer: Sintesi Sottrattiva")
-            use_subtractive = st.checkbox("Abilita Sintesi Sottrattiva", value=True, key='subtractive_on')
-            params['subtractive_enabled'] = use_subtractive
-            if use_subtractive:
-                sub_layer_gain = st.slider("🎚️ Volume Layer Sottrattivo", 0.0, 2.0, 1.0, step=0.05, key='sub_gain',
-                                            help="Bilancia questo layer rispetto agli altri attivi contemporaneamente.")
-                params['sub_layer_gain'] = sub_layer_gain
-            else:
-                sub_layer_gain = 0.0
-            if use_subtractive:
-                sub_freq_source = st.selectbox("Sorgente Frequenza (Hz)", ["Luminosità", "Dettaglio", "Movimento", "Densità Contorni", "Variazione Colore"], key='sub_freq_src')
-                sub_amp_source = st.selectbox("Sorgente Ampiezza (0-1)", ["Luminosità", "Dettaglio", "Movimento", "Densità Contorni", "Variazione Colore"], key='sub_amp_src')
-                sub_waveform_type = st.selectbox("Tipo di Forma d'Onda", ["sine", "square", "sawtooth"], key='sub_waveform_type')
-
-                if sub_waveform_type in ("square", "sawtooth"):
-                    sub_band_limited = st.checkbox(
-                        "Band-limited (anti-aliasing PolyBLEP)", value=False, key='sub_band_limited',
-                        help="Di default square/sawtooth sono generate 'al naturale' e aliasano alle "
-                             "frequenze medio-alte: è l'artefatto lo-fi/glitch tipico ricercato in molta "
-                             "musica elettronica. Attiva questa opzione per un suono più pulito in stile "
-                             "synth analogico, senza aliasing."
-                    )
-                else:
-                    sub_band_limited = False
-                params['sub_band_limited'] = sub_band_limited
-
-                
-                sub_freq_min = st.slider("Frequenza Minima (Hz)", 20, 1000, 100, key='sub_freq_min')
-                sub_freq_max = st.slider("Frequenza Massima (Hz)", 20, 1000, 800, key='sub_freq_max')
-                sub_amp_min = st.slider("Ampiezza Minima", 0.0, 1.0, 0.1, step=0.01, key='sub_amp_min')
-                sub_amp_max = st.slider("Ampiezza Massima", 0.0, 1.0, 0.5, step=0.01, key='sub_amp_max')
-
-                params['sub_freq_source'] = sub_freq_source
-                params['sub_amp_source'] = sub_amp_source
-                params['sub_waveform_type'] = sub_waveform_type
-                params['sub_freq_range'] = (sub_freq_min, sub_freq_max)
-                params['sub_amp_range'] = (sub_amp_min, sub_amp_max)
-
-                sub_freq_data_raw = []
-                if sub_freq_source == "Luminosità": sub_freq_data_raw = luminosity_data
-                elif sub_freq_source == "Dettaglio": sub_freq_data_raw = detail_data
-                elif sub_freq_source == "Movimento": sub_freq_data_raw = movement_data
-                elif sub_freq_source == "Densità Contorni": sub_freq_data_raw = edge_density_data
-                elif sub_freq_source == "Variazione Colore": sub_freq_data_raw = color_variation_data
-
-                sub_amp_data_raw = []
-                if sub_amp_source == "Luminosità": sub_amp_data_raw = luminosity_data
-                elif sub_amp_source == "Dettaglio": sub_amp_data_raw = detail_data
-                elif sub_amp_source == "Movimento": sub_amp_data_raw = movement_data
-                elif sub_amp_source == "Densità Contorni": sub_amp_data_raw = edge_density_data
-                elif sub_amp_source == "Variazione Colore": sub_amp_data_raw = color_variation_data
-                
-                # Normalizza e scala i dati delle sorgenti
-                sub_freq_scaled = scale_frequency_exponential(sub_freq_data_raw, sub_freq_min, sub_freq_max)
-                sub_freq_scaled = apply_melody(sub_freq_scaled)
-                sub_amp_scaled = np.interp(sub_amp_data_raw, (min(sub_amp_data_raw) if sub_amp_data_raw else 0, max(sub_amp_data_raw) if sub_amp_data_raw else 1), (sub_amp_min, sub_amp_max)).tolist()
-
-                st.markdown("##### Filtro Sottrattivo (vero)")
-                sub_filter_enabled = st.checkbox(
-                    "Applica filtro passa-basso risonante", value=False, key='sub_filter_on',
-                    help="'Sintesi sottrattiva' significa scolpire le armoniche con un filtro, non solo "
-                         "modulare ampiezza/frequenza dell'onda: questo aggiunge il filtro vero e proprio "
-                         "(risonante, con Q) sopra la forma d'onda già generata. Funziona meglio con "
-                         "square/sawtooth, che sono ricche di armoniche da tagliare."
-                )
-                params['sub_filter_enabled'] = sub_filter_enabled
-                if sub_filter_enabled:
-                    sub_cutoff_source = st.selectbox("Sorgente Cutoff (Hz)", ["Luminosità", "Dettaglio", "Movimento", "Densità Contorni", "Variazione Colore"], key='sub_cutoff_src')
-                    sub_cutoff_min = st.slider("Cutoff Minimo (Hz)", 50, 5000, 200, key='sub_cutoff_min')
-                    sub_cutoff_max = st.slider("Cutoff Massimo (Hz)", 50, 8000, 3000, key='sub_cutoff_max')
-                    sub_resonance = st.slider(
-                        "Risonanza (Q)", 0.5, 8.0, 1.5, step=0.1, key='sub_resonance',
-                        help="Q alto = picco più marcato intorno al cutoff (carattere più 'synth'/aggressivo)."
-                    )
-                    params['sub_cutoff_source'] = sub_cutoff_source
-                    params['sub_cutoff_range'] = (sub_cutoff_min, sub_cutoff_max)
-                    params['sub_resonance'] = sub_resonance
-
-                    sub_cutoff_data_raw = []
-                    if sub_cutoff_source == "Luminosità": sub_cutoff_data_raw = luminosity_data
-                    elif sub_cutoff_source == "Dettaglio": sub_cutoff_data_raw = detail_data
-                    elif sub_cutoff_source == "Movimento": sub_cutoff_data_raw = movement_data
-                    elif sub_cutoff_source == "Densità Contorni": sub_cutoff_data_raw = edge_density_data
-                    elif sub_cutoff_source == "Variazione Colore": sub_cutoff_data_raw = color_variation_data
-
-                    sub_cutoff_scaled = scale_frequency_exponential(sub_cutoff_data_raw, sub_cutoff_min, sub_cutoff_max)
-                    sub_resonance_scaled = [sub_resonance] * max(len(sub_cutoff_scaled), 1)
-                else:
-                    sub_cutoff_scaled = []
-                    sub_resonance_scaled = []
-            else: # Aggiunto else per gestire i casi in cui i dati non sono scalati
-                sub_freq_scaled = []
-                sub_amp_scaled = []
-                sub_band_limited = False
-                params['sub_band_limited'] = False
-                sub_filter_enabled = False
-                params['sub_filter_enabled'] = False
-                sub_cutoff_scaled = []
-                sub_resonance_scaled = []
-
-        # Layer 2: Sintesi FM (Basato su Variazione Movimento e Centro di Massa Orizzontale)
-        with tab_fm:
-            st.markdown("### Layer: Sintesi FM")
-            use_fm = st.checkbox("Abilita Sintesi FM", value=True, key='fm_on')
-            params['fm_enabled'] = use_fm
-            if use_fm:
-                fm_layer_gain = st.slider("🎚️ Volume Layer FM", 0.0, 2.0, 1.0, step=0.05, key='fm_gain',
-                                           help="Bilancia questo layer rispetto agli altri attivi contemporaneamente.")
-                params['fm_layer_gain'] = fm_layer_gain
-
-                fm_source_options = ["Luminosità", "Dettaglio", "Movimento", "Variazione Movimento", "Densità Contorni", "Variazione Colore"]
-                fm_carrier_source = st.selectbox("Sorgente Frequenza Portante (Hz)", fm_source_options, key='fm_carr_src')
-                fm_mod_source = st.selectbox("Sorgente Frequenza Modulatore (Hz)", fm_source_options, key='fm_mod_src')
-                fm_mod_idx_source = st.selectbox("Sorgente Indice Modulazione", fm_source_options, key='fm_idx_src')
-                fm_amp_source = st.selectbox("Sorgente Ampiezza (0-1)", fm_source_options, key='fm_amp_src')
-
-                fm_carrier_min = st.slider("Portante Minima (Hz)", 50, 2000, 200, key='fm_carr_min')
-                fm_carrier_max = st.slider("Portante Massima (Hz)", 50, 2000, 1500, key='fm_carr_max')
-                fm_mod_min = st.slider("Modulatore Minimo (Hz)", 10, 500, 50, key='fm_mod_min')
-                fm_mod_max = st.slider("Modulatore Massimo (Hz)", 10, 500, 250, key='fm_mod_max')
-                fm_mod_idx_min = st.slider("Indice Modulazione Minimo", 0.0, 10.0, 0.5, step=0.1, key='fm_idx_min')
-                fm_mod_idx_max = st.slider("Indice Modulazione Massimo", 0.0, 10.0, 5.0, step=0.1, key='fm_idx_max')
-                fm_amp_min = st.slider("Ampiezza FM Minima", 0.0, 1.0, 0.05, step=0.01, key='fm_amp_min')
-                fm_amp_max = st.slider("Ampiezza FM Massima", 0.0, 1.0, 0.3, step=0.01, key='fm_amp_max')
-
-                params['fm_carrier_source'] = fm_carrier_source
-                params['fm_mod_source'] = fm_mod_source
-                params['fm_mod_idx_source'] = fm_mod_idx_source
-                params['fm_amp_source'] = fm_amp_source
-                params['fm_carrier_range'] = (fm_carrier_min, fm_carrier_max)
-                params['fm_mod_range'] = (fm_mod_min, fm_mod_max)
-                params['fm_mod_idx_range'] = (fm_mod_idx_min, fm_mod_idx_max)
-                params['fm_amp_range'] = (fm_amp_min, fm_amp_max)
-
-                fm_carrier_data_raw = []
-                if fm_carrier_source == "Luminosità": fm_carrier_data_raw = luminosity_data
-                elif fm_carrier_source == "Dettaglio": fm_carrier_data_raw = detail_data
-                elif fm_carrier_source == "Movimento": fm_carrier_data_raw = movement_data
-                elif fm_carrier_source == "Variazione Movimento": fm_carrier_data_raw = variation_movement_data
-                elif fm_carrier_source == "Densità Contorni": fm_carrier_data_raw = edge_density_data
-                elif fm_carrier_source == "Variazione Colore": fm_carrier_data_raw = color_variation_data
-
-                fm_mod_data_raw = []
-                if fm_mod_source == "Luminosità": fm_mod_data_raw = luminosity_data
-                elif fm_mod_source == "Dettaglio": fm_mod_data_raw = detail_data
-                elif fm_mod_source == "Movimento": fm_mod_data_raw = movement_data
-                elif fm_mod_source == "Variazione Movimento": fm_mod_data_raw = variation_movement_data
-                elif fm_mod_source == "Densità Contorni": fm_mod_data_raw = edge_density_data
-                elif fm_mod_source == "Variazione Colore": fm_mod_data_raw = color_variation_data
-
-                fm_mod_idx_data_raw = []
-                if fm_mod_idx_source == "Luminosità": fm_mod_idx_data_raw = luminosity_data
-                elif fm_mod_idx_source == "Dettaglio": fm_mod_idx_data_raw = detail_data
-                elif fm_mod_idx_source == "Movimento": fm_mod_idx_data_raw = movement_data
-                elif fm_mod_idx_source == "Variazione Movimento": fm_mod_idx_data_raw = variation_movement_data
-                elif fm_mod_idx_source == "Densità Contorni": fm_mod_idx_data_raw = edge_density_data
-                elif fm_mod_idx_source == "Variazione Colore": fm_mod_idx_data_raw = color_variation_data
-
-                fm_amp_data_raw = []
-                if fm_amp_source == "Luminosità": fm_amp_data_raw = luminosity_data
-                elif fm_amp_source == "Dettaglio": fm_amp_data_raw = detail_data
-                elif fm_amp_source == "Movimento": fm_amp_data_raw = movement_data
-                elif fm_amp_source == "Variazione Movimento": fm_amp_data_raw = variation_movement_data
-                elif fm_amp_source == "Densità Contorni": fm_amp_data_raw = edge_density_data
-                elif fm_amp_source == "Variazione Colore": fm_amp_data_raw = color_variation_data
-
-
-                fm_carrier_scaled = scale_frequency_exponential(fm_carrier_data_raw, fm_carrier_min, fm_carrier_max)
-                fm_carrier_scaled = apply_melody(fm_carrier_scaled)
-                fm_mod_scaled = scale_frequency_exponential(fm_mod_data_raw, fm_mod_min, fm_mod_max)
-                fm_mod_idx_scaled = np.interp(fm_mod_idx_data_raw, (min(fm_mod_idx_data_raw) if fm_mod_idx_data_raw else 0, max(fm_mod_idx_data_raw) if fm_mod_idx_data_raw else 1), (fm_mod_idx_min, fm_mod_idx_max)).tolist()
-                fm_amp_scaled = np.interp(fm_amp_data_raw, (min(fm_amp_data_raw) if fm_amp_data_raw else 0, max(fm_amp_data_raw) if fm_amp_data_raw else 1), (fm_amp_min, fm_amp_max)).tolist()
-            else: # Aggiunto else per gestire i casi in cui i dati non sono scalati
-                fm_carrier_scaled = []
-                fm_mod_scaled = []
-                fm_mod_idx_scaled = []
-                fm_amp_scaled = []
-                fm_layer_gain = 0.0
-
-        # Layer 2b: E-Piano FM (note discrete, stile DX7/Rhodes)
-        with tab_epiano:
-            st.markdown("### Layer: E-Piano (FM a note)")
-            st.caption(
-                "A differenza della Sintesi FM continua qui sopra, questo layer suona NOTE "
-                "discrete con inviluppo: attacco rapido, decadimento esponenziale, e un indice "
-                "di modulazione che si smorza più in fretta dell'ampiezza (il timbro si "
-                "'ammorbidisce' mentre la nota risuona) — il meccanismo classico degli e-piano "
-                "FM digitali (DX7 EPiano1, Rhodes)."
-            )
-            use_epiano = st.checkbox("Abilita Layer E-Piano", value=False, key='epiano_on')
-            params['epiano_enabled'] = use_epiano
-            if use_epiano:
-                epiano_layer_gain = st.slider("🎚️ Volume Layer E-Piano", 0.0, 2.0, 1.0, step=0.05, key='epiano_gain')
-                params['epiano_layer_gain'] = epiano_layer_gain
-
-                epiano_source_options = ["Luminosità", "Dettaglio", "Movimento", "Densità Contorni", "Variazione Colore"]
-                epiano_density_source = st.selectbox("Sorgente Densità Note", epiano_source_options, key='epiano_dens_src')
-                epiano_pitch_source = st.selectbox("Sorgente Intonazione", epiano_source_options, key='epiano_pitch_src', index=2)
-                epiano_brightness_source = st.selectbox("Sorgente Brillantezza (indice FM)", epiano_source_options, key='epiano_bright_src', index=1)
-                epiano_amp_source = st.selectbox("Sorgente Ampiezza", epiano_source_options, key='epiano_amp_src')
-
-                epiano_density_min = st.slider("Densità Minima (note/finestra)", 0, 5, 0, key='epiano_dens_min')
-                epiano_density_max = st.slider("Densità Massima (note/finestra)", 0, 5, 2, key='epiano_dens_max')
-                epiano_pitch_min = st.slider("Intonazione Minima (Hz)", 40, 800, 130, key='epiano_pitch_min')
-                epiano_pitch_max = st.slider("Intonazione Massima (Hz)", 40, 1500, 500, key='epiano_pitch_max')
-                epiano_amp_min = st.slider("Ampiezza Minima", 0.0, 1.0, 0.3, step=0.01, key='epiano_amp_min')
-                epiano_amp_max = st.slider("Ampiezza Massima", 0.0, 1.0, 1.0, step=0.01, key='epiano_amp_max')
-                epiano_note_duration = st.slider(
-                    "Durata Massima Nota (sec)", 0.3, 2.5, 1.2, step=0.1, key='epiano_note_dur',
-                    help="Quanto a lungo può risuonare la nota prima di essere tagliata."
-                )
-                epiano_mod_ratio = st.select_slider(
-                    "Rapporto Modulatore/Portante", options=[0.5, 1.0, 1.4, 2.0, 3.5, 7.0, 14.0], value=1.0, key='epiano_mod_ratio',
-                    help="Rapporti classici della sintesi FM: 1.0 e 1.4 danno timbri 'e-piano' morbidi, "
-                         "3.5/7.0 timbri più metallici/campanellati, 14.0 è il rapporto usato nella terza "
-                         "coppia operatore del patch 'E.Piano 1' originale del DX7 per l'attacco a campana."
-                )
-
-                params['epiano_density_source'] = epiano_density_source
-                params['epiano_pitch_source'] = epiano_pitch_source
-                params['epiano_brightness_source'] = epiano_brightness_source
-                params['epiano_amp_source'] = epiano_amp_source
-                params['epiano_density_range'] = (epiano_density_min, epiano_density_max)
-                params['epiano_pitch_range'] = (epiano_pitch_min, epiano_pitch_max)
-                params['epiano_amp_range'] = (epiano_amp_min, epiano_amp_max)
-                params['epiano_note_duration'] = epiano_note_duration
-                params['epiano_mod_ratio'] = epiano_mod_ratio
-
-                def _epiano_source_data(name):
-                    if name == "Luminosità": return luminosity_data
-                    if name == "Dettaglio": return detail_data
-                    if name == "Movimento": return movement_data
-                    if name == "Densità Contorni": return edge_density_data
-                    if name == "Variazione Colore": return color_variation_data
-                    return []
-
-                epiano_density_data_raw = _epiano_source_data(epiano_density_source)
-                epiano_pitch_data_raw = _epiano_source_data(epiano_pitch_source)
-                epiano_brightness_data_raw = _epiano_source_data(epiano_brightness_source)
-                epiano_amp_data_raw = _epiano_source_data(epiano_amp_source)
-
-                epiano_density_scaled = np.interp(epiano_density_data_raw, (min(epiano_density_data_raw) if epiano_density_data_raw else 0, max(epiano_density_data_raw) if epiano_density_data_raw else 1), (epiano_density_min, epiano_density_max)).tolist()
-                epiano_pitch_scaled = scale_frequency_exponential(epiano_pitch_data_raw, epiano_pitch_min, epiano_pitch_max)
-                epiano_pitch_scaled = apply_melody(epiano_pitch_scaled)
-                # Brillantezza normalizzata in [0,1] indipendentemente dal range della sorgente scelta
-                epiano_brightness_scaled = np.interp(epiano_brightness_data_raw, (min(epiano_brightness_data_raw) if epiano_brightness_data_raw else 0, max(epiano_brightness_data_raw) if epiano_brightness_data_raw else 1), (0.0, 1.0)).tolist()
-                epiano_amp_scaled = np.interp(epiano_amp_data_raw, (min(epiano_amp_data_raw) if epiano_amp_data_raw else 0, max(epiano_amp_data_raw) if epiano_amp_data_raw else 1), (epiano_amp_min, epiano_amp_max)).tolist()
-            else:
-                epiano_layer_gain = 0.0
-                epiano_density_scaled = []
-                epiano_pitch_scaled = []
-                epiano_brightness_scaled = []
-                epiano_amp_scaled = []
-                epiano_note_duration = 1.2
-                epiano_mod_ratio = 1.0
-                params['epiano_note_duration'] = epiano_note_duration
-                params['epiano_mod_ratio'] = epiano_mod_ratio
-
-        # Layer 3: Sintesi Granulare (Basato su Dettaglio e Movimento)
-        with tab_gran:
-            st.markdown("### Layer: Sintesi Granulare")
-            use_granular = st.checkbox("Abilita Sintesi Granulare", value=True, key='granular_on')
-            params['granular_enabled'] = use_granular
-            if use_granular:
-                gran_layer_gain = st.slider("🎚️ Volume Layer Granulare", 0.0, 2.0, 1.0, step=0.05, key='gran_gain',
-                                             help="Bilancia questo layer rispetto agli altri attivi contemporaneamente.")
-                params['gran_layer_gain'] = gran_layer_gain
-
-                gran_source_options = ["Dettaglio", "Movimento", "Variazione Movimento", "Densità Contorni", "Variazione Colore"]
-                gran_density_source = st.selectbox("Sorgente Densità Grani", gran_source_options, key='gran_dens_src')
-                gran_duration_source = st.selectbox("Sorgente Durata Grani (sec)", gran_source_options, key='gran_dur_src')
-                gran_amp_source = st.selectbox("Sorgente Ampiezza Grani (0-1)", gran_source_options, key='gran_amp_src')
-                gran_pitch_source = st.selectbox("Sorgente Intonazione Grani (Hz)", ["Luminosità"] + gran_source_options, key='gran_pitch_src',
-                                                  help="Prima era sempre casuale: ora anche l'intonazione di ogni grano segue il video.")
-                
-                gran_density_min = st.slider("Densità Minima Grani", 0, 10, 1, key='gran_dens_min')
-                gran_density_max = st.slider("Densità Massima Grani", 0, 10, 5, key='gran_dens_max')
-                gran_duration_min = st.slider("Durata Minima Grani (sec)", 0.01, 0.1, 0.02, step=0.005, key='gran_dur_min')
-                gran_duration_max = st.slider("Durata Massima Grani (sec)", 0.01, 0.1, 0.05, step=0.005, key='gran_dur_max')
-                gran_amp_min = st.slider("Ampiezza Grani Minima", 0.0, 1.0, 0.01, step=0.01, key='gran_amp_min')
-                gran_amp_max = st.slider("Ampiezza Grani Massima", 0.0, 1.0, 0.1, step=0.01, key='gran_amp_max')
-                gran_pitch_min = st.slider("Intonazione Minima Grani (Hz)", 50, 2000, 200, key='gran_pitch_min')
-                gran_pitch_max = st.slider("Intonazione Massima Grani (Hz)", 50, 2000, 1000, key='gran_pitch_max')
-
-                params['gran_density_source'] = gran_density_source
-                params['gran_duration_source'] = gran_duration_source
-                params['gran_amp_source'] = gran_amp_source
-                params['gran_pitch_source'] = gran_pitch_source
-                params['gran_density_range'] = (gran_density_min, gran_density_max)
-                params['gran_duration_range'] = (gran_duration_min, gran_duration_max)
-                params['gran_amp_range'] = (gran_amp_min, gran_amp_max)
-                params['gran_pitch_range'] = (gran_pitch_min, gran_pitch_max)
-
-                gran_density_data_raw = []
-                if gran_density_source == "Dettaglio": gran_density_data_raw = detail_data
-                elif gran_density_source == "Movimento": gran_density_data_raw = movement_data
-                elif gran_density_source == "Variazione Movimento": gran_density_data_raw = variation_movement_data
-                elif gran_density_source == "Densità Contorni": gran_density_data_raw = edge_density_data
-                elif gran_density_source == "Variazione Colore": gran_density_data_raw = color_variation_data
-
-                gran_duration_data_raw = []
-                if gran_duration_source == "Dettaglio": gran_duration_data_raw = detail_data
-                elif gran_duration_source == "Movimento": gran_duration_data_raw = movement_data
-                elif gran_duration_source == "Variazione Movimento": gran_duration_data_raw = variation_movement_data
-                elif gran_duration_source == "Densità Contorni": gran_duration_data_raw = edge_density_data
-                elif gran_duration_source == "Variazione Colore": gran_duration_data_raw = color_variation_data
-
-                gran_amp_data_raw = []
-                if gran_amp_source == "Dettaglio": gran_amp_data_raw = detail_data
-                elif gran_amp_source == "Movimento": gran_amp_data_raw = movement_data
-                elif gran_amp_source == "Variazione Movimento": gran_amp_data_raw = variation_movement_data
-                elif gran_amp_source == "Densità Contorni": gran_amp_data_raw = edge_density_data
-                elif gran_amp_source == "Variazione Colore": gran_amp_data_raw = color_variation_data
-
-                gran_pitch_data_raw = []
-                if gran_pitch_source == "Luminosità": gran_pitch_data_raw = luminosity_data
-                elif gran_pitch_source == "Dettaglio": gran_pitch_data_raw = detail_data
-                elif gran_pitch_source == "Movimento": gran_pitch_data_raw = movement_data
-                elif gran_pitch_source == "Variazione Movimento": gran_pitch_data_raw = variation_movement_data
-                elif gran_pitch_source == "Densità Contorni": gran_pitch_data_raw = edge_density_data
-                elif gran_pitch_source == "Variazione Colore": gran_pitch_data_raw = color_variation_data
-
-                gran_density_scaled = np.interp(gran_density_data_raw, (min(gran_density_data_raw) if gran_density_data_raw else 0, max(gran_density_data_raw) if gran_density_data_raw else 1), (gran_density_min, gran_density_max)).tolist()
-                gran_duration_scaled = np.interp(gran_duration_data_raw, (min(gran_duration_data_raw) if gran_duration_data_raw else 0, max(gran_duration_data_raw) if gran_duration_data_raw else 1), (gran_duration_min, gran_duration_max)).tolist()
-                gran_amp_scaled = np.interp(gran_amp_data_raw, (min(gran_amp_data_raw) if gran_amp_data_raw else 0, max(gran_amp_data_raw) if gran_amp_data_raw else 1), (gran_amp_min, gran_amp_max)).tolist()
-                gran_pitch_scaled = scale_frequency_exponential(gran_pitch_data_raw, gran_pitch_min, gran_pitch_max)
-                gran_pitch_scaled = apply_melody(gran_pitch_scaled)
-            else: # Aggiunto else per gestire i casi in cui i dati non sono scalati
-                gran_density_scaled = []
-                gran_duration_scaled = []
-                gran_amp_scaled = []
-                gran_pitch_scaled = []
-                gran_layer_gain = 0.0
-
-
-        # Layer 3b: Corde (Karplus-Strong, modellazione fisica)
-        with tab_pluck:
-            st.markdown("### Layer: Corde (Karplus-Strong)")
-            st.caption(
-                "Modellazione fisica: simula una corda pizzicata (rumore che circola in una linea "
-                "di ritardo accordata, con smorzamento) invece di un'onda o un grano. Carattere "
-                "percussivo/organico, diverso dagli altri layer."
-            )
-            use_pluck = st.checkbox("Abilita Layer Corde", value=False, key='pluck_on')
-            params['pluck_enabled'] = use_pluck
-            if use_pluck:
-                pluck_layer_gain = st.slider("🎚️ Volume Layer Corde", 0.0, 2.0, 1.0, step=0.05, key='pluck_gain')
-                params['pluck_layer_gain'] = pluck_layer_gain
-
-                pluck_source_options = ["Luminosità", "Dettaglio", "Movimento", "Densità Contorni", "Variazione Colore"]
-                pluck_density_source = st.selectbox("Sorgente Densità Pizzicate", pluck_source_options, key='pluck_dens_src')
-                pluck_pitch_source = st.selectbox("Sorgente Intonazione", pluck_source_options, key='pluck_pitch_src', index=2)
-                pluck_damping_source = st.selectbox("Sorgente Smorzamento", pluck_source_options, key='pluck_damp_src', index=1)
-                pluck_amp_source = st.selectbox("Sorgente Ampiezza", pluck_source_options, key='pluck_amp_src')
-
-                # Densità volutamente limitata (max 5, non 10 come il layer granulare): pizzicate
-                # più fitte di ~150ms perderebbero il carattere "corda" per fondersi in una texture
-                # continua (che è già il ruolo della sintesi granulare), quindi non aggiungerebbero
-                # nulla di espressivo — solo tempo di calcolo su un video lungo e denso.
-                pluck_density_min = st.slider("Densità Minima (pizzicate/finestra)", 0, 5, 0, key='pluck_dens_min')
-                pluck_density_max = st.slider("Densità Massima (pizzicate/finestra)", 0, 5, 2, key='pluck_dens_max')
-                pluck_pitch_min = st.slider("Intonazione Minima (Hz)", 40, 800, 80, key='pluck_pitch_min')
-                pluck_pitch_max = st.slider("Intonazione Massima (Hz)", 40, 1200, 400, key='pluck_pitch_max')
-                pluck_amp_min = st.slider("Ampiezza Minima", 0.0, 1.0, 0.3, step=0.01, key='pluck_amp_min')
-                pluck_amp_max = st.slider("Ampiezza Massima", 0.0, 1.0, 1.0, step=0.01, key='pluck_amp_max')
-                pluck_duration = st.slider(
-                    "Durata Massima Pizzicata (sec)", 0.1, 1.0, 0.4, step=0.05, key='pluck_duration',
-                    help="Quanto a lungo può risuonare una corda prima di essere tagliata."
-                )
-
-                st.markdown("##### Carattere")
-                pluck_hardness = st.slider(
-                    "Durezza Eccitazione (pizzicata → martellata)", 0.0, 1.0, 0.0, step=0.05, key='pluck_hardness',
-                    help="0 = pizzicata classica (rumore bianco, morbida). Valori più alti = attacco "
-                         "più duro e percussivo, più vicino a un martelletto di pianoforte/clavicembalo."
-                )
-                pluck_unison_voices = st.select_slider(
-                    "Corde all'Unisono", options=[1, 2, 3], value=1, key='pluck_unison_voices',
-                    help="Più di 1 somma 2-3 corde leggermente scordate per nota (come le corde "
-                         "multiple di un pianoforte vero), per un carattere più ricco/mosso invece "
-                         "di una pizzicata singola e statica. Aumenta il tempo di generazione."
-                )
-                if pluck_unison_voices > 1:
-                    pluck_unison_detune = st.slider(
-                        "Scordatura Unisono (cent)", 1.0, 25.0, 8.0, step=1.0, key='pluck_unison_detune',
-                        help="Quanto le corde extra sono scordate rispetto all'intonazione nominale. "
-                             "Valori bassi (5-10) danno un 'battimento' naturale, alti (20+) un chorus più marcato."
-                    )
-                else:
-                    pluck_unison_detune = 0.0
-
-                params['pluck_density_source'] = pluck_density_source
-                params['pluck_pitch_source'] = pluck_pitch_source
-                params['pluck_damping_source'] = pluck_damping_source
-                params['pluck_amp_source'] = pluck_amp_source
-                params['pluck_density_range'] = (pluck_density_min, pluck_density_max)
-                params['pluck_pitch_range'] = (pluck_pitch_min, pluck_pitch_max)
-                params['pluck_amp_range'] = (pluck_amp_min, pluck_amp_max)
-                params['pluck_duration'] = pluck_duration
-                params['pluck_hardness'] = pluck_hardness
-                params['pluck_unison_voices'] = pluck_unison_voices
-                params['pluck_unison_detune'] = pluck_unison_detune
-
-                def _pluck_source_data(name):
-                    if name == "Luminosità": return luminosity_data
-                    if name == "Dettaglio": return detail_data
-                    if name == "Movimento": return movement_data
-                    if name == "Densità Contorni": return edge_density_data
-                    if name == "Variazione Colore": return color_variation_data
-                    return []
-
-                pluck_density_data_raw = _pluck_source_data(pluck_density_source)
-                pluck_pitch_data_raw = _pluck_source_data(pluck_pitch_source)
-                pluck_damping_data_raw = _pluck_source_data(pluck_damping_source)
-                pluck_amp_data_raw = _pluck_source_data(pluck_amp_source)
-
-                pluck_density_scaled = np.interp(pluck_density_data_raw, (min(pluck_density_data_raw) if pluck_density_data_raw else 0, max(pluck_density_data_raw) if pluck_density_data_raw else 1), (pluck_density_min, pluck_density_max)).tolist()
-                pluck_pitch_scaled = scale_frequency_exponential(pluck_pitch_data_raw, pluck_pitch_min, pluck_pitch_max)
-                pluck_pitch_scaled = apply_melody(pluck_pitch_scaled)
-                # Smorzamento normalizzato in [0,1] indipendentemente dal range della sorgente scelta
-                pluck_damping_scaled = np.interp(pluck_damping_data_raw, (min(pluck_damping_data_raw) if pluck_damping_data_raw else 0, max(pluck_damping_data_raw) if pluck_damping_data_raw else 1), (0.0, 1.0)).tolist()
-                pluck_amp_scaled = np.interp(pluck_amp_data_raw, (min(pluck_amp_data_raw) if pluck_amp_data_raw else 0, max(pluck_amp_data_raw) if pluck_amp_data_raw else 1), (pluck_amp_min, pluck_amp_max)).tolist()
-            else:
-                pluck_layer_gain = 0.0
-                pluck_density_scaled = []
-                pluck_pitch_scaled = []
-                pluck_damping_scaled = []
-                pluck_amp_scaled = []
-                pluck_duration = 0.4
-                pluck_hardness = 0.0
-                pluck_unison_voices = 1
-                pluck_unison_detune = 0.0
-                params['pluck_duration'] = pluck_duration
-                params['pluck_hardness'] = pluck_hardness
-                params['pluck_unison_voices'] = pluck_unison_voices
-                params['pluck_unison_detune'] = pluck_unison_detune
-
-        # Layer 4: Rumore (Basato su Variazione Movimento)
-        with tab_noise:
-            st.markdown("### Layer: Rumore")
-            use_noise = st.checkbox("Abilita Rumore", value=True, key='noise_on')
-            params['noise_enabled'] = use_noise
-            if use_noise:
-                noise_layer_gain = st.slider("🎚️ Volume Layer Rumore", 0.0, 2.0, 1.0, step=0.05, key='noise_gain',
-                                              help="Bilancia questo layer rispetto agli altri attivi contemporaneamente.")
-                params['noise_layer_gain'] = noise_layer_gain
-
-                noise_amp_source = st.selectbox("Sorgente Ampiezza Rumore", ["Variazione Movimento", "Movimento", "Dettaglio", "Densità Contorni", "Variazione Colore"], key='noise_amp_src')
-                noise_amp_min = st.slider("Ampiezza Minima Rumore", 0.0, 1.0, 0.0, step=0.01, key='noise_amp_min')
-                noise_amp_max = st.slider("Ampiezza Massima Rumore", 0.0, 1.0, 0.1, step=0.01, key='noise_amp_max')
-
-                params['noise_amp_source'] = noise_amp_source
-                params['noise_amp_range'] = (noise_amp_min, noise_amp_max)
-
-                noise_amp_data_raw = []
-                if noise_amp_source == "Variazione Movimento": noise_amp_data_raw = variation_movement_data
-                elif noise_amp_source == "Movimento": noise_amp_data_raw = movement_data
-                elif noise_amp_source == "Dettaglio": noise_amp_data_raw = detail_data
-                elif noise_amp_source == "Densità Contorni": noise_amp_data_raw = edge_density_data
-                elif noise_amp_source == "Variazione Colore": noise_amp_data_raw = color_variation_data
-
-                noise_amp_scaled = np.interp(noise_amp_data_raw, (min(noise_amp_data_raw) if noise_amp_data_raw else 0, max(noise_amp_data_raw) if noise_amp_data_raw else 1), (noise_amp_min, noise_amp_max)).tolist()
-            else: # Aggiunto else per gestire i casi in cui i dati non sono scalati
-                noise_amp_scaled = []
-                noise_layer_gain = 0.0
-
-
-        # Effetti Audio (Glitch, Delay, Reverb)
-        with tab_fx:
-            st.markdown("### Effetti Audio")
-            
-            # Glitch
-            st.subheader("Glitch")
-            use_glitch = st.checkbox("Abilita Glitch", value=False, key='glitch_on')
-            params['glitch_enabled'] = use_glitch
-            if use_glitch:
-                glitch_character = st.selectbox(
-                    "Carattere del Glitch",
-                    ["Bilanciato (default)", "Pulito / Digitale (repeat + reverse, poco rumore)", "Sporco / Analogico (rumore dominante)"],
-                    key='glitch_character',
-                    help="Prima il tipo di glitch (repeat/noise/reverse) era sempre scelto a caso in modo uniforme, "
-                         "quindi 'VHS sporco' e 'Datamosh pulito' suonavano uguali nel carattere. Ora puoi pesare la scelta."
-                )
-                params['glitch_character'] = glitch_character
-
-                glitch_factor_source = st.selectbox("Sorgente Fattore Glitch (Probabilità)", ["Variazione Movimento", "Movimento", "Dettaglio", "Densità Contorni", "Variazione Colore"], key='glitch_factor_src')
-                glitch_intensity_source = st.selectbox("Sorgente Intensità Glitch (Durata/Ampiezza)", ["Variazione Movimento", "Movimento", "Dettaglio", "Densità Contorni", "Variazione Colore"], key='glitch_intensity_src')
-                
-                glitch_factor_min = st.slider("Fattore Minimo Glitch (0-1)", 0.0, 1.0, 0.01, step=0.005, key='glitch_factor_min')
-                glitch_factor_max = st.slider("Fattore Massimo Glitch (0-1)", 0.0, 1.0, 0.1, step=0.005, key='glitch_factor_max')
-                glitch_intensity_min = st.slider("Intensità Minima Glitch (0-1)", 0.0, 1.0, 0.1, step=0.01, key='glitch_intensity_min')
-                glitch_intensity_max = st.slider("Intensità Massima Glitch (0-1)", 0.0, 1.0, 0.8, step=0.01, key='glitch_intensity_max')
-
-                if glitch_character.startswith("Pulito"):
-                    glitch_type_weights = {"repeat": 0.45, "noise": 0.1, "reverse": 0.45}
-                elif glitch_character.startswith("Sporco"):
-                    glitch_type_weights = {"repeat": 0.2, "noise": 0.65, "reverse": 0.15}
-                else:
-                    glitch_type_weights = {"repeat": 1/3, "noise": 1/3, "reverse": 1/3}
-
-                params['glitch_factor_source'] = glitch_factor_source
-                params['glitch_intensity_source'] = glitch_intensity_source
-                params['glitch_factor_range'] = (glitch_factor_min, glitch_factor_max)
-                params['glitch_intensity_range'] = (glitch_intensity_min, glitch_intensity_max)
-
-                glitch_factor_data_raw = []
-                if glitch_factor_source == "Variazione Movimento": glitch_factor_data_raw = variation_movement_data
-                elif glitch_factor_source == "Movimento": glitch_factor_data_raw = movement_data
-                elif glitch_factor_source == "Dettaglio": glitch_factor_data_raw = detail_data
-                elif glitch_factor_source == "Densità Contorni": glitch_factor_data_raw = edge_density_data
-                elif glitch_factor_source == "Variazione Colore": glitch_factor_data_raw = color_variation_data
-
-                glitch_intensity_data_raw = []
-                if glitch_intensity_source == "Variazione Movimento": glitch_intensity_data_raw = variation_movement_data
-                elif glitch_intensity_source == "Movimento": glitch_intensity_data_raw = movement_data
-                elif glitch_intensity_source == "Dettaglio": glitch_intensity_data_raw = detail_data
-                elif glitch_intensity_source == "Densità Contorni": glitch_intensity_data_raw = edge_density_data
-                elif glitch_intensity_source == "Variazione Colore": glitch_intensity_data_raw = color_variation_data
-
-                glitch_factor_scaled = np.interp(glitch_factor_data_raw, (min(glitch_factor_data_raw) if glitch_factor_data_raw else 0, max(glitch_factor_data_raw) if glitch_factor_data_raw else 1), (glitch_factor_min, glitch_factor_max)).tolist()
-                glitch_intensity_data = np.interp(glitch_intensity_data_raw, (min(glitch_intensity_data_raw) if glitch_intensity_data_raw else 0, max(glitch_intensity_data_raw) if glitch_intensity_data_raw else 1), (glitch_intensity_min, glitch_intensity_max)).tolist()
-            else: # Aggiunto else per gestire i casi in cui i dati non sono scalati
-                glitch_factor_scaled = []
-                glitch_intensity_data = []
-                glitch_type_weights = {"repeat": 1/3, "noise": 1/3, "reverse": 1/3}
-
-            # Delay
-            st.subheader("Delay")
-            use_delay = st.checkbox("Abilita Delay", value=False, key='delay_on')
-            params['delay_enabled'] = use_delay
-            if use_delay:
-                delay_time_source = st.selectbox("Sorgente Tempo Delay (sec)", ["Movimento", "Variazione Movimento", "Luminosità", "Densità Contorni", "Variazione Colore"], key='delay_time_src')
-                delay_feedback_source = st.selectbox("Sorgente Feedback Delay (0-1)", ["Movimento", "Variazione Movimento", "Dettaglio", "Densità Contorni", "Variazione Colore"], key='delay_feedback_src')
-                
-                delay_time_min = st.slider("Tempo Minimo Delay (sec)", 0.01, 0.5, 0.1, step=0.01, key='delay_time_min')
-                delay_time_max = st.slider("Tempo Massimo Delay (sec)", 0.01, 0.5, 0.3, step=0.01, key='delay_time_max')
-                delay_feedback_min = st.slider("Feedback Minimo Delay", 0.0, 0.95, 0.3, step=0.01, key='delay_feedback_min')
-                delay_feedback_max = st.slider("Feedback Massimo Delay", 0.0, 0.95, 0.7, step=0.01, key='delay_feedback_max')
-
-                params['delay_time_source'] = delay_time_source
-                params['delay_feedback_source'] = delay_feedback_source
-                params['delay_time_range'] = (delay_time_min, delay_time_max)
-                params['delay_feedback_range'] = (delay_feedback_min, delay_feedback_max)
-
-                delay_time_data_raw = []
-                if delay_time_source == "Movimento": delay_time_data_raw = movement_data
-                elif delay_time_source == "Variazione Movimento": delay_time_data_raw = variation_movement_data
-                elif delay_time_source == "Luminosità": delay_time_data_raw = luminosity_data
-                elif delay_time_source == "Densità Contorni": delay_time_data_raw = edge_density_data
-                elif delay_time_source == "Variazione Colore": delay_time_data_raw = color_variation_data
-
-                delay_feedback_data_raw = []
-                if delay_feedback_source == "Movimento": delay_feedback_data_raw = movement_data
-                elif delay_feedback_source == "Variazione Movimento": delay_feedback_data_raw = variation_movement_data
-                elif delay_feedback_source == "Dettaglio": delay_feedback_data_raw = detail_data
-                elif delay_feedback_source == "Densità Contorni": delay_feedback_data_raw = edge_density_data
-                elif delay_feedback_source == "Variazione Colore": delay_feedback_data_raw = color_variation_data
-
-                delay_time_scaled = np.interp(delay_time_data_raw, (min(delay_time_data_raw) if delay_time_data_raw else 0, max(delay_time_data_raw) if delay_time_data_raw else 1), (delay_time_min, delay_time_max)).tolist()
-                delay_feedback_scaled = np.interp(delay_feedback_data_raw, (min(delay_feedback_data_raw) if delay_feedback_data_raw else 0, max(delay_feedback_data_raw) if delay_feedback_data_raw else 1), (delay_feedback_min, delay_feedback_max)).tolist()
-            else: # Aggiunto else per gestire i casi in cui i dati non sono scalati
-                delay_time_scaled = []
-                delay_feedback_scaled = []
-
-
-            # Reverb
-            st.subheader("Riverbero")
-            use_reverb = st.checkbox("Abilita Riverbero", value=False, key='reverb_on')
-            params['reverb_enabled'] = use_reverb
-            if use_reverb:
-                reverb_decay_source = st.selectbox("Sorgente Tempo Decadimento (sec)", ["Luminosità", "Dettaglio", "Movimento", "Densità Contorni", "Variazione Colore"], key='reverb_decay_src')
-                reverb_mix_source = st.selectbox("Sorgente Mix (Wet/Dry)", ["Luminosità", "Dettaglio", "Movimento", "Densità Contorni", "Variazione Colore"], key='reverb_mix_src')
-                
-                reverb_decay_min = st.slider("Decadimento Minimo (sec)", 0.1, 5.0, 1.0, step=0.1, key='reverb_decay_min')
-                reverb_decay_max = st.slider("Decadimento Massimo (sec)", 0.1, 5.0, 3.0, step=0.1, key='reverb_decay_max')
-                reverb_mix_min = st.slider("Mix Minimo (0-1)", 0.0, 1.0, 0.2, step=0.01, key='reverb_mix_min')
-                reverb_mix_max = st.slider("Mix Massimo (0-1)", 0.0, 1.0, 0.6, step=0.01, key='reverb_mix_max')
-
-                params['reverb_decay_source'] = reverb_decay_source
-                params['reverb_mix_source'] = reverb_mix_source
-                params['reverb_decay_range'] = (reverb_decay_min, reverb_decay_max)
-                params['reverb_mix_range'] = (reverb_mix_min, reverb_mix_max)
-
-                reverb_decay_data_raw = []
-                if reverb_decay_source == "Luminosità": reverb_decay_data_raw = luminosity_data
-                elif reverb_decay_source == "Dettaglio": reverb_decay_data_raw = detail_data
-                elif reverb_decay_source == "Movimento": reverb_decay_data_raw = movement_data
-                elif reverb_decay_source == "Densità Contorni": reverb_decay_data_raw = edge_density_data
-                elif reverb_decay_source == "Variazione Colore": reverb_decay_data_raw = color_variation_data
-
-                reverb_mix_data_raw = []
-                if reverb_mix_source == "Luminosità": reverb_mix_data_raw = luminosity_data
-                elif reverb_mix_source == "Dettaglio": reverb_mix_data_raw = detail_data
-                elif reverb_mix_source == "Movimento": reverb_mix_data_raw = movement_data
-                elif reverb_mix_source == "Densità Contorni": reverb_mix_data_raw = edge_density_data
-                elif reverb_mix_source == "Variazione Colore": reverb_mix_data_raw = color_variation_data
-
-                reverb_decay_scaled = np.interp(reverb_decay_data_raw, (min(reverb_decay_data_raw) if reverb_decay_data_raw else 0, max(reverb_decay_data_raw) if reverb_decay_data_raw else 1), (reverb_decay_min, reverb_decay_max)).tolist()
-                reverb_mix_scaled = np.interp(reverb_mix_data_raw, (min(reverb_mix_data_raw) if reverb_mix_data_raw else 0, max(reverb_mix_data_raw) if reverb_mix_data_raw else 1), (reverb_mix_min, reverb_mix_max)).tolist()
-            else: # Aggiunto else per gestire i casi in cui i dati non sono scalati
-                reverb_decay_scaled = []
-                reverb_mix_scaled = []
-
-
-        # Equalizzatore Dinamico
-        with tab_eq:
-            st.markdown("### Equalizzatore Dinamico")
-            use_eq = st.checkbox("Abilita Equalizzatore", value=False, key='eq_on')
-            params['eq_enabled'] = use_eq
-            if use_eq:
-                eq_low_source = st.selectbox("Sorgente Guadagno Bassi (dB)", ["Luminosità", "Movimento", "Variazione Movimento", "Densità Contorni", "Variazione Colore"], key='eq_low_src')
-                eq_mid_source = st.selectbox("Sorgente Guadagno Medi (dB)", ["Dettaglio", "Luminosità", "Movimento", "Densità Contorni", "Variazione Colore"], key='eq_mid_src')
-                eq_high_source = st.selectbox("Sorgente Guadagno Alti (dB)", ["Movimento", "Dettaglio", "Variazione Movimento", "Densità Contorni", "Variazione Colore"], key='eq_high_src')
-                
-                eq_gain_min = st.slider("Guadagno Minimo (dB)", -20.0, 20.0, -10.0, step=0.5, key='eq_gain_min')
-                eq_gain_max = st.slider("Guadagno Massimo (dB)", -20.0, 20.0, 10.0, step=0.5, key='eq_gain_max')
-
-                params['eq_low_source'] = eq_low_source
-                params['eq_mid_source'] = eq_mid_source
-                params['eq_high_source'] = eq_high_source
-                params['eq_gain_range'] = (eq_gain_min, eq_gain_max)
-
-                eq_low_data_raw = []
-                if eq_low_source == "Luminosità": eq_low_data_raw = luminosity_data
-                elif eq_low_source == "Movimento": eq_low_data_raw = movement_data
-                elif eq_low_source == "Variazione Movimento": eq_low_data_raw = variation_movement_data
-                elif eq_low_source == "Densità Contorni": eq_low_data_raw = edge_density_data
-                elif eq_low_source == "Variazione Colore": eq_low_data_raw = color_variation_data
-
-                eq_mid_data_raw = []
-                if eq_mid_source == "Dettaglio": eq_mid_data_raw = detail_data
-                elif eq_mid_source == "Luminosità": eq_mid_data_raw = luminosity_data
-                elif eq_mid_source == "Movimento": eq_mid_data_raw = movement_data
-                elif eq_mid_source == "Densità Contorni": eq_mid_data_raw = edge_density_data
-                elif eq_mid_source == "Variazione Colore": eq_mid_data_raw = color_variation_data
-
-                eq_high_data_raw = []
-                if eq_high_source == "Movimento": eq_high_data_raw = movement_data
-                elif eq_high_source == "Dettaglio": eq_high_data_raw = detail_data
-                elif eq_high_source == "Variazione Movimento": eq_high_data_raw = variation_movement_data
-                elif eq_high_source == "Densità Contorni": eq_high_data_raw = edge_density_data
-                elif eq_high_source == "Variazione Colore": eq_high_data_raw = color_variation_data
-
-                eq_low_scaled = np.interp(eq_low_data_raw, (min(eq_low_data_raw) if eq_low_data_raw else 0, max(eq_low_data_raw) if eq_low_data_raw else 1), (eq_gain_min, eq_gain_max)).tolist()
-                eq_mid_scaled = np.interp(eq_mid_data_raw, (min(eq_mid_data_raw) if eq_mid_data_raw else 0, max(eq_mid_data_raw) if eq_mid_data_raw else 1), (eq_gain_min, eq_gain_max)).tolist()
-                eq_high_scaled = np.interp(eq_high_data_raw, (min(eq_high_data_raw) if eq_high_data_raw else 0, max(eq_high_data_raw) if eq_high_data_raw else 1), (eq_gain_min, eq_gain_max)).tolist()
-            else: # Aggiunto else per gestire i casi in cui i dati non sono scalati
-                eq_low_scaled = []
-                eq_mid_scaled = []
-                eq_high_scaled = []
-
-        # Panning Stereo (finora il centro di massa orizzontale veniva calcolato ma mai usato)
-        with tab_pan:
-            st.markdown("### Panning Stereo")
-            st.caption("Il centro di massa orizzontale del video (dove si concentra la 'massa' visiva nel frame) può spostare il suono nello spazio stereo: se il soggetto si muove a sinistra o a destra, il suono lo segue.")
-            use_panning = st.checkbox("Abilita Panning Stereo", value=False, key='panning_on')
-            params['panning_enabled'] = use_panning
-            if use_panning:
-                pan_source = st.selectbox("Sorgente Panning", ["Centro di Massa Orizzontale", "Movimento", "Variazione Movimento", "Densità Contorni", "Variazione Colore"], key='pan_src',
-                                           help="Centro di Massa Orizzontale è la scelta più naturale: segue davvero dove si trova il soggetto nel frame.")
-                params['pan_source'] = pan_source
-
-                pan_data_raw = []
-                if pan_source == "Centro di Massa Orizzontale": pan_data_raw = horizontal_mass_center_data
-                elif pan_source == "Movimento": pan_data_raw = movement_data
-                elif pan_source == "Variazione Movimento": pan_data_raw = variation_movement_data
-                elif pan_source == "Densità Contorni": pan_data_raw = edge_density_data
-                elif pan_source == "Variazione Colore": pan_data_raw = color_variation_data
-
-                # Il centro di massa orizzontale è già normalizzato 0..1 (0=sinistra, 1=destra):
-                # per questa sorgente non serve rimappare min/max, altrimenti un soggetto che sta
-                # sempre a destra verrebbe "stirato" fino all'estrema sinistra.
-                if pan_source == "Centro di Massa Orizzontale":
-                    pan_scaled = pan_data_raw
-                else:
-                    pan_scaled = np.interp(pan_data_raw, (min(pan_data_raw) if pan_data_raw else 0, max(pan_data_raw) if pan_data_raw else 1), (0.0, 1.0)).tolist()
-            else:
-                pan_scaled = []
-
-            st.markdown("---")
-            st.markdown("### Altezza (Su/Giù)")
-            st.caption("Lo stereo non ha un canale fisico per 'sopra' e 'sotto': qui si usa un trucco psicoacustico — un suono più chiaro/brillante viene percepito come 'in alto', uno più scuro/attutito come 'in basso'. Basato sul centro di massa verticale del video.")
-            use_elevation = st.checkbox("Abilita Simulazione Altezza", value=False, key='elevation_on')
-            params['elevation_enabled'] = use_elevation
-            if use_elevation:
-                elevation_source = st.selectbox("Sorgente Altezza", ["Centro di Massa Verticale", "Luminosità", "Densità Contorni", "Variazione Colore"], key='elevation_src',
-                                                 help="Centro di Massa Verticale segue davvero se il soggetto è in alto o in basso nel frame. Le altre sono mappature più creative.")
-                params['elevation_source'] = elevation_source
-
-                if elevation_source == "Centro di Massa Verticale":
-                    # Già normalizzato 0..1 (0=alto del frame, 1=basso): nessun rimappaggio min/max,
-                    # altrimenti un soggetto sempre in alto verrebbe "stirato" fino in basso.
-                    elevation_scaled = vertical_mass_center_data
-                elif elevation_source == "Luminosità": # video più luminoso = più "in alto" (elevation_data basso = luminosità alta)
-                    elevation_scaled = [1.0 - l for l in luminosity_data]
-                else: # Densità Contorni / Variazione Colore: mappatura creativa, normalizzata 0..1 senza inversione
-                    elevation_raw = edge_density_data if elevation_source == "Densità Contorni" else color_variation_data
-                    elevation_scaled = np.interp(elevation_raw, (min(elevation_raw) if elevation_raw else 0, max(elevation_raw) if elevation_raw else 1), (0.0, 1.0)).tolist()
-            else:
-                elevation_scaled = []
-
-
-        if not generative_mode:
-            st.subheader("Impostazioni Output Video")
-            output_resolution_choice = st.selectbox("Formato Video Output", list(FORMAT_RESOLUTIONS.keys()))
-            params['output_resolution_choice'] = output_resolution_choice
-        else:
-            output_resolution_choice = None
-            params['output_resolution_choice'] = "N/A (modalità generativa)"
-
-        st.subheader("Impostazioni Output Audio")
-
-        col_audio, col_video = st.columns(2)
-        with col_audio:
-            normalize_audio = st.checkbox("Normalizza Audio Finale", value=True)
-            params['normalize_audio'] = normalize_audio
-            use_saturation = st.checkbox(
-                "Saturazione Soft (Analogica)", value=True,
-                help="Applica una leggera compressione morbida (tanh) prima della normalizzazione: "
-                     "addolcisce i picchi improvvisi (tipici quando grani/glitch/riverbero si sommano) "
-                     "con un carattere più 'analogico' invece di un clip digitale netto."
-            )
-            params['use_saturation'] = use_saturation
-            if use_saturation:
-                saturation_drive = st.slider(
-                    "Intensità Saturazione", 1.0, 3.0, 1.5, step=0.1,
-                    help="Valori più alti = compressione più marcata dei picchi (più 'calda'/satura)."
-                )
-                params['saturation_drive'] = saturation_drive
-            else:
-                params['saturation_drive'] = 1.0
-        with col_video:
-            if not generative_mode:
-                use_original_audio = st.checkbox("Mantieni Audio Originale del Video (Mix con quello generato)", value=False)
-                params['use_original_audio'] = use_original_audio
-                if use_original_audio:
-                    original_audio_mix_level = st.slider("Livello Mix Audio Originale", 0.0, 1.0, 0.5, step=0.01)
-                    params['original_audio_mix_level'] = original_audio_mix_level
-                else:
-                    params['original_audio_mix_level'] = 0.0
-            else:
-                use_original_audio = False
-                params['use_original_audio'] = False
-                params['original_audio_mix_level'] = 0.0
-                st.caption("🎲 Modalità generativa: nessun audio originale da mantenere (nessun video caricato).")
-            export_stems = st.checkbox(
-                "Esporta anche gli stems separati (ZIP)", value=False,
-                help="Oltre al video, genera uno ZIP con l'audio di ogni layer attivo separato "
-                     "(dry, prima degli effetti), da remixare in un DAW."
-            )
-            params['export_stems'] = export_stems
-
-        def build_combined_audio(return_stems: bool = False):
-            """Genera e mixa tutti i layer/effetti audio secondo i parametri già impostati
-            nell'interfaccia (chiusura su tutte le variabili '..._scaled' calcolate sopra).
-            Condivisa tra l'anteprima audio rapida e il render video finale, per non duplicare
-            la stessa logica in due punti che potrebbero disallinearsi nel tempo.
-
-            Se return_stems=True, restituisce anche un dizionario con l'audio 'dry' di ogni
-            singolo layer (già pesato dal proprio Volume Layer, ma prima di effetti/mix/master),
-            utile per un export stems separato da remixare in un DAW."""
-            mixed_audio = np.zeros(audio_generator.total_samples, dtype=np.float32)
-            stems = {}
-
-            if use_subtractive:
-                subtractive_audio = audio_generator.generate_subtractive_waveform(sub_freq_scaled, sub_amp_scaled, sub_waveform_type, band_limited=sub_band_limited)
-                if sub_filter_enabled:
-                    subtractive_audio = audio_generator.apply_resonant_filter(subtractive_audio, sub_cutoff_scaled, sub_resonance_scaled)
-                subtractive_audio = subtractive_audio * sub_layer_gain
-                mixed_audio += subtractive_audio
-                if return_stems:
-                    stems['sottrattiva'] = subtractive_audio.astype(np.float32)
-
-            if use_fm:
-                fm_audio = audio_generator.generate_fm_layer(fm_carrier_scaled, fm_mod_scaled, fm_mod_idx_scaled, fm_amp_scaled) * fm_layer_gain
-                mixed_audio += fm_audio
-                if return_stems:
-                    stems['fm'] = fm_audio.astype(np.float32)
-
-            if use_epiano:
-                epiano_audio = audio_generator.generate_fm_epiano_layer(
-                    epiano_density_scaled, epiano_pitch_scaled, epiano_brightness_scaled, epiano_amp_scaled,
-                    note_duration=epiano_note_duration, mod_ratio=epiano_mod_ratio
-                ) * epiano_layer_gain
-                mixed_audio += epiano_audio
-                if return_stems:
-                    stems['epiano'] = epiano_audio.astype(np.float32)
-
-            if use_granular:
-                granular_audio = audio_generator.generate_granular_layer(gran_density_scaled, gran_duration_scaled, gran_amp_scaled, gran_pitch_scaled) * gran_layer_gain
-                mixed_audio += granular_audio
-                if return_stems:
-                    stems['granulare'] = granular_audio.astype(np.float32)
-
-            if use_pluck:
-                pluck_audio = audio_generator.generate_pluck_layer(
-                    pluck_density_scaled, pluck_pitch_scaled, pluck_damping_scaled, pluck_amp_scaled,
-                    max_pluck_duration=pluck_duration, hammer_hardness=pluck_hardness,
-                    unison_voices=pluck_unison_voices, unison_detune_cents=pluck_unison_detune
-                ) * pluck_layer_gain
-                mixed_audio += pluck_audio
-                if return_stems:
-                    stems['corde'] = pluck_audio.astype(np.float32)
-
-            if use_noise:
-                noise_audio = audio_generator.add_noise_layer(noise_amp_scaled) * noise_layer_gain
-                mixed_audio += noise_audio
-                if return_stems:
-                    stems['rumore'] = noise_audio.astype(np.float32)
-
-            if use_glitch:
-                mixed_audio = audio_generator.apply_glitch_effect(mixed_audio, glitch_factor_scaled, glitch_intensity_data, glitch_type_weights)
-
-            if use_delay:
-                mixed_audio = audio_generator.apply_delay_effect(mixed_audio, delay_time_scaled, delay_feedback_scaled)
-
-            if use_reverb:
-                mixed_audio = audio_generator.apply_reverb_effect(mixed_audio, reverb_decay_scaled, reverb_mix_scaled)
-
-            if use_eq:
-                mixed_audio = audio_generator.apply_eq_effect(mixed_audio, eq_low_scaled, eq_mid_scaled, eq_high_scaled)
-
-            # Altezza (su/giù): applicata prima del panning, mentre l'audio è ancora mono
-            # (illusione timbrica, non di posizione).
-            if use_elevation:
-                mixed_audio = audio_generator.apply_elevation_filter(mixed_audio, elevation_scaled)
-
-            # Panning stereo: applicato per ultimo, dopo tutti gli effetti mono, così converte
-            # l'audio in stereo (samples, 2) solo alla fine della catena.
-            if use_panning:
-                mixed_audio = audio_generator.apply_stereo_panning(mixed_audio, pan_scaled)
-
-            if use_saturation:
-                # Saturazione soft (tanh) prima della normalizzazione: comprime morbidamente i
-                # picchi (es. quando più grani/glitch/riverbero si sovrappongono nello stesso
-                # istante) invece di lasciare che un clip rigido più avanti li tagli di netto.
-                # tanh(x) è per costruzione sempre in (-1, 1) qualunque sia l'ampiezza in ingresso:
-                # 'drive' controlla quanto la non-linearità entra in gioco (più alto = più
-                # compressione/calore) e, come effetto collaterale voluto, anche il volume
-                # percepito dei passaggi più quieti (comportamento standard per un saturatore
-                # in stile analogico/nastro).
-                mixed_audio = np.tanh(mixed_audio * saturation_drive)
-
-            if normalize_audio:
-                # Prevenire divisione per zero se l'audio è silenzioso.
-                # Usiamo il picco GLOBALE (non per-canale) per non alterare il bilanciamento
-                # stereo introdotto dal panning: normalizzare i due canali in modo indipendente
-                # appiattirebbe la differenza di volume tra sinistra e destra.
-                peak = np.max(np.abs(mixed_audio))
-                if peak > 1e-6:
-                    mixed_audio = mixed_audio / peak
-                else:
-                    mixed_audio = np.zeros_like(mixed_audio) # Mantieni a zero se già silenzioso
-
-            # Assicurati che l'audio sia nel range [-1, 1] per soundfile
-            mixed_audio = np.clip(mixed_audio, -1.0, 1.0).astype(np.float32, copy=False)
-
-            if return_stems:
-                for stem in stems.values():
-                    np.clip(stem, -1.0, 1.0, out=stem)  # in-place: niente seconda copia di ogni stem
-                return mixed_audio, stems
-            return mixed_audio
-
-        if st.button("🔊 Anteprima Audio (senza video)"):
-            # Genera solo l'audio, senza toccare FFmpeg/video: pensata per iterare rapidamente
-            # sui parametri ad orecchio, senza aspettare ogni volta il render+mux del video intero.
-            st.info("🎵 Generazione anteprima audio in corso...")
-            preview_audio = build_combined_audio()
-            preview_audio_path = f"preview_audio_{session_id}.wav"
-            sf.write(preview_audio_path, preview_audio, AUDIO_SAMPLE_RATE)
-            del preview_audio
-            st.audio(preview_audio_path, format="audio/wav")
-            gc.collect()
-
-        if st.button("🎵 Genera Traccia Audio" if generative_mode else "Genera Video con Audio"):
-            # Sempre tenta la generazione audio se il pulsante è cliccato
-            st.info("🎵 Generazione e mixaggio audio in corso... Attendere.")
-            progress_bar_audio = st.progress(0)
-            status_text_audio = st.empty()
-
-            progress_bar_audio.progress(10)
-            status_text_audio.text("Generazione layer e applicazione effetti...")
-
-            combined_audio, generated_stems = build_combined_audio(return_stems=True)
-
-            progress_bar_audio.progress(90)
-            status_text_audio.text("Scrittura file audio...")
-
-            # audio_output_path è assegnato qui, sempre se il pulsante è cliccato
-            audio_output_path = f"output_audio_{session_id}.wav"
-            sf.write(audio_output_path, combined_audio, AUDIO_SAMPLE_RATE)
-            del combined_audio  # il WAV è su disco: libera il buffer (fino a ~100+ MB)
-
-            stems_zip_path = None
-            if export_stems and generated_stems:
-                stems_zip_path = f"stems_{session_id}.zip"
-                with zipfile.ZipFile(stems_zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-                    for stem_name, stem_audio in generated_stems.items():
-                        stem_wav_path = f"stem_{session_id}_{stem_name}.wav"
-                        sf.write(stem_wav_path, stem_audio, AUDIO_SAMPLE_RATE)
-                        zf.write(stem_wav_path, arcname=f"{stem_name}.wav")
-                        os.remove(stem_wav_path)  # il wav intermedio serve solo per scrivere nello zip
-                # Salva i bytes in session_state (stesso pattern del video finale), così il
-                # download persiste tra i rerun anche se il file su disco viene poi ripulito.
-                with open(stems_zip_path, "rb") as f:
-                    st.session_state['stems_zip_bytes'] = f.read()
-                os.remove(stems_zip_path)
-            else:
-                st.session_state['stems_zip_bytes'] = None
-            generated_stems = None  # stems già scritti nello zip: libera la RAM
-            
-            progress_bar_audio.progress(100)
-            status_text_audio.text("Audio generato!")
-            st.success("✅ Audio generato con successo!")
-            
-            gc.collect() # Libera memoria
-
-            # In modalità generativa non c'è nessun video da unire: offri direttamente l'audio,
-            # riusando lo stesso percorso già previsto per quando FFmpeg non è disponibile
-            # (stessa logica, messaggio diverso per non confondere "niente video" con un errore).
-            if generative_mode:
-                st.success(f"🎵 Traccia generativa pronta: '{base_name_output}'.")
-                with open(audio_output_path, "rb") as f:
-                    audio_bytes = f.read()
-                st.session_state['generative_audio_bytes'] = audio_bytes
-                st.download_button(
-                    "⬇️ Scarica Traccia Audio (WAV)",
-                    audio_bytes,
-                    file_name=f"{base_name_output}.wav",
-                    mime="audio/wav",
-                    key="dl_generative_audio_inline"
-                )
-                if os.path.exists(audio_output_path):
-                    os.remove(audio_output_path)
-            elif not check_ffmpeg():
-                st.warning(f"⚠️ FFmpeg non è installato o non è nel PATH. Impossibile unire il video con l'audio. L'audio generato è disponibile in '{audio_output_path}'.")
-                with open(audio_output_path, "rb") as f:
-                    st.download_button(
-                        "⬇️ Scarica Solo Audio (WAV temporaneo)",
-                        f,
-                        file_name=f"videosound_generato_audio_{base_name_output}.wav",
-                        mime="audio/wav"
-                    )
-                # Pulisci i file temporanei ANCHE se FFmpeg non è stato trovato
-                for temp_f in [video_input_path, audio_output_path]:
-                    if temp_f and os.path.exists(temp_f):
-                        os.remove(temp_f)
-                st.info("🗑️ File temporanei puliti.")
-            else: # FFmpeg è disponibile, procedi con l'unione di video e audio
-                st.info("🎥 Unione audio/video e ricodifica in corso... Potrebbe richiedere del tempo.")
-                progress_bar_video = st.progress(0)
-                status_text_video = st.empty()
-
-                final_video_path = f"output_{base_name_output}_{session_id}_{output_resolution_choice.replace(' ', '_')}.mp4"
-                
-                ffmpeg_command = ["ffmpeg", "-y"]
-
-                temp_original_audio_path = None
-                if use_original_audio:
-                    # Estrai audio originale. Il video caricato potrebbe non avere una
-                    # traccia audio (es. screen recording muto) o avere un codec che
-                    # ffmpeg non riesce a rimappare in AAC: in quel caso non crashare,
-                    # avvisa l'utente e prosegui usando solo l'audio generato.
-                    temp_original_audio_path = f"temp_original_audio_{session_id}.aac"
-                    try:
-                        subprocess.run([
-                            "ffmpeg", "-y", "-i", video_input_path, "-vn", "-acodec", "aac", temp_original_audio_path
-                        ], check=True, capture_output=True)
-                    except subprocess.CalledProcessError:
-                        st.warning("⚠️ Impossibile estrarre l'audio originale dal video (potrebbe non avere una traccia audio). Procedo usando solo l'audio generato.")
-                        use_original_audio = False
-                        params['use_original_audio'] = False
-                        if os.path.exists(temp_original_audio_path):
-                            os.remove(temp_original_audio_path)
-                        temp_original_audio_path = None
-
-                if use_original_audio:
-                    # Mix e ricodifica
-                    ffmpeg_command.extend([
-                        "-i", video_input_path,
-                        "-i", audio_output_path,
-                        "-i", temp_original_audio_path,
-                        "-filter_complex",
-                        f"[1:a]volume=1.0[generated_audio];" # volume fisso per audio generato
-                        f"[2:a]volume={original_audio_mix_level}[original_audio];" # volume per audio originale
-                        f"[generated_audio][original_audio]amix=inputs=2:duration=longest[aout]", # mix
-                        "-map", "0:v",
-                        "-map", "[aout]",
-                        "-c:v", "libx264",
-                        "-preset", "medium",
-                        "-crf", "23",
-                        "-c:a", "aac",
-                        "-b:a", "192k",
-                    ])
-                else:
-                    ffmpeg_command.extend([
-                        "-i", video_input_path,
-                        "-i", audio_output_path,
-                        "-map", "0:v",
-                        "-map", "1:a",
-                        "-c:v", "libx264",
-                        "-preset", "medium",
-                        "-crf", "23",
-                        "-c:a", "aac",
-                        "-b:a", "192k",
-                    ])
-
-                if output_resolution_choice != "Originale":
-                    width, height = FORMAT_RESOLUTIONS[output_resolution_choice]
-                    ffmpeg_command.extend(["-vf", f"scale={width}:{height},setsar=1:1"])
-                
-                ffmpeg_command.append(final_video_path)
-
-                try:
-                    process = subprocess.Popen(ffmpeg_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-                    
-                    # Cerca il progresso corrente nell'output di FFmpeg (la durata totale
-                    # è già nota da duration_seconds, quindi non serve riestrarla dallo stderr)
-                    time_pattern = r"time=(\d{2}):(\d{2}):(\d{2}\.\d{2})"
-                    
-                    total_seconds = duration_seconds # Già calcolato prima
-
-                    while True:
-                        output = process.stderr.readline()
-                        if not output and process.poll() is not None:
-                            break
-                        if output:
-                            time_match = re.search(time_pattern, output)
-                            if time_match:
-                                hours, minutes, seconds = map(float, time_match.groups())
-                                current_seconds = hours * 3600 + minutes * 60 + seconds
-                                if total_seconds > 0:
-                                    progress = int((current_seconds / total_seconds) * 100)
-                                    progress_bar_video.progress(min(progress, 99)) # Non arrivare al 100% finché non è finito
-                                    status_text_video.text(f"Elaborazione video: {current_seconds:.2f}/{total_seconds:.2f}s")
-                    
-                    stdout, stderr = process.communicate()
-                    if process.returncode != 0:
-                        raise subprocess.CalledProcessError(process.returncode, process.args, stdout, stderr)
-
-                    progress_bar_video.progress(100)
-                    status_text_video.text("Video completato!")
-                    st.success("✅ Video con audio generato con successo! Scarica qui sotto:")
-                    
-                    # Salva video in session_state (così il download non riavvia la generazione)
-                    with open(final_video_path, "rb") as f:
-                        st.session_state['video_bytes'] = f.read()
-                    preset_slug = preset_to_filename_slug(st.session_state.get('preset_choice', PRESET_MANUALE))
-                    name_suffix = f"_{preset_slug}" if preset_slug else ""
-                    st.session_state['video_filename'] = f"{base_name_output}{name_suffix}_video.mp4"
-                    st.session_state['report_filename'] = f"{base_name_output}{name_suffix}_report.txt"
-
-                    # Costruisci il report in stile archivio Loop507: campi bilingue IT/EN
-                    # con prefisso "::", coerente con la documentazione degli altri progetti.
-                    def field(it_label: str, en_label: str, value, indent: str = "") -> str:
-                        return f"{indent}:: {it_label} / {en_label} :: {value}"
-
-                    def onoff(flag: bool) -> str:
-                        return "abilitata / enabled" if flag else "disabilitata / disabled"
-
-                    report_lines = []
-                    report_lines.append(":: VIDEOSOUND GEN — REPORT")
-                    report_lines.append(":: by Loop507")
-                    report_lines.append("")
-
-                    preset_used = st.session_state.get('preset_choice', PRESET_MANUALE)
-                    report_lines.append(field("preset di partenza", "starting preset", preset_used))
-                    report_lines.append(field("formato output video", "video output format", params.get('output_resolution_choice', 'N/A')))
-                    if params.get('use_original_audio'):
-                        report_lines.append(field("audio originale", "original audio", f"mantenuto / kept (mix {params.get('original_audio_mix_level', 0):.2f})"))
-                    else:
-                        report_lines.append(field("audio originale", "original audio", "non mantenuto / not kept"))
-                    report_lines.append(field("normalizzazione audio finale", "final audio normalization", "sì / yes" if params.get('normalize_audio') else "no / no"))
-                    if params.get('use_saturation'):
-                        report_lines.append(field("saturazione soft", "soft saturation", f"abilitata / enabled (drive {params.get('saturation_drive', 1.5):.1f})"))
-                    else:
-                        report_lines.append(field("saturazione soft", "soft saturation", "disabilitata / disabled"))
-                    if params.get('melody_enabled'):
-                        report_lines.append(field("melodia (quantizzazione a scala)", "melody (scale quantization)", f"{params.get('melody_scale', 'N/A')} (fondamentale {params.get('melody_root_note', 220.0):.0f} Hz)"))
-                    else:
-                        report_lines.append(field("melodia (quantizzazione a scala)", "melody (scale quantization)", "disabilitata / disabled (intonazione libera / free pitch)"))
-
-                    report_lines.append("")
-                    report_lines.append(":: --- layer audio / audio layers ---")
-
-                    report_lines.append(field("sintesi sottrattiva", "subtractive synthesis", onoff(params.get('subtractive_enabled'))))
-                    if params.get('subtractive_enabled'):
-                        report_lines.append(field("volume layer", "layer volume", f"{params.get('sub_layer_gain', 1.0):.2f}", indent="  "))
-                        report_lines.append(field("frequenza", "frequency", f"{params['sub_freq_source']} ({params['sub_freq_range'][0]}-{params['sub_freq_range'][1]} Hz)", indent="  "))
-                        report_lines.append(field("ampiezza", "amplitude", f"{params['sub_amp_source']} ({params['sub_amp_range'][0]:.2f}-{params['sub_amp_range'][1]:.2f})", indent="  "))
-                        report_lines.append(field("forma d'onda", "waveform", params['sub_waveform_type'], indent="  "))
-                        if params['sub_waveform_type'] in ("square", "sawtooth"):
-                            report_lines.append(field("anti-aliasing", "anti-aliasing", "band-limited (PolyBLEP)" if params.get('sub_band_limited') else "grezzo / raw (aliasing voluto)", indent="  "))
-                        if params.get('sub_filter_enabled'):
-                            report_lines.append(field("filtro risonante", "resonant filter", f"cutoff {params.get('sub_cutoff_source', 'N/A')} ({params['sub_cutoff_range'][0]}-{params['sub_cutoff_range'][1]} Hz), Q {params.get('sub_resonance', 1.5):.1f}", indent="  "))
-                        else:
-                            report_lines.append(field("filtro risonante", "resonant filter", "disabilitato / disabled", indent="  "))
-
-                    report_lines.append(field("sintesi fm", "fm synthesis", onoff(params.get('fm_enabled'))))
-                    if params.get('fm_enabled'):
-                        report_lines.append(field("volume layer", "layer volume", f"{params.get('fm_layer_gain', 1.0):.2f}", indent="  "))
-                        report_lines.append(field("portante", "carrier", f"{params['fm_carrier_source']} ({params['fm_carrier_range'][0]}-{params['fm_carrier_range'][1]} Hz)", indent="  "))
-                        report_lines.append(field("modulatore", "modulator", f"{params['fm_mod_source']} ({params['fm_mod_range'][0]}-{params['fm_mod_range'][1]} Hz)", indent="  "))
-                        report_lines.append(field("indice mod.", "mod. index", f"{params['fm_mod_idx_source']} ({params['fm_mod_idx_range'][0]:.1f}-{params['fm_mod_idx_range'][1]:.1f})", indent="  "))
-                        report_lines.append(field("ampiezza", "amplitude", f"{params['fm_amp_source']} ({params['fm_amp_range'][0]:.2f}-{params['fm_amp_range'][1]:.2f})", indent="  "))
-
-                    report_lines.append(field("e-piano (fm a note)", "e-piano (fm notes)", onoff(params.get('epiano_enabled'))))
-                    if params.get('epiano_enabled'):
-                        report_lines.append(field("volume layer", "layer volume", f"{params.get('epiano_layer_gain', 1.0):.2f}", indent="  "))
-                        report_lines.append(field("densità", "density", f"{params.get('epiano_density_source', 'N/A')} ({params['epiano_density_range'][0]}-{params['epiano_density_range'][1]} note/finestra)", indent="  "))
-                        report_lines.append(field("intonazione", "pitch", f"{params.get('epiano_pitch_source', 'N/A')} ({params['epiano_pitch_range'][0]}-{params['epiano_pitch_range'][1]} Hz)", indent="  "))
-                        report_lines.append(field("brillantezza", "brightness", params.get('epiano_brightness_source', 'N/A'), indent="  "))
-                        report_lines.append(field("rapporto mod/portante", "mod/carrier ratio", f"{params.get('epiano_mod_ratio', 1.0):.1f}", indent="  "))
-                        report_lines.append(field("durata massima nota", "max note duration", f"{params.get('epiano_note_duration', 1.2):.2f} sec", indent="  "))
-
-                    report_lines.append(field("sintesi granulare", "granular synthesis", onoff(params.get('granular_enabled'))))
-                    if params.get('granular_enabled'):
-                        report_lines.append(field("volume layer", "layer volume", f"{params.get('gran_layer_gain', 1.0):.2f}", indent="  "))
-                        report_lines.append(field("densità", "density", f"{params['gran_density_source']} ({params['gran_density_range'][0]}-{params['gran_density_range'][1]} grani/grains)", indent="  "))
-                        report_lines.append(field("durata", "duration", f"{params['gran_duration_source']} ({params['gran_duration_range'][0]:.3f}-{params['gran_duration_range'][1]:.3f} sec)", indent="  "))
-                        report_lines.append(field("ampiezza", "amplitude", f"{params['gran_amp_source']} ({params['gran_amp_range'][0]:.2f}-{params['gran_amp_range'][1]:.2f})", indent="  "))
-                        if 'gran_pitch_range' in params:
-                            report_lines.append(field("intonazione grani", "grain pitch", f"{params.get('gran_pitch_source', 'N/A')} ({params['gran_pitch_range'][0]}-{params['gran_pitch_range'][1]} Hz)", indent="  "))
-
-                    report_lines.append(field("corde (karplus-strong)", "strings (karplus-strong)", onoff(params.get('pluck_enabled'))))
-                    if params.get('pluck_enabled'):
-                        report_lines.append(field("volume layer", "layer volume", f"{params.get('pluck_layer_gain', 1.0):.2f}", indent="  "))
-                        report_lines.append(field("densità", "density", f"{params.get('pluck_density_source', 'N/A')} ({params['pluck_density_range'][0]}-{params['pluck_density_range'][1]} pizzicate/finestra)", indent="  "))
-                        report_lines.append(field("intonazione", "pitch", f"{params.get('pluck_pitch_source', 'N/A')} ({params['pluck_pitch_range'][0]}-{params['pluck_pitch_range'][1]} Hz)", indent="  "))
-                        report_lines.append(field("smorzamento", "damping", params.get('pluck_damping_source', 'N/A'), indent="  "))
-                        report_lines.append(field("durata massima", "max duration", f"{params.get('pluck_duration', 0.4):.2f} sec", indent="  "))
-                        report_lines.append(field("carattere", "character", f"durezza {params.get('pluck_hardness', 0.0):.2f} (0=pizzicata, 1=martellata)", indent="  "))
-                        if params.get('pluck_unison_voices', 1) > 1:
-                            report_lines.append(field("unisono", "unison", f"{params['pluck_unison_voices']} corde, scordatura {params.get('pluck_unison_detune', 0.0):.0f} cent", indent="  "))
-                        else:
-                            report_lines.append(field("unisono", "unison", "disabilitato / disabled (1 corda)", indent="  "))
-
-                    report_lines.append(field("rumore", "noise", onoff(params.get('noise_enabled'))))
-                    if params.get('noise_enabled'):
-                        report_lines.append(field("volume layer", "layer volume", f"{params.get('noise_layer_gain', 1.0):.2f}", indent="  "))
-                        report_lines.append(field("ampiezza", "amplitude", f"{params['noise_amp_source']} ({params['noise_amp_range'][0]:.2f}-{params['noise_amp_range'][1]:.2f})", indent="  "))
-
-                    report_lines.append("")
-                    report_lines.append(":: --- effetti audio / audio effects ---")
-
-                    report_lines.append(field("glitch", "glitch", onoff(params.get('glitch_enabled'))))
-                    if params.get('glitch_enabled'):
-                        report_lines.append(field("carattere", "character", params.get('glitch_character', 'Bilanciato (default)'), indent="  "))
-                        report_lines.append(field("fattore", "factor", f"{params['glitch_factor_source']} ({params['glitch_factor_range'][0]:.3f}-{params['glitch_factor_range'][1]:.3f})", indent="  "))
-                        report_lines.append(field("intensità", "intensity", f"{params['glitch_intensity_source']} ({params['glitch_intensity_range'][0]:.2f}-{params['glitch_intensity_range'][1]:.2f})", indent="  "))
-
-                    report_lines.append(field("delay", "delay", onoff(params.get('delay_enabled'))))
-                    if params.get('delay_enabled'):
-                        report_lines.append(field("tempo", "time", f"{params['delay_time_source']} ({params['delay_time_range'][0]:.2f}-{params['delay_time_range'][1]:.2f} sec)", indent="  "))
-                        report_lines.append(field("feedback", "feedback", f"{params['delay_feedback_source']} ({params['delay_feedback_range'][0]:.2f}-{params['delay_feedback_range'][1]:.2f})", indent="  "))
-
-                    report_lines.append(field("riverbero", "reverb", onoff(params.get('reverb_enabled'))))
-                    if params.get('reverb_enabled'):
-                        report_lines.append(field("decadimento", "decay", f"{params['reverb_decay_source']} ({params['reverb_decay_range'][0]:.1f}-{params['reverb_decay_range'][1]:.1f} sec)", indent="  "))
-                        report_lines.append(field("mix", "mix", f"{params['reverb_mix_source']} ({params['reverb_mix_range'][0]:.2f}-{params['reverb_mix_range'][1]:.2f})", indent="  "))
-
-                    report_lines.append(field("equalizzatore dinamico", "dynamic equalizer", onoff(params.get('eq_enabled'))))
-                    if params.get('eq_enabled'):
-                        report_lines.append(field("bassi", "low", f"{params['eq_low_source']} ({params['eq_gain_range'][0]:.1f}-{params['eq_gain_range'][1]:.1f} dB)", indent="  "))
-                        report_lines.append(field("medi", "mid", f"{params['eq_mid_source']} ({params['eq_gain_range'][0]:.1f}-{params['eq_gain_range'][1]:.1f} dB)", indent="  "))
-                        report_lines.append(field("alti", "high", f"{params['eq_high_source']} ({params['eq_gain_range'][0]:.1f}-{params['eq_gain_range'][1]:.1f} dB)", indent="  "))
-
-                    report_lines.append("")
-                    report_lines.append(":: --- spazializzazione / spatialization ---")
-                    if params.get('panning_enabled'):
-                        report_lines.append(field("panning stereo", "stereo panning", f"abilitato / enabled (sorgente/source: {params.get('pan_source', 'N/A')})"))
-                    else:
-                        report_lines.append(field("panning stereo", "stereo panning", "disabilitato / disabled"))
-                    if params.get('elevation_enabled'):
-                        report_lines.append(field("simulazione altezza", "elevation simulation", f"abilitata / enabled (sorgente/source: {params.get('elevation_source', 'N/A')})"))
-                    else:
-                        report_lines.append(field("simulazione altezza", "elevation simulation", "disabilitata / disabled"))
-
-                    report_lines.append("")
-                    report_lines.append("#loop507 #videosoundgen #glitchbrutalista #minimalismocomputazionale")
-
-                    st.session_state['report_text'] = "\n".join(report_lines)
-                    
-                    # Pulisci i file temporanei
-                    for temp_f in [video_input_path, audio_output_path, temp_original_audio_path if use_original_audio else None, final_video_path]:
-                        if temp_f and os.path.exists(temp_f):
-                            os.remove(temp_f)
-                    st.info("🗑️ File temporanei puliti.")
-
-                except subprocess.CalledProcessError as e:
-                    st.error(f"❌ Errore FFmpeg durante l'unione/ricodifica: {e.stderr.decode()}")
-                    st.code(e.stdout.decode() + e.stderr.decode())
-                    # Pulisci i file temporanei anche in caso di errore FFmpeg
-                    for temp_f in [video_input_path, audio_output_path, temp_original_audio_path if use_original_audio else None]:
-                        if temp_f and os.path.exists(temp_f):
-                            os.remove(temp_f)
-                    st.info("🗑️ File temporanei puliti.")
-                except Exception as e:
-                    st.error(f"❌ Errore generico durante l'unione/ricodifica: {str(e)}")
-                    # Pulisci i file temporanei anche in caso di errore generico
-                    for temp_f in [video_input_path, audio_output_path, temp_original_audio_path if use_original_audio else None]:
-                        if temp_f and os.path.exists(temp_f):
-                            os.remove(temp_f)
-                    st.info("🗑️ File temporanei puliti.")
-        # Non c'è più un blocco 'else' diretto per 'if st.button' che usi audio_output_path
-        # La logica del "FFmpeg non trovato" è ora gestita all'interno del blocco 'if st.button'
-        # Questo previene l'UnboundLocalError quando il pulsante non è ancora stato cliccato.
-
-
-        # ── PULSANTI DI DOWNLOAD PERSISTENTI ───────────────────────────────────
-        # Sono fuori dal blocco if st.button → vengono renderizzati ad ogni rerun
-        # senza riavviare la generazione. I dati vengono letti da session_state.
-        if st.session_state.get('video_bytes') or st.session_state.get('report_text') or st.session_state.get('stems_zip_bytes') or st.session_state.get('generative_audio_bytes'):
-            st.markdown("---")
-            st.subheader("⬇️ Download")
-            dl_col1, dl_col2, dl_col3 = st.columns(3)
-            with dl_col1:
-                if st.session_state.get('video_bytes'):
-                    st.download_button(
-                        label="🎬 Scarica Video Finale",
-                        data=st.session_state['video_bytes'],
-                        file_name=st.session_state.get('video_filename', 'output_video.mp4'),
-                        mime="video/mp4",
-                        key="dl_video"
-                    )
-                if st.session_state.get('generative_audio_bytes'):
-                    st.download_button(
-                        label="🎵 Scarica Traccia Audio",
-                        data=st.session_state['generative_audio_bytes'],
-                        file_name=f"{base_name_output}.wav" if base_name_output else "traccia_generativa.wav",
-                        mime="audio/wav",
-                        key="dl_generative_audio"
-                    )
-            with dl_col2:
-                if st.session_state.get('report_text'):
-                    st.download_button(
-                        label="📄 Scarica Report Parametri",
-                        data=st.session_state['report_text'],
-                        file_name=st.session_state.get('report_filename', f"{base_name_output}_report.txt"),
-                        mime="text/plain",
-                        key="dl_report"
-                    )
-            with dl_col3:
-                if st.session_state.get('stems_zip_bytes'):
-                    st.download_button(
-                        label="🎛️ Scarica Stems (ZIP)",
-                        data=st.session_state['stems_zip_bytes'],
-                        file_name=f"{base_name_output}_stems.zip",
-                        mime="application/zip",
-                        key="dl_stems"
-                    )
-
-
-        # Questa sezione è volutamente fuori dal blocco if/else del pulsante,
-        # ma all'interno dell'if uploaded_file is not None.
-        st.markdown("---")
-        with st.expander("✨ Descrizione del Brano Generato"):
-            st.write("Questa è una descrizione dettagliata dei parametri usati per generare il tuo brano:")
-            
-            st.markdown("#### Impostazioni Video:")
-            st.write(f"- Formato Output Video: **{params['output_resolution_choice']}**")
-            if params['use_original_audio']:
-                st.write(f"- Audio Originale del Video: **Mantenuto** (Livello Mix: **{params['original_audio_mix_level']:.2f}**)")
-            else:
-                st.write("- Audio Originale del Video: **Non mantenuto**")
-            st.write(f"- Normalizzazione Audio Finale: **{'Sì' if params['normalize_audio'] else 'No'}**")
-            
-            st.markdown("#### Layer Audio:")
-            if params['subtractive_enabled']:
-                st.markdown("##### Sintesi Sottrattiva (Abilitata):")
-                st.write(f"- Frequenza Controllata da: **{params['sub_freq_source']}** ({params['sub_freq_range'][0]} - {params['sub_freq_range'][1]} Hz)")
-                st.write(f"- Ampiezza Controllata da: **{params['sub_amp_source']}** ({params['sub_amp_range'][0]:.2f} - {params['sub_amp_range'][1]:.2f})")
-                st.write(f"- Tipo Onda: **{params['sub_waveform_type']}**")
-            else:
-                st.write("##### Sintesi Sottrattiva: Disabilitata")
-
-            if params['fm_enabled']:
-                st.markdown("##### Sintesi FM (Abilitata):")
-                st.write(f"- Frequenza Portante Controllata da: **{params['fm_carrier_source']}** ({params['fm_carrier_range'][0]} - {params['fm_carrier_range'][1]} Hz)")
-                st.write(f"- Frequenza Modulatore Controllata da: **{params['fm_mod_source']}** ({params['fm_mod_range'][0]} - {params['fm_mod_range'][1]} Hz)")
-                st.write(f"- Indice Modulazione Controllato da: **{params['fm_mod_idx_source']}** ({params['fm_mod_idx_range'][0]:.1f} - {params['fm_mod_idx_range'][1]:.1f})")
-                st.write(f"- Ampiezza FM Controllata da: **{params['fm_amp_source']}** ({params['fm_amp_range'][0]:.2f} - {params['fm_amp_range'][1]:.2f})")
-            else:
-                st.write("##### Sintesi FM: Disabilitata")
-
-            if params['granular_enabled']:
-                st.markdown("##### Sintesi Granulare (Abilitata):")
-                st.write(f"- Densità Grani Controllata da: **{params['gran_density_source']}** ({params['gran_density_range'][0]} - {params['gran_density_range'][1]} grani)")
-                st.write(f"- Durata Grani Controllata da: **{params['gran_duration_source']}** ({params['gran_duration_range'][0]:.3f} - {params['gran_duration_range'][1]:.3f} sec)")
-                st.write(f"- Ampiezza Grani Controllata da: **{params['gran_amp_source']}** ({params['gran_amp_range'][0]:.2f} - {params['gran_amp_range'][1]:.2f})")
-            else:
-                st.write("##### Sintesi Granulare: Disabilitata")
-
-            if params['noise_enabled']:
-                st.markdown("##### Rumore (Abilitato):")
-                st.write(f"- Ampiezza Rumore Controllata da: **{params['noise_amp_source']}** ({params['noise_amp_range'][0]:.2f} - {params['noise_amp_range'][1]:.2f})")
-            else:
-                st.write("##### Rumore: Disabilitato")
-
-            st.markdown("#### Effetti Audio:")
-            if params['glitch_enabled']:
-                st.markdown("##### Glitch (Abilitato):")
-                st.write(f"- Fattore Glitch (Probabilità) Controllato da: **{params['glitch_factor_source']}** ({params['glitch_factor_range'][0]:.3f} - {params['glitch_factor_range'][1]:.3f})")
-                st.write(f"- Intensità Glitch (Durata/Ampiezza) Controllata da: **{params['glitch_intensity_source']}** ({params['glitch_intensity_range'][0]:.2f} - {params['glitch_intensity_range'][1]:.2f})")
-            else:
-                st.write("##### Glitch: Disabilitato")
-
-            if params['delay_enabled']:
-                st.markdown("##### Delay (Abilitato):")
-                st.write(f"- Tempo Delay Controllato da: **{params['delay_time_source']}** ({params['delay_time_range'][0]:.2f} - {params['delay_time_range'][1]:.2f} sec)")
-                st.write(f"- Feedback Delay Controllato da: **{params['delay_feedback_source']}** ({params['delay_feedback_range'][0]:.2f} - {params['delay_feedback_range'][1]:.2f})")
-            else:
-                st.write("##### Delay: Disabilitato")
-
-            if params['reverb_enabled']:
-                st.markdown("##### Riverbero (Abilitato):")
-                st.write(f"- Tempo Decadimento Controllato da: **{params['reverb_decay_source']}** ({params['reverb_decay_range'][0]:.1f} - {params['reverb_decay_range'][1]:.1f} sec)")
-                st.write(f"- Mix Riverbero Controllato da: **{params['reverb_mix_source']}** ({params['reverb_mix_range'][0]:.2f} - {params['reverb_mix_range'][1]:.2f})")
-            else:
-                st.write("##### Riverbero: Disabilitato")
-
-            if params['eq_enabled']:
-                st.markdown("##### Equalizzatore Dinamico (Abilitato):")
-                st.write(f"- Guadagno Bassi Controllato da: **{params['eq_low_source']}** ({params['eq_gain_range'][0]:.1f} - {params['eq_gain_range'][1]:.1f} dB)")
-                st.write(f"- Guadagno Medi Controllato da: **{params['eq_mid_source']}** ({params['eq_gain_range'][0]:.1f} - {params['eq_gain_range'][1]:.1f} dB)")
-                st.write(f"- Guadagno Alti Controllato da: **{params['eq_high_source']}** ({params['eq_gain_range'][0]:.1f} - {params['eq_gain_range'][1]:.1f} dB)")
-            else:
-                st.write("##### Equalizzatore Dinamico: Disabilitato")
-
-    gc.collect() # Questa riga è ora all'interno del blocco `if uploaded_file is not None`
 
 if __name__ == "__main__":
     main()
