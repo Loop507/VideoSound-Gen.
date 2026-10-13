@@ -372,7 +372,7 @@ def validate_video_file(uploaded_file) -> bool:
         return False
     return True
 
-def analyze_video_frames(video_path: str) -> Tuple[list, list, list, list, list, list, list, list, float, float]:
+def analyze_video_frames(video_path: str) -> Tuple[list, list, list, list, list, list, list, list, float, float, list]:
     """
     Analizza i frame di un video per estrarre dati visivi.
 
@@ -421,6 +421,9 @@ def analyze_video_frames(video_path: str) -> Tuple[list, list, list, list, list,
 
     prev_gray_frame = None
     prev_movement = 0.0
+    impact_data = []       # "impatto visivo": quanto cambia di colpo la direzione/quantità di movimento
+    prev_small = None
+    prev_directogram = None
 
     while True:
         ret, frame = cap.read()
@@ -435,6 +438,25 @@ def analyze_video_frames(video_path: str) -> Tuple[list, list, list, list, list,
             h, w = frame.shape[:2]
 
         gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+        # Impatto visivo (ispirato a "Visual Rhythm and Beat", Davis & Agrawala 2018): optical flow di
+        # Farneback a bassa risoluzione (160 px di larghezza: l'optical flow è costoso e il ritmo si vede
+        # benissimo anche in piccolo), riassunto in un "directogram" (movimento totale per direzione) e
+        # poi in quanto il directogram cambia da un frame al successivo. Un picco = un cambio brusco del
+        # movimento (partenza, stop, urto, cambio di direzione), cioè un "battito" visivo.
+        small = gray_frame
+        if gray_frame.shape[1] > FLOW_ANALYSIS_WIDTH:
+            small = cv2.resize(gray_frame, (FLOW_ANALYSIS_WIDTH, max(8, int(round(gray_frame.shape[0] * FLOW_ANALYSIS_WIDTH / gray_frame.shape[1])))),
+                               interpolation=cv2.INTER_AREA)
+        if prev_small is not None:
+            flow = cv2.calcOpticalFlowFarneback(prev_small, small, None, 0.5, 2, 9, 2, 5, 1.1, 0)
+            flow_mag, flow_ang = cv2.cartToPolar(flow[..., 0], flow[..., 1])
+            dir_bins = np.minimum((flow_ang * (DIRECTOGRAM_BINS / (2.0 * np.pi))).astype(np.int32), DIRECTOGRAM_BINS - 1)
+            directogram = np.bincount(dir_bins.ravel(), weights=flow_mag.ravel(), minlength=DIRECTOGRAM_BINS) / flow_mag.size
+        else:
+            directogram = np.zeros(DIRECTOGRAM_BINS)
+        impact_data.append(float(np.abs(directogram - prev_directogram).sum()) if prev_directogram is not None else 0.0)
+        prev_small, prev_directogram = small, directogram
 
         # Luminosità (media intensità dei pixel) e dettaglio (deviazione standard) in un solo passaggio
         mean_val, std_val = cv2.meanStdDev(gray_frame)
@@ -482,18 +504,25 @@ def analyze_video_frames(video_path: str) -> Tuple[list, list, list, list, list,
     # Assicurati che tutti gli array abbiano la stessa lunghezza finale
     max_len = len(luminosity_data)
     for arr in [detail_data, movement_data, variation_movement_data, horizontal_mass_center_data,
-                vertical_mass_center_data, edge_density_data, color_variation_data]:
+                vertical_mass_center_data, edge_density_data, color_variation_data, impact_data]:
         while len(arr) < max_len:
             arr.append(arr[-1] if arr else 0.0) # Aggiunge l'ultimo valore o 0.0 se vuoto
+
+    # Normalizza l'impatto sul 95° percentile (robusto ai pochi picchi enormi), valori in [0, 2]. Il
+    # riferimento non scende mai sotto IMPACT_NOISE_FLOOR: in un video fermo o con solo rumore del sensore
+    # l'inviluppo resta basso invece di essere "gonfiato" a 1 (e si ritrovano picchi che non esistono).
+    impact_arr = np.asarray(impact_data, dtype=np.float64)
+    ref = max(float(np.percentile(impact_arr, 95)) if impact_arr.size else 0.0, IMPACT_NOISE_FLOOR)
+    impact_data = np.clip(impact_arr / ref, 0.0, 2.0).tolist()
 
     gc.collect() # Libera memoria
 
     return (luminosity_data, detail_data, movement_data, variation_movement_data, horizontal_mass_center_data,
-            vertical_mass_center_data, edge_density_data, color_variation_data, duration_seconds, fps)
+            vertical_mass_center_data, edge_density_data, color_variation_data, duration_seconds, fps, impact_data)
 
 
 @st.cache_data(show_spinner="🎞️ Analisi del video in corso...")
-def analyze_video_frames_cached(video_path: str, file_hash: str) -> Tuple[list, list, list, list, list, list, list, list, float, float]:
+def analyze_video_frames_cached(video_path: str, file_hash: str) -> Tuple[list, list, list, list, list, list, list, list, float, float, list]:
     """Wrapper cache di analyze_video_frames. Senza questa cache, Streamlit riesegue l'intero
     script (e quindi anche l'analisi frame-per-frame del video, che decodifica ogni singolo
     fotogramma con OpenCV) ad OGNI interazione con qualsiasi controllo dell'interfaccia — non solo
@@ -509,7 +538,7 @@ def analyze_video_frames_cached(video_path: str, file_hash: str) -> Tuple[list, 
 
 
 def generate_synthetic_feature_curves(duration_seconds: float, fps: float = 30.0, seed: int = None
-                                       ) -> Tuple[list, list, list, list, list, list, list, list, float, float]:
+                                       ) -> Tuple[list, list, list, list, list, list, list, list, float, float, list]:
     """Genera 8 curve di controllo sintetiche al posto di quelle estratte da un video, per usare
     VideoSound-Gen come strumento generativo standalone senza caricare alcun file. Restituisce
     esattamente lo stesso formato di analyze_video_frames_cached (8 liste + durata + fps), quindi
@@ -551,9 +580,20 @@ def generate_synthetic_feature_curves(duration_seconds: float, fps: float = 30.0
     edge_density_data = organic_curve(0.07)
     color_variation_data = organic_curve(0.06)
 
+    # Ritmo generativo: al posto dei picchi di movimento di un video vero, un treno di impulsi casuali
+    # (circa 2 al secondo, ben separati, forza variabile). Disegnato DOPO le 8 curve, così queste restano
+    # identiche a prima per lo stesso seed.
+    impact = np.zeros(n_frames)
+    gap_frames = max(2, int(round(0.18 * fps)))
+    next_frame = int(rng.randint(0, gap_frames * 2))
+    while next_frame < n_frames:
+        impact[next_frame] = rng.uniform(0.35, 1.0)
+        next_frame += gap_frames + int(rng.exponential(0.3 * fps))
+    impact = np.convolve(impact, [0.5, 1.0, 0.5], mode='same')
+
     return (luminosity_data, detail_data, movement_data, variation_movement_data,
             horizontal_mass_center_data, vertical_mass_center_data, edge_density_data,
-            color_variation_data, duration_seconds, fps)
+            color_variation_data, duration_seconds, fps, impact.tolist())
 
 
 # ── SINTESI GRANULARE "A VIAGGIO" (audio in → audio out) ───────────────────
@@ -916,9 +956,11 @@ class AudioGenerator:
 
         nyquist = 0.5 * self.sample_rate
 
-        # Aggiorna i coefficienti ogni ~20ms: abbastanza spesso da seguire la modulazione video,
-        # abbastanza raro da restare economico (stesso compromesso di delay/reverb).
-        chunk_size = max(1, int(0.02 * self.sample_rate))
+        # Aggiorna i coefficienti ogni 2.5 ms (prima 20 ms). Misurato su una sawtooth con cutoff
+        # modulato: l'errore rispetto a una modulazione 'ideale' per-campione scende da -11 dB a
+        # -25 dB, mentre cambiare tipo di filtro (biquad -> state variable filter) cambiava meno
+        # di 0.5 dB: il limite era il passo di aggiornamento, non la struttura del filtro.
+        chunk_size = max(1, int(FILTER_UPDATE_SECONDS * self.sample_rate))
         n_chunks = (n_samples + chunk_size - 1) // chunk_size
         chunk_start_indices = np.minimum(np.arange(n_chunks) * chunk_size, n_samples - 1)
         chunk_times = self.time_array[chunk_start_indices]
@@ -1001,7 +1043,8 @@ class AudioGenerator:
 
     def generate_fm_epiano_layer(self, density_data: list, pitch_data: list, brightness_data: list, amp_data: list,
                                   note_duration: float = 1.2, mod_ratio: float = 1.0,
-                                  trigger_window_seconds: float = 0.2) -> np.ndarray:
+                                  trigger_window_seconds: float = 0.2, pitch_jitter_scale: float = 1.0,
+                                  onset_samples: np.ndarray = None, onset_strength: np.ndarray = None) -> np.ndarray:
         """Layer 'e-piano' FM (stile DX7/Rhodes): a differenza del layer FM continuo esistente,
         qui la sintesi è per NOTE discrete con inviluppo. Il dettaglio che fa davvero la
         differenza timbrica: l'indice di modulazione ha il suo inviluppo separato, che decade
@@ -1058,8 +1101,17 @@ class AudioGenerator:
             current_brightness = float(np.clip(brightness_at_window[i], 0.0, 1.0))
             current_amp = float(amp_at_window[i])
 
-            start_notes = np.random.randint(start_w, end_w, size=num_notes)
-            jitter = (np.random.rand(num_notes) - 0.5) * 0.02  # +/-1%: intonazione naturale, non stonata come le corde
+            if onset_samples is None:
+                start_notes = np.random.randint(start_w, end_w, size=num_notes)
+                accents = np.ones(num_notes)
+            else:  # note sui picchi di movimento che cadono in questa finestra (la densità fa da limite)
+                lo, hi = np.searchsorted(onset_samples, [start_w, end_w])
+                start_notes = onset_samples[lo:hi][:num_notes]
+                accents = 0.6 + 0.4 * onset_strength[lo:hi][:num_notes]
+                num_notes = len(start_notes)
+                if num_notes == 0:
+                    continue
+            jitter = (np.random.rand(num_notes) - 0.5) * 0.02 * pitch_jitter_scale  # +/-1%: intonazione naturale, non stonata come le corde
 
             # Indice di modulazione iniziale: range ~0.5 (timbro morbido) - 6.0 (timbro brillante/metallico)
             mod_index0 = 0.5 + 5.5 * current_brightness
@@ -1072,7 +1124,7 @@ class AudioGenerator:
 
                 modulator_phase = 2 * np.pi * modulator_freq * t
                 carrier_phase = 2 * np.pi * carrier_freq * t + mod_index_env * np.sin(modulator_phase)
-                note_signal = np.sin(carrier_phase) * base_amp_env * current_amp * 0.3
+                note_signal = np.sin(carrier_phase) * base_amp_env * current_amp * 0.3 * accents[k]
 
                 start = start_notes[k]
                 end = min(start + note_duration_samples, self.total_samples)
@@ -1105,7 +1157,52 @@ class AudioGenerator:
         carrier_phase *= 0.5
         return carrier_phase
 
-    def _karplus_strong_pluck(self, D: int, duration_samples: int, g: float, hammer_hardness: float = 0.0) -> np.ndarray:
+    def _ks_excitation(self, burst_len: int, hammer_hardness: float) -> np.ndarray:
+        """Burst di eccitazione di una corda (rumore bianco, o rumore + sua derivata se hardness > 0)."""
+        noise_burst = np.random.uniform(-1.0, 1.0, burst_len)
+        if hammer_hardness > 0.0:
+            hard_burst = np.diff(noise_burst, prepend=0.0)
+            # np.diff raddoppia grosso modo l'ampiezza media (differenza di due valori indipendenti
+            # in [-1,1]): riscalata per restare paragonabile in livello al rumore bianco puro.
+            hard_burst = hard_burst / 1.6
+            return (1.0 - hammer_hardness) * noise_burst + hammer_hardness * hard_burst
+        return noise_burst
+
+    def _ks_tuning(self, freq: float):
+        """(D, mu) per accordare con precisione una corda Karplus-Strong.
+
+        Il filtro d'anello della versione classica (media di due campioni) aggiunge mezzo campione
+        di ritardo, quindi con D = round(fs/f) la nota usciva sempre calante (da pochi cent a
+        oltre 40 cent oltre 1 kHz). Qui il filtro d'anello è h = 0.5*[(1-mu), 1, mu] (stessa
+        media di due campioni, con una piccola interpolazione lineare) e mu è scelto in forma
+        chiusa perché il ritardo di fase alla frequenza fondamentale sia esattamente fs/f.
+        Il guadagno in continua resta 1 (smorzamento invariato)."""
+        target = self.sample_rate / freq
+        w0 = 2.0 * np.pi * freq / self.sample_rate
+        D = max(2, int(np.floor(target - 0.5)))
+        r = target - D  # ritardo frazionario richiesto al filtro d'anello, in [0.5, 1.5)
+        mu = 0.5 * (1.0 - np.tan(w0 * (1.0 - r)) / np.tan(w0 / 2.0))
+        return D, float(np.clip(mu, 0.0, 1.0))
+
+    def _karplus_strong_pluck_fractional(self, D: int, duration_samples: int, g: float,
+                                         hammer_hardness: float, mu: float) -> np.ndarray:
+        """Come _karplus_strong_pluck, ma con filtro d'anello a 3 tappe h = 0.5*g*[(1-mu), 1, mu]
+        (vedi _ks_tuning): y[n] = h0*y[n-D] + h1*y[n-D-1] + h2*y[n-D-2]. Ogni blocco di D campioni
+        legge solo dal blocco precedente, quindi resta vettorizzabile come nella versione classica."""
+        y_ext = np.zeros(duration_samples + 2)  # y_ext[j] = y[j-2]; i due zeri iniziali sono y[-2], y[-1]
+        burst_len = min(D, duration_samples)
+        y_ext[2:2 + burst_len] = self._ks_excitation(burst_len, hammer_hardness)
+        h0, h1, h2 = 0.5 * g * (1.0 - mu), 0.5 * g, 0.5 * g * mu
+        pos = D
+        while pos < duration_samples:
+            block_len = min(D, duration_samples - pos)
+            ext_idx = np.arange(pos, pos + block_len) + 2
+            y_ext[ext_idx] = h0 * y_ext[ext_idx - D] + h1 * y_ext[ext_idx - D - 1] + h2 * y_ext[ext_idx - D - 2]
+            pos += block_len
+        return y_ext[2:]
+
+    def _karplus_strong_pluck(self, D: int, duration_samples: int, g: float, hammer_hardness: float = 0.0,
+                              mu: float = None) -> np.ndarray:
         """Calcola una singola pizzicata Karplus-Strong: y[n] = eccitazione[n] per n<D (lunga
         quanto la linea di ritardo), poi y[n] = 0.5*g*(y[n-D] + y[n-D-1]) per n>=D.
 
@@ -1121,22 +1218,13 @@ class AudioGenerator:
         campioni consecutivi, che esalta le componenti ad alta frequenza) si ottiene un transiente
         più duro e percussivo — più vicino a un martelletto di pianoforte/clavicembalo che a un dito
         che pizzica una corda. hardness=0 → comportamento originale invariato."""
+        if mu is not None:  # accordatura frazionaria (vedi _ks_tuning); mu=None = comportamento classico
+            return self._karplus_strong_pluck_fractional(D, duration_samples, g, hammer_hardness, mu)
         # y_ext[0] rappresenta y[-1] = 0 (silenzio prima dell'eccitazione); serve per evitare
         # indici negativi quando il primo blocco legge un campione prima dell'inizio del rumore.
         y_ext = np.zeros(duration_samples + 1)
         burst_len = min(D, duration_samples)
-        noise_burst = np.random.uniform(-1.0, 1.0, burst_len)
-
-        if hammer_hardness > 0.0:
-            hard_burst = np.diff(noise_burst, prepend=0.0)
-            # np.diff raddoppia grosso modo l'ampiezza media (differenza di due valori indipendenti
-            # in [-1,1]): riscalata per restare paragonabile in livello al rumore bianco puro.
-            hard_burst = hard_burst / 1.6
-            excitation = (1.0 - hammer_hardness) * noise_burst + hammer_hardness * hard_burst
-        else:
-            excitation = noise_burst
-
-        y_ext[1:1 + burst_len] = excitation
+        y_ext[1:1 + burst_len] = self._ks_excitation(burst_len, hammer_hardness)
 
         pos = D
         while pos < duration_samples:
@@ -1149,7 +1237,9 @@ class AudioGenerator:
 
     def generate_pluck_layer(self, density_data: list, pitch_data: list, damping_data: list, amp_data: list,
                               max_pluck_duration: float = 0.4, trigger_window_seconds: float = 0.15,
-                              hammer_hardness: float = 0.0, unison_voices: int = 1, unison_detune_cents: float = 0.0) -> np.ndarray:
+                              hammer_hardness: float = 0.0, unison_voices: int = 1, unison_detune_cents: float = 0.0,
+                              pitch_jitter_scale: float = 1.0, onset_samples: np.ndarray = None,
+                              onset_strength: np.ndarray = None) -> np.ndarray:
         """Layer a modellazione fisica (Karplus-Strong): sintetizza 'pizzicate' di corda invece di
         onde/grani. Algoritmo classico: rumore bianco che eccita una linea di ritardo di lunghezza
         D = sample_rate/pitch, richiusa in retroazione con un filtro passa-basso a 2 campioni
@@ -1227,8 +1317,17 @@ class AudioGenerator:
             g = 0.90 + 0.099 * float(np.clip(damping_at_window[i], 0.0, 1.0))
             current_amp = float(amp_at_window[i])
 
-            start_pluck_samples = np.random.randint(start_sample_window, end_sample_window, size=num_plucks_in_window)
-            jitter = (np.random.rand(num_plucks_in_window) - 0.5) * 0.1  # +/-5% intonazione, meno del layer granulare (le corde restano più "accordate")
+            if onset_samples is None:
+                start_pluck_samples = np.random.randint(start_sample_window, end_sample_window, size=num_plucks_in_window)
+                accents = np.ones(num_plucks_in_window)
+            else:  # pizzicate sui picchi di movimento che cadono in questa finestra (la densità fa da limite)
+                lo, hi = np.searchsorted(onset_samples, [start_sample_window, end_sample_window])
+                start_pluck_samples = onset_samples[lo:hi][:num_plucks_in_window]
+                accents = 0.6 + 0.4 * onset_strength[lo:hi][:num_plucks_in_window]
+                num_plucks_in_window = len(start_pluck_samples)
+                if num_plucks_in_window == 0:
+                    continue
+            jitter = (np.random.rand(num_plucks_in_window) - 0.5) * 0.1 * pitch_jitter_scale  # +/-5% intonazione, meno del layer granulare (le corde restano più "accordate")
 
             for p in range(num_plucks_in_window):
                 pluck_freq = max(20.0, current_pitch * (1.0 + jitter[p]))
@@ -1236,9 +1335,9 @@ class AudioGenerator:
                 pluck_audio = np.zeros(pluck_duration_samples)
                 for ratio in voice_ratios:
                     voice_freq = max(20.0, pluck_freq * ratio)
-                    D = max(2, int(round(self.sample_rate / voice_freq)))
-                    pluck_audio += self._karplus_strong_pluck(D, pluck_duration_samples, g, hammer_hardness=hammer_hardness)
-                pluck_audio = pluck_audio / np.sqrt(unison_voices) * current_amp * 0.15  # /sqrt(N): somma voci scorrelate, non /N che sarebbe troppo silenzioso
+                    D, mu = self._ks_tuning(voice_freq)
+                    pluck_audio += self._karplus_strong_pluck(D, pluck_duration_samples, g, hammer_hardness=hammer_hardness, mu=mu)
+                pluck_audio = pluck_audio / np.sqrt(unison_voices) * current_amp * 0.15 * accents[p]  # /sqrt(N): somma voci scorrelate, non /N che sarebbe troppo silenzioso
 
                 start = start_pluck_samples[p]
                 end = min(start + pluck_duration_samples, self.total_samples)
@@ -1246,7 +1345,8 @@ class AudioGenerator:
 
         return audio
 
-    def generate_granular_layer(self, density_data: list, grain_duration_data: list, amp_data: list, pitch_data: list) -> np.ndarray:
+    def generate_granular_layer(self, density_data: list, grain_duration_data: list, amp_data: list, pitch_data: list,
+                                pitch_jitter_scale: float = 1.0) -> np.ndarray:
         """Genera un layer di sintesi granulare. L'intonazione dei grani è guidata da pitch_data
         (con un piccolo jitter casuale per mantenere una texture organica), non più puramente random."""
         n_frames = len(density_data)
@@ -1298,7 +1398,7 @@ class AudioGenerator:
             # per grano: piccola ottimizzazione aggiuntiva, non il costo principale.
             max_start = end_sample_segment - grain_dur_samples
             start_grain_samples = np.random.randint(start_sample_segment, max_start, size=num_grains_in_segment)
-            jitter = (np.random.rand(num_grains_in_segment) - 0.5) * 0.2
+            jitter = (np.random.rand(num_grains_in_segment) - 0.5) * 0.2 * pitch_jitter_scale
             grain_freqs = np.maximum(20.0, current_pitch * (1.0 + jitter))
 
             grain_t = np.arange(grain_dur_samples) / self.sample_rate
@@ -1424,14 +1524,20 @@ class AudioGenerator:
 
         return glitched_audio
 
-    def apply_delay_effect(self, audio_array: np.ndarray, delay_time_data: list, feedback_data: list) -> np.ndarray:
-        """Applica un effetto delay dinamico all'audio, processato a piccoli blocchi (non più campione per
-        campione). Dato che il tempo di delay minimo possibile (10ms) corrisponde sempre a molti più
-        campioni della dimensione del blocco, nessuna lettura ritardata entro un blocco può dipendere da
-        dati calcolati nello stesso blocco: questo permette di leggere/scrivere l'intero blocco con
-        NumPy vettorizzato invece che con un loop Python per-campione. I parametri (tempo/feedback)
-        vengono aggiornati una volta per blocco anziché per ogni singolo campione: una quantizzazione
-        finissima (~3ms) che in pratica non si sente, ma è un cambiamento reale rispetto a prima."""
+    def apply_delay_effect(self, audio_array: np.ndarray, delay_time_data: list, feedback_data: list,
+                           mode: str = "crossfade") -> np.ndarray:
+        """Delay dinamico elaborato a blocchi vettorizzati. Il tempo di delay minimo (10 ms) è sempre
+        molto più lungo del blocco, quindi nessuna lettura ritardata dipende da dati calcolati nello
+        stesso blocco.
+
+        mode controlla cosa succede quando il tempo di delay cambia (a ogni blocco, seguendo il video):
+          "crossfade" (default): ogni blocco sfuma dal tap al vecchio tempo a quello al nuovo tempo.
+              Niente click e niente glissando d'intonazione: la lettura salta, ma senza discontinuità.
+          "glide": il tempo scorre con continuità (rampa) e la lettura è interpolata, come una linea
+              di ritardo a nastro: con variazioni rapide il pitch scivola (effetto Doppler, anche forte).
+          "step": comportamento originale, tempo intero fisso per blocco (ogni cambio è un piccolo click).
+        Con tempo e feedback costanti le tre modalità coincidono.
+        Nelle modalità "crossfade" e "glide" anche il feedback segue una rampa invece di cambiare di scatto."""
         if audio_array.ndim == 1:
             audio_array_processed = np.expand_dims(audio_array, axis=1)
         else:
@@ -1442,34 +1548,32 @@ class AudioGenerator:
         num_channels = delayed_audio.shape[1]
         buffer_len = self.sample_rate
         delay_buffers = [np.zeros(buffer_len, dtype=delayed_audio.dtype) for _ in range(num_channels)]
-        write_pos = [0] * num_channels
 
-        # Il delay minimo possibile è 0.01s: il blocco deve restare ben al di sotto di quella soglia
-        # in campioni, per garantire che nessuna lettura ritardata ricada nel blocco corrente.
+        # Il blocco deve restare ben al di sotto del delay minimo (0.01 s), così nessuna lettura
+        # (nemmeno quella del campione successivo usato dall'interpolazione) cade nel blocco corrente.
         min_possible_delay_samples = max(1, int(0.01 * self.sample_rate))
         chunk_size = max(1, min(128, min_possible_delay_samples // 2))
 
         total_samples = len(delayed_audio)
 
-        # I parametri (tempo/feedback) sono letti una sola volta per blocco, non per ogni campione:
-        # interpolare l'intero array a risoluzione campione (milioni di punti, via
-        # _interp_data_to_audio_length) per poi leggerne solo un valore ogni chunk_size campioni è
-        # lavoro sprecato (confermato via profiling: circa un quarto del tempo totale della funzione).
-        # Si interpola quindi una sola volta, direttamente nei tempi di inizio-blocco.
+        # Parametri letti una volta per blocco (interpolati solo nei tempi di inizio-blocco).
         n_chunks = (total_samples + chunk_size - 1) // chunk_size
-        chunk_start_indices = np.arange(n_chunks) * chunk_size
-        chunk_start_indices = np.minimum(chunk_start_indices, total_samples - 1)
+        chunk_start_indices = np.minimum(np.arange(n_chunks) * chunk_size, total_samples - 1)
         chunk_times = self.time_array[chunk_start_indices]
 
         delay_time_time_points = np.linspace(0, self.total_duration_seconds, len(delay_time_data), endpoint=True)
         feedback_time_points = np.linspace(0, self.total_duration_seconds, len(feedback_data), endpoint=True)
-        delay_time_at_chunk = np.clip(np.interp(chunk_times, delay_time_time_points, delay_time_data), 0.01, 0.5)
+        delay_samples_at_chunk = np.clip(np.interp(chunk_times, delay_time_time_points, delay_time_data), 0.01, 0.5) * self.sample_rate
         feedback_at_chunk = np.clip(np.interp(chunk_times, feedback_time_points, feedback_data), 0.0, 0.95)
 
-        # np.arange(seg_len) veniva ricreato ad ogni iterazione del loop (fino a ~100k volte su un
-        # video lungo): seg_len è sempre uguale a chunk_size tranne che nell'ultimo blocco, quindi
-        # viene calcolato una sola volta e poi affettato.
-        arange_chunk = np.arange(chunk_size)
+        ramp = np.arange(1, chunk_size + 1, dtype=np.float64)
+        prev_delay = float(delay_samples_at_chunk[0])
+        prev_feedback = float(feedback_at_chunk[0])
+
+        def read_fractional(buf, read_pos):
+            i0 = np.floor(read_pos).astype(np.int64)
+            frac = read_pos - i0
+            return (1.0 - frac) * buf[i0 % buffer_len] + frac * buf[(i0 + 1) % buffer_len]
 
         idx = 0
         chunk_idx = 0
@@ -1477,32 +1581,150 @@ class AudioGenerator:
             end = min(idx + chunk_size, total_samples)
             seg_len = end - idx
 
-            # np.clip ha un overhead notevole se chiamato su singoli scalari decine di migliaia di
-            # volte (macchinari di riduzione generici pensati per array); i valori sono già stati
-            # clippati in blocco sopra, quindi qui si legge soltanto il valore già pronto.
-            current_delay_time_seconds = float(delay_time_at_chunk[chunk_idx])
-            current_feedback_gain = float(feedback_at_chunk[chunk_idx])
-            delay_samples = max(1, int(current_delay_time_seconds * self.sample_rate))
+            cur_delay = float(delay_samples_at_chunk[chunk_idx])
+            cur_feedback = float(feedback_at_chunk[chunk_idx])
+            frac_ramp = ramp[:seg_len] / seg_len
+            sample_index = np.arange(idx, end)
+            write_positions = sample_index % buffer_len
+            if mode == "step":
+                feedback_curve = cur_feedback
+            else:
+                feedback_curve = prev_feedback + (cur_feedback - prev_feedback) * frac_ramp
 
             for c in range(num_channels):
-                wp = write_pos[c]
-                write_positions = (wp + arange_chunk[:seg_len]) % buffer_len
-                read_positions = (write_positions - delay_samples) % buffer_len
-
-                delayed_vals = delay_buffers[c][read_positions]
-                in_chunk = audio_array_processed[idx:end, c]
-                out_chunk = in_chunk + delayed_vals * current_feedback_gain
+                buf = delay_buffers[c]
+                if mode == "step":
+                    delayed_vals = buf[(sample_index - max(1, int(cur_delay))) % buffer_len]
+                elif mode == "glide":
+                    delayed_vals = read_fractional(buf, sample_index - (prev_delay + (cur_delay - prev_delay) * frac_ramp))
+                else:  # crossfade
+                    tap_old = read_fractional(buf, sample_index - prev_delay)
+                    tap_new = read_fractional(buf, sample_index - cur_delay)
+                    delayed_vals = (1.0 - frac_ramp) * tap_old + frac_ramp * tap_new
+                out_chunk = audio_array_processed[idx:end, c] + delayed_vals * feedback_curve
 
                 delayed_audio[idx:end, c] = out_chunk
-                delay_buffers[c][write_positions] = out_chunk
-                write_pos[c] = (wp + seg_len) % buffer_len
+                buf[write_positions] = out_chunk
 
+            prev_delay, prev_feedback = cur_delay, cur_feedback
             idx = end
             chunk_idx += 1
 
         return delayed_audio.squeeze() if num_channels == 1 else delayed_audio
 
-    def apply_reverb_effect(self, audio_array: np.ndarray, decay_time_data: list, mix_data: list) -> np.ndarray:
+    # ── Riverbero FDN (Feedback Delay Network) con diffusione a velvet noise ──────────────────
+    # Rispetto ai 4 comb-filter Schroeder in parallelo (senza diffusione: suono metallico, eco
+    # a "sbuffi" distinguibili), qui 8 linee di ritardo con lunghezze coprime sono accoppiate da
+    # una matrice di feedback ortogonale (Householder): l'energia si mescola tra le linee e la
+    # densità d'eco cresce rapidamente. L'ingresso passa prima da un filtro a velvet noise
+    # (sequenza sparsa di impulsi ±1: decorrela l'attacco e accelera la densità iniziale, a costo
+    # di poche somme), e in ogni anello un passa-basso a un polo fa decadere gli acuti prima dei
+    # bassi, come una stanza vera. Riferimenti: Jot & Chaigne (FDN); Schlecht et al., "Velvet-noise
+    # feedback delay network" (DAFx-2020); Välimäki et al. (velvet noise).
+    FDN_NUM_LINES = 8
+    FDN_BASE_DELAYS_MS = (30.0, 35.2, 39.7, 44.5, 48.9, 54.6, 60.3, 66.1)
+    FDN_DAMPING = 0.25          # polo del passa-basso d'anello: più alto = acuti che decadono prima
+    FDN_WET_SCALE = 1.78        # calibrati (rumore bianco, T=1 s) per avere livello e coda simili al riverbero Schroeder
+    FDN_WET_DECAY_EXP = 0.26    # a parità di slider; il livello wet cresce con T come T**0.26 (misurato)
+    FDN_DECAY_COMP = 1.3        # l'assorbimento degli acuti accorcia la coda: lo slider è compensato di questo fattore
+    FDN_VELVET_SECONDS = 0.05
+    FDN_VELVET_DENSITY = 1500.0  # impulsi al secondo
+
+    def _fdn_delay_lengths(self) -> np.ndarray:
+        """Lunghezze (campioni) delle 8 linee: numeri primi distinti, quindi mutuamente coprimi."""
+        def is_prime(n):
+            if n < 2:
+                return False
+            return all(n % p for p in range(2, int(n ** 0.5) + 1))
+        lengths = []
+        for ms in self.FDN_BASE_DELAYS_MS:
+            n = int(round(ms * self.sample_rate / 1000.0))
+            while not is_prime(n) or n in lengths:
+                n += 1
+            lengths.append(n)
+        return np.array(lengths, dtype=np.int64)
+
+    @staticmethod
+    def _fdn_signs(n_lines: int, seed: int) -> np.ndarray:
+        """Pattern di segni ±1 a somma zero (metà +, metà −), normalizzato: ingresso/uscita delle linee.
+        La somma zero evita di eccitare solo il modo "tutte le linee uguali" della matrice di Householder."""
+        signs = np.array([1.0] * (n_lines // 2) + [-1.0] * (n_lines - n_lines // 2))
+        return np.random.RandomState(seed).permutation(signs) / np.sqrt(n_lines)
+
+    def _velvet_kernel(self, seed: int = 1234) -> np.ndarray:
+        """Velvet noise: un impulso ±1 in posizione casuale in ciascuna fascia di una griglia regolare,
+        normalizzato a energia unitaria. Usa un generatore PRIVATO: non tocca lo stato di np.random
+        (e quindi la casualità degli altri layer resta quella di sempre)."""
+        rng = np.random.RandomState(seed)
+        n = int(self.FDN_VELVET_SECONDS * self.sample_rate)
+        grid = self.sample_rate / self.FDN_VELVET_DENSITY
+        m = max(1, int(n / grid))
+        pos = np.minimum((np.arange(m) * grid + rng.uniform(0.0, grid, m)).astype(np.int64), n - 1)
+        kernel = np.zeros(n)
+        kernel[pos] = rng.choice([-1.0, 1.0], m)
+        return kernel / np.sqrt(m)
+
+    def _apply_reverb_fdn(self, audio_array: np.ndarray, decay_time_data: list, mix_data: list) -> np.ndarray:
+        """Riverbero FDN (vedi il commento sopra). Stessa interfaccia e stessa mappatura dei parametri
+        di _apply_reverb_schroeder: tempo di decadimento e mix seguono le curve del video; il segnale
+        mono resta mono (la catena effetti successiva si aspetta un solo canale prima del panning)."""
+        from scipy.signal import oaconvolve
+        audio_array_processed = np.expand_dims(audio_array, axis=1) if audio_array.ndim == 1 else audio_array
+        total_samples = len(audio_array_processed)
+        num_channels = audio_array_processed.shape[1]
+        reverbed_audio = np.copy(audio_array_processed)
+
+        n_lines = self.FDN_NUM_LINES
+        delays = self._fdn_delay_lengths()
+        chunk_size = int(delays.min())                 # nessuna lettura ritardata cade nel blocco corrente
+        buffer_len = int(delays.max()) + chunk_size + 1
+
+        n_chunks = (total_samples + chunk_size - 1) // chunk_size
+        chunk_times = self.time_array[np.minimum(np.arange(n_chunks) * chunk_size, total_samples - 1)]
+        decay_time_points = np.linspace(0, self.total_duration_seconds, len(decay_time_data), endpoint=True)
+        mix_time_points = np.linspace(0, self.total_duration_seconds, len(mix_data), endpoint=True)
+        decay_at_chunk = np.clip(np.interp(chunk_times, decay_time_points, decay_time_data), 0.1, 5.0)
+        mix_at_chunk = np.clip(np.interp(chunk_times, mix_time_points, mix_data), 0.0, 1.0)
+        # Stessa legge di decadimento del riverbero Schroeder (stesso significato dello slider).
+        gains = np.clip(np.exp(-3.0 * delays[None, :] / (self.sample_rate * decay_at_chunk[:, None] * self.FDN_DECAY_COMP)), 0.0, 0.99)
+        wet_scale_at_chunk = self.FDN_WET_SCALE * decay_at_chunk ** self.FDN_WET_DECAY_EXP
+
+        in_signs = self._fdn_signs(n_lines, 11)
+        out_signs = self._fdn_signs(n_lines, 29)
+        kernel = self._velvet_kernel()
+        damp = self.FDN_DAMPING
+        rows = np.arange(n_lines)[:, None]
+        arange_chunk = np.arange(chunk_size)
+
+        for ch in range(num_channels):
+            dry_all = audio_array_processed[:, ch]
+            diffused = oaconvolve(dry_all.astype(np.float64), kernel)[:total_samples]
+            buf = np.zeros((n_lines, buffer_len))
+            zi = np.zeros((1, n_lines))
+            for k in range(n_chunks):
+                idx = k * chunk_size
+                end = min(idx + chunk_size, total_samples)
+                seg = end - idx
+                pos = idx + arange_chunk[:seg]
+                outs = buf[rows, (pos[None, :] - delays[:, None]) % buffer_len].T      # (seg, linee): uscite dei delay
+                fb = outs - (2.0 / n_lines) * outs.sum(axis=1, keepdims=True)           # matrice di Householder
+                fb *= gains[k][None, :]
+                fb, zi = lfilter([1.0 - damp], [1.0, -damp], fb, axis=0, zi=zi)        # assorbimento degli acuti
+                buf[:, pos % buffer_len] = (diffused[idx:end, None] * in_signs[None, :] + fb).T
+                mix = float(mix_at_chunk[k])
+                reverbed_audio[idx:end, ch] = dry_all[idx:end] * (1.0 - mix) + (outs @ out_signs) * mix * wet_scale_at_chunk[k]
+
+        return reverbed_audio.squeeze() if num_channels == 1 else reverbed_audio
+
+    def apply_reverb_effect(self, audio_array: np.ndarray, decay_time_data: list, mix_data: list,
+                            reverb_type: str = "fdn") -> np.ndarray:
+        """Riverbero. reverb_type: "fdn" (default, FDN + velvet noise) o "schroeder" (4 comb filter,
+        il riverbero originale dell'app, mantenuto per poter ritrovare il suono di prima)."""
+        if reverb_type == "schroeder":
+            return self._apply_reverb_schroeder(audio_array, decay_time_data, mix_data)
+        return self._apply_reverb_fdn(audio_array, decay_time_data, mix_data)
+
+    def _apply_reverb_schroeder(self, audio_array: np.ndarray, decay_time_data: list, mix_data: list) -> np.ndarray:
         """Applica un semplice effetto di riverbero all'audio, processato a piccoli blocchi (stessa logica
         di apply_delay_effect): i 4 tempi di delay delle linee comb-filter (Schroeder) sono sempre molto
         più lunghi della dimensione del blocco, quindi ogni blocco può essere letto/scritto in modo
@@ -1711,6 +1933,199 @@ def get_audio_generator(sample_rate: int, total_duration_seconds: float) -> Audi
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# MASTER — loudness (ITU-R BS.1770 / EBU R128), true peak e saturazione ADAA
+# ═══════════════════════════════════════════════════════════════════════════
+# Perché: normalizzare il picco a 0 dBFS non basta. Il picco "vero" (inter-sample) può superare
+# 0 dBFS, e la codifica AAC del video lo fa sforare ancora: misurato su 8 tracce generate, fino
+# a +3.1 dBTP prima della codifica e campioni oltre 0 dBFS dopo. EBU R128 chiede un massimo di
+# -1 dBTP; le piattaforme di streaming normalizzano intorno a -14 LUFS. Qui è implementato tutto
+# solo con NumPy/SciPy (nessuna dipendenza in più).
+
+TRUE_PEAK_CEILING_DB = -1.0
+FLOW_ANALYSIS_WIDTH = 160   # larghezza dei frame usati per l'optical flow (impatto visivo)
+DIRECTOGRAM_BINS = 8       # direzioni in cui si raggruppa il movimento
+IMPACT_NOISE_FLOOR = 0.02  # impatto grezzo (px medi di flusso a 160 px) sotto cui non è movimento ma rumore: misurato,
+                           # il rumore del sensore sta intorno a 0.001-0.0025 e gli eventi veri a 0.25-0.5
+ONSET_MIN_STRENGTH = 0.25  # forza minima (in unità dell'impatto normalizzato) perché un picco conti, qualunque sensibilità
+FILTER_UPDATE_SECONDS = 0.0025  # passo di aggiornamento dei coefficienti del filtro risonante
+# etichetta mostrata nell'interfaccia -> (tipo, valore)
+LOUDNESS_TARGETS = {
+    "Picco a −1 dBTP (consigliato)": ('peak', -1.0),
+    "−14 LUFS (streaming: YouTube, Spotify)": ('lufs', -14.0),
+    "−16 LUFS (Apple Music)": ('lufs', -16.0),
+    "−23 LUFS (broadcast EBU R128)": ('lufs', -23.0),
+    "Picco a 0 dBFS (come prima)": ('legacy', 0.0),
+}
+LOUDNESS_DEFAULT = "Picco a −1 dBTP (consigliato)"
+
+_CHUNK = 1 << 20  # campioni per blocco nelle elaborazioni a blocchi (limita la RAM su tracce lunghe)
+
+
+def _k_weighting_sos(fs: float) -> np.ndarray:
+    """Filtro K-weighting di BS.1770: shelf alto (~+4 dB sopra 1.7 kHz) + passa-alto a ~38 Hz.
+    Parametri e formule (trasformata bilineare del prototipo analogico) come nella letteratura
+    di riferimento: a 48 kHz riproducono i coefficienti pubblicati nello standard."""
+    # Stadio 1: shelf alto
+    G, Q, fc = 3.999843853973347, 0.7071752369554196, 1681.9744509555319
+    K = np.tan(np.pi * fc / fs)
+    Vh = 10.0 ** (G / 20.0)
+    Vb = Vh ** 0.4996667741545416
+    a0 = 1.0 + K / Q + K * K
+    shelf = [(Vh + Vb * K / Q + K * K) / a0, 2.0 * (K * K - Vh) / a0, (Vh - Vb * K / Q + K * K) / a0,
+             1.0, 2.0 * (K * K - 1.0) / a0, (1.0 - K / Q + K * K) / a0]
+    # Stadio 2: passa-alto (RLB)
+    Q2, fc2 = 0.5003270373253953, 38.13547087613982
+    K2 = np.tan(np.pi * fc2 / fs)
+    a0 = 1.0 + K2 / Q2 + K2 * K2
+    hp = [1.0, -2.0, 1.0, 1.0, 2.0 * (K2 * K2 - 1.0) / a0, (1.0 - K2 / Q2 + K2 * K2) / a0]
+    return np.array([shelf, hp])
+
+
+def integrated_loudness(x: np.ndarray, fs: float, dual_mono: bool = True) -> float:
+    """Loudness integrata in LUFS (BS.1770-4: blocchi da 400 ms con 75% di overlap, gate assoluto
+    a -70 LUFS e relativo a -10 LU). Un segnale mono viene misurato come "dual mono" (lo stesso
+    segnale su sinistra e destra, come lo si ascolta davvero), cioè +3 LU rispetto a un solo
+    canale. Restituisce -inf se il segnale è troppo corto o silenzioso."""
+    x = np.asarray(x)
+    if x.ndim == 1:
+        x = x[:, None]
+    channels = x.shape[1]
+    weight = 2.0 if (channels == 1 and dual_mono) else 1.0
+    hop = int(round(0.1 * fs))
+    n_hops = x.shape[0] // hop
+    if n_hops < 4:
+        return float('-inf')
+    sos = _k_weighting_sos(fs)
+    hop_power = np.zeros((channels, n_hops))
+    from scipy.signal import sosfilt
+    for c in range(channels):
+        zi = np.zeros((2, 2))
+        for s in range(0, n_hops * hop, hop * max(1, _CHUNK // hop)):
+            e = min(s + hop * max(1, _CHUNK // hop), n_hops * hop)
+            y, zi = sosfilt(sos, x[s:e, c].astype(np.float64), zi=zi)
+            hop_power[c, s // hop:e // hop] = (y ** 2).reshape(-1, hop).mean(axis=1)
+    # potenza di ogni blocco da 400 ms = media di 4 hop consecutivi
+    block_power = np.zeros(n_hops - 3)
+    for c in range(channels):
+        cs = np.concatenate([[0.0], np.cumsum(hop_power[c])])
+        block_power += (cs[4:] - cs[:-4]) / 4.0
+    block_power *= weight
+    block_lufs = -0.691 + 10.0 * np.log10(np.maximum(block_power, 1e-20))
+    keep = block_lufs > -70.0
+    if not keep.any():
+        return float('-inf')
+    rel_gate = -0.691 + 10.0 * np.log10(block_power[keep].mean()) - 10.0
+    keep &= block_lufs > rel_gate
+    if not keep.any():
+        return float('-inf')
+    return float(-0.691 + 10.0 * np.log10(block_power[keep].mean()))
+
+
+def _oversampled_abs_max(chunk: np.ndarray, factor: int = 4) -> np.ndarray:
+    """|segnale| sovracampionato ×factor (stima del picco inter-sample), max tra i canali: forma (n, factor)."""
+    from scipy.signal import resample_poly
+    up = resample_poly(chunk.astype(np.float64), factor, 1, axis=0)
+    return np.abs(up).reshape(chunk.shape[0], factor, -1).max(axis=2)
+
+
+def _iter_oversampled(x: np.ndarray, pad: int = 64):
+    """Scorre x a blocchi (con un po' di padding per i bordi del filtro) e produce, per ogni blocco,
+    (indice di inizio, array (n, 4) con il |picco| sovracampionato)."""
+    n = x.shape[0]
+    for s in range(0, n, _CHUNK):
+        e = min(s + _CHUNK, n)
+        a, b = max(0, s - pad), min(n, e + pad)
+        ov = _oversampled_abs_max(x[a:b])
+        yield s, ov[s - a:s - a + (e - s)]
+
+
+def true_peak_linear(x: np.ndarray) -> float:
+    """Picco vero (inter-sample, sovracampionamento ×4 come da BS.1770 Annex 2), lineare."""
+    x = np.asarray(x)
+    if x.ndim == 1:
+        x = x[:, None]
+    return max((float(ov.max()) for _, ov in _iter_oversampled(x)), default=0.0)
+
+
+def limit_true_peak(x: np.ndarray, ceiling_db: float = TRUE_PEAK_CEILING_DB, fs: float = 44100.0) -> np.ndarray:
+    """Limiter look-ahead sul picco vero: calcola il guadagno necessario campione per campione
+    (sul segnale sovracampionato), lo allarga con un filtro di minimo e lo ammorbidisce con una
+    media mobile della stessa larghezza (~8 ms). Così ogni picco viene abbassato prima che
+    arrivi, senza clip e senza distorsione da taglio. Il guadagno è comune a tutti i canali."""
+    from scipy.ndimage import minimum_filter1d, uniform_filter1d
+    squeeze = (x.ndim == 1)
+    xs = x[:, None] if squeeze else x
+    ceil = 10.0 ** (ceiling_db / 20.0)
+    g_req = np.ones(xs.shape[0], dtype=np.float32)
+    for s, ov in _iter_oversampled(xs):
+        pk = ov.max(axis=1)
+        g_req[s:s + ov.shape[0]] = np.minimum(1.0, ceil / np.maximum(pk, 1e-12))
+    if g_req.min() >= 1.0:
+        return x
+    w = max(3, int(0.008 * fs)) | 1
+    gain = uniform_filter1d(minimum_filter1d(g_req, w, mode='nearest'), w, mode='nearest')
+    out = (xs * gain[:, None]).astype(x.dtype, copy=False)
+    # rete di sicurezza: il filtro di interpolazione non è identico a quello usato per la misura
+    tp = true_peak_linear(out)
+    if tp > ceil:
+        out = (out * (ceil / tp)).astype(x.dtype, copy=False)
+    return out[:, 0] if squeeze else out
+
+
+def apply_master_level(x: np.ndarray, fs: float, mode) -> np.ndarray:
+    """Porta l'audio al livello finale scelto. mode = (tipo, valore) da LOUDNESS_TARGETS."""
+    kind, value = mode
+    if kind == 'legacy':  # comportamento originale: picco campione a 0 dBFS
+        peak = np.max(np.abs(x))
+        return x / peak if peak > 1e-6 else np.zeros_like(x)
+    if kind == 'peak':
+        tp = true_peak_linear(x)
+        if tp <= 1e-6:
+            return np.zeros_like(x)
+        return (x * (10.0 ** (value / 20.0) / tp)).astype(x.dtype, copy=False)
+    # 'lufs': guadagno per arrivare al target, poi tetto di picco vero (il limiter agisce solo se serve)
+    loudness = integrated_loudness(x, fs)
+    if not np.isfinite(loudness):
+        return x
+    x = (x * (10.0 ** ((value - loudness) / 20.0))).astype(x.dtype, copy=False)
+    return limit_true_peak(x, TRUE_PEAK_CEILING_DB, fs)
+
+
+def measure_levels(x: np.ndarray, fs: float):
+    """(LUFS integrati, picco vero in dBTP) per mostrarli all'utente."""
+    tp = true_peak_linear(x)
+    return integrated_loudness(x, fs), (20.0 * np.log10(tp) if tp > 0 else float('-inf'))
+
+
+def _log_cosh(u: np.ndarray) -> np.ndarray:
+    a = np.abs(u)
+    return a + np.log1p(np.exp(-2.0 * a)) - np.log(2.0)
+
+
+def apply_saturation(x: np.ndarray, drive: float, adaa: bool = True) -> np.ndarray:
+    """Saturazione soft tanh(drive*x). Con adaa=True usa l'antiderivative antialiasing del primo
+    ordine: invece di valutare tanh nel singolo campione, valuta la media di tanh tra due campioni
+    consecutivi usando la sua antiderivata (ln cosh), che riduce l'aliasing generato dalla
+    non-linearità senza sovracampionare. Per differenze minuscole tra campioni usa il valore al
+    punto medio (evita la divisione per zero)."""
+    x = np.asarray(x)
+    if not adaa:
+        return np.tanh(x * drive)
+    out = np.empty_like(x)
+    prev = np.zeros(x.shape[1:], dtype=np.float64)
+    for s in range(0, x.shape[0], _CHUNK):
+        u = x[s:s + _CHUNK].astype(np.float64) * drive
+        up = np.concatenate([prev[None], u[:-1]], axis=0)
+        dx = u - up
+        small = np.abs(dx) < 1e-5
+        safe_dx = np.where(small, 1.0, dx)
+        y = np.where(small, np.tanh(0.5 * (u + up)), (_log_cosh(u) - _log_cosh(up)) / safe_dx)
+        out[s:s + _CHUNK] = y.astype(x.dtype, copy=False)
+        prev = u[-1]
+    return out
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # INTERFACCIA — sorgenti dati, scaling e contesto condiviso
 # ═══════════════════════════════════════════════════════════════════════════
 # main() è stato spezzato in funzioni: una per ogni scheda dei controlli (che restituisce un
@@ -1720,9 +2135,15 @@ def get_audio_generator(sample_rate: int, total_duration_seconds: float) -> Audi
 
 # Opzioni delle "Sorgente ..." (le liste restano separate perché ogni widget offre un
 # sottoinsieme diverso di feature video).
-SRC_BASE = ["Luminosità", "Dettaglio", "Movimento", "Densità Contorni", "Variazione Colore"]
-SRC_FM = ["Luminosità", "Dettaglio", "Movimento", "Variazione Movimento", "Densità Contorni", "Variazione Colore"]
-SRC_GRAN = ["Dettaglio", "Movimento", "Variazione Movimento", "Densità Contorni", "Variazione Colore"]
+# "Altezza nel Frame (alto = acuto)": posizione verticale del centro di massa, invertita (1 = in alto nel
+# frame). Gli esperimenti di Evans & Treisman mostrano che le persone associano spontaneamente un suono più
+# acuto a ciò che sta più in alto; il "Centro di Massa Verticale" grezzo (0 = in alto) resta riservato
+# alla scheda Altezza. L'inversione di polarità di una sorgente si ottiene mettendo il minimo dello
+# slider sopra il massimo.
+SRC_HEIGHT = "Altezza nel Frame (alto = acuto)"
+SRC_BASE = ["Luminosità", "Dettaglio", "Movimento", "Densità Contorni", "Variazione Colore", SRC_HEIGHT]
+SRC_FM = ["Luminosità", "Dettaglio", "Movimento", "Variazione Movimento", "Densità Contorni", "Variazione Colore", SRC_HEIGHT]
+SRC_GRAN = ["Dettaglio", "Movimento", "Variazione Movimento", "Densità Contorni", "Variazione Colore", SRC_HEIGHT]
 SRC_VARMOV_FIRST = ["Variazione Movimento", "Movimento", "Dettaglio", "Densità Contorni", "Variazione Colore"]
 
 
@@ -1746,11 +2167,37 @@ def scale_to_range(raw: list, lo: float, hi: float) -> list:
     return np.interp(raw, (min(raw) if raw else 0, max(raw) if raw else 1), (lo, hi)).tolist()
 
 
+def detect_visual_onsets(impact: list, duration_seconds: float, sensitivity: float = 1.0, min_gap_seconds: float = 0.15):
+    """Picchi dell'inviluppo d'impatto visivo -> (tempi in secondi, forza 0-1).
+
+    Un frame è un picco se è un massimo locale sopra la soglia media + std/sensitivity (e comunque sopra
+    ONSET_MIN_STRENGTH, così un video senza eventi non produce picchi); poi si tengono i
+    più forti rispettando una distanza minima (min_gap_seconds). sensitivity più alta = soglia più bassa
+    = più picchi."""
+    env = np.asarray(impact, dtype=np.float64)
+    n = env.size
+    if n < 3 or env.max() <= 1e-9:
+        return np.zeros(0), np.zeros(0)
+    env = np.convolve(env, [0.25, 0.5, 0.25], mode='same')
+    threshold = max(env.mean() + env.std() / max(sensitivity, 0.05), ONSET_MIN_STRENGTH)
+    inner = np.arange(1, n - 1)
+    candidates = inner[(env[inner] >= env[inner - 1]) & (env[inner] > env[inner + 1]) & (env[inner] > threshold)]
+    gap = max(1, int(round(min_gap_seconds * (n - 1) / max(duration_seconds, 1e-6))))
+    kept = []
+    for i in candidates[np.argsort(-env[candidates])]:       # dal più forte al più debole
+        if all(abs(i - j) >= gap for j in kept):
+            kept.append(i)
+    kept = np.sort(np.array(kept, dtype=np.int64))
+    times = kept / (n - 1) * duration_seconds
+    return times, env[kept] / env.max()
+
+
 class UiContext:
     """Dati del video (o sintetici) + melodia globale, condivisi da tutte le schede."""
 
     def __init__(self, luminosity, detail, movement, variation_movement,
-                 horizontal_mass_center, vertical_mass_center, edge_density, color_variation):
+                 horizontal_mass_center, vertical_mass_center, edge_density, color_variation,
+                 visual_impact=None, duration_seconds=1.0):
         # etichetta mostrata nei selectbox -> lista di valori per frame
         self.features = {
             "Luminosità": luminosity,
@@ -1761,7 +2208,11 @@ class UiContext:
             "Centro di Massa Verticale": vertical_mass_center,
             "Densità Contorni": edge_density,
             "Variazione Colore": color_variation,
+            SRC_HEIGHT: [1.0 - v for v in vertical_mass_center],
         }
+        self.visual_impact = visual_impact if visual_impact is not None else []
+        self.duration_seconds = duration_seconds
+        self.onsets = (np.zeros(0), np.zeros(0))   # (tempi, forza) dei picchi di movimento, vedi render_beat_controls
         self.melody_enabled = False
         self.melody_scale = SCALE_NONE
         self.melody_root_note = 220.0
@@ -1780,6 +2231,12 @@ class UiContext:
     def freq_curve_free(self, label: str, lo: float, hi: float) -> list:
         """Come freq_curve ma sempre libera (modulatore FM, cutoff del filtro: non sono note)."""
         return scale_frequency_exponential(self.source(label), lo, hi)
+
+    def jitter_scale(self) -> float:
+        """Fattore per il jitter casuale d'intonazione di e-piano, corde e grani. Con la Melodia attiva
+        scende a pochi cent: prima il jitter (±1%, ±5%, ±10%) veniva aggiunto DOPO la quantizzazione e
+        portava le note fuori dalla scala che l'utente aveva scelto."""
+        return 0.05 if self.melody_enabled else 1.0
 
     def apply_melody(self, freqs: list) -> list:
         """Quantizzazione a scala globale, se abilitata; altrimenti intonazione libera."""
@@ -1806,7 +2263,9 @@ def render_melody_controls(params: dict, ctx: UiContext) -> None:
             "quale nota suona, ma il risultato è una melodia riconoscibile invece di "
             "un'intonazione libera/microtonale. Si applica a tutti i layer con un'intonazione "
             "(Sottrattiva, FM, Granulare, E-Piano, Corde) usando la stessa tonica, così restano "
-            "sempre in accordo tra loro invece che ognuno per conto suo."
+            "sempre in accordo tra loro invece che ognuno per conto suo. Con la Melodia attiva si riduce anche "
+            "il jitter casuale d'intonazione di corde, e-piano e grani a pochi cent, così le note restano "
+            "davvero sulla scala."
         )
         use_melody_quantization = st.checkbox("Abilita Melodia", value=False, key='melody_on')
         params['melody_enabled'] = use_melody_quantization
@@ -1824,6 +2283,30 @@ def render_melody_controls(params: dict, ctx: UiContext) -> None:
     ctx.melody_enabled = use_melody_quantization
     ctx.melody_scale = melody_scale
     ctx.melody_root_note = melody_root_note
+
+
+def render_beat_controls(params: dict, ctx: UiContext) -> None:
+    """Picchi di movimento del video, usabili per far suonare le note di E-Piano e Corde a tempo con il video."""
+    with st.expander("🥁 Ritmo dal video (picchi di movimento)", expanded=False):
+        st.caption(
+            "Di default le note di E-Piano e Corde cadono in punti casuali dentro finestre di 0.15-0.2 secondi. "
+            "Qui si individuano i momenti in cui il movimento del video cambia di colpo (partenze, stop, urti, "
+            "cambi di direzione); nelle schede E-Piano e Corde puoi scegliere «Sui picchi di movimento» per far "
+            "suonare le note proprio lì. La densità della scheda resta un limite: densità 0 = silenzio."
+        )
+        beat_sensitivity = st.slider("Sensibilità", 0.25, 3.0, 1.0, step=0.05, key='beat_sensitivity',
+                                     help="Più alta = più picchi (soglia più bassa).")
+        beat_min_gap = st.slider("Distanza minima tra due picchi (sec)", 0.08, 0.5, 0.15, step=0.01, key='beat_min_gap')
+        ctx.onsets = detect_visual_onsets(ctx.visual_impact, ctx.duration_seconds, beat_sensitivity, beat_min_gap)
+        n_onsets = len(ctx.onsets[0])
+        st.caption(f"Rilevati **{n_onsets}** picchi (≈ {n_onsets / max(ctx.duration_seconds, 1e-6):.1f} al secondo).")
+        params['beat_sensitivity'] = beat_sensitivity
+        params['beat_min_gap'] = beat_min_gap
+        params['beat_count'] = n_onsets
+
+
+TRIGGER_RANDOM = "Casuale nella finestra (come prima)"
+TRIGGER_BEATS = "Sui picchi di movimento del video"
 
 
 # ── Schede dei layer sonori ──────────────────────────────────────────────────
@@ -1965,6 +2448,11 @@ def render_epiano_tab(params: dict, ctx: UiContext) -> Layer:
     if use_epiano:
         layer.gain = st.slider("🎚️ Volume Layer E-Piano", 0.0, 2.0, 1.0, step=0.05, key='epiano_gain')
         params['epiano_layer_gain'] = layer.gain
+        epiano_trigger = st.selectbox("Posizione delle note", [TRIGGER_RANDOM, TRIGGER_BEATS], key='epiano_trigger',
+                                      help="Sui picchi di movimento: ogni nota parte esattamente quando il video cambia di colpo "
+                                           "(vedi «Ritmo dal video»), con più forza sui picchi più marcati.")
+        params['epiano_trigger'] = epiano_trigger
+        layer.opts['onsets'] = ctx.onsets if epiano_trigger == TRIGGER_BEATS else None
 
         epiano_density_source = st.selectbox("Sorgente Densità Note", SRC_BASE, key='epiano_dens_src')
         epiano_pitch_source = st.selectbox("Sorgente Intonazione", SRC_BASE, key='epiano_pitch_src', index=2)
@@ -2009,7 +2497,7 @@ def render_epiano_tab(params: dict, ctx: UiContext) -> Layer:
         epiano_mod_ratio = 1.0
         params['epiano_note_duration'] = epiano_note_duration
         params['epiano_mod_ratio'] = epiano_mod_ratio
-    layer.opts.update(note_duration=epiano_note_duration, mod_ratio=epiano_mod_ratio)
+    layer.opts.update(note_duration=epiano_note_duration, mod_ratio=epiano_mod_ratio, jitter_scale=ctx.jitter_scale())
     return layer
 
 
@@ -2054,6 +2542,7 @@ def render_granular_tab(params: dict, ctx: UiContext) -> Layer:
         layer.curves['pitch'] = ctx.freq_curve(gran_pitch_source, gran_pitch_min, gran_pitch_max)
     else:
         layer.curves.update(density=[], duration=[], amp=[], pitch=[])
+    layer.opts['jitter_scale'] = ctx.jitter_scale()
     return layer
 
 
@@ -2071,6 +2560,11 @@ def render_pluck_tab(params: dict, ctx: UiContext) -> Layer:
     if use_pluck:
         layer.gain = st.slider("🎚️ Volume Layer Corde", 0.0, 2.0, 1.0, step=0.05, key='pluck_gain')
         params['pluck_layer_gain'] = layer.gain
+        pluck_trigger = st.selectbox("Posizione delle pizzicate", [TRIGGER_RANDOM, TRIGGER_BEATS], key='pluck_trigger',
+                                     help="Sui picchi di movimento: ogni pizzicata parte esattamente quando il video cambia di colpo "
+                                          "(vedi «Ritmo dal video»), con più forza sui picchi più marcati.")
+        params['pluck_trigger'] = pluck_trigger
+        layer.opts['onsets'] = ctx.onsets if pluck_trigger == TRIGGER_BEATS else None
 
         pluck_density_source = st.selectbox("Sorgente Densità Pizzicate", SRC_BASE, key='pluck_dens_src')
         pluck_pitch_source = st.selectbox("Sorgente Intonazione", SRC_BASE, key='pluck_pitch_src', index=2)
@@ -2141,7 +2635,8 @@ def render_pluck_tab(params: dict, ctx: UiContext) -> Layer:
         params['pluck_unison_voices'] = pluck_unison_voices
         params['pluck_unison_detune'] = pluck_unison_detune
     layer.opts.update(duration=pluck_duration, hardness=pluck_hardness,
-                      unison_voices=pluck_unison_voices, unison_detune=pluck_unison_detune)
+                      unison_voices=pluck_unison_voices, unison_detune=pluck_unison_detune,
+                      jitter_scale=ctx.jitter_scale())
     return layer
 
 
@@ -2223,6 +2718,16 @@ def render_effects_tab(params: dict, ctx: UiContext) -> Tuple[Layer, Layer, Laye
     params['delay_enabled'] = use_delay
     delay = Layer(enabled=use_delay)
     if use_delay:
+        delay_mode_label = st.selectbox(
+            "Cambio del tempo di delay", ["Crossfade (senza click né glissando)", "Glissando (eco a nastro)", "A gradini (come prima)"],
+            key='delay_mode',
+            help="Come si comporta il delay quando il tempo cambia seguendo il video. Crossfade: la lettura "
+                 "passa da un tempo all'altro senza click. Glissando: il tempo scorre e l'intonazione scivola "
+                 "come in un'eco a nastro (può diventare molto marcato con variazioni rapide). A gradini: "
+                 "comportamento originale, con un piccolo click a ogni cambio."
+        )
+        params['delay_mode'] = delay_mode_label
+        delay.opts['mode'] = "glide" if delay_mode_label.startswith("Glissando") else ("step" if delay_mode_label.startswith("A gradini") else "crossfade")
         delay_time_source = st.selectbox("Sorgente Tempo Delay (sec)", ["Movimento", "Variazione Movimento", "Luminosità", "Densità Contorni", "Variazione Colore"], key='delay_time_src')
         delay_feedback_source = st.selectbox("Sorgente Feedback Delay (0-1)", ["Movimento", "Variazione Movimento", "Dettaglio", "Densità Contorni", "Variazione Colore"], key='delay_feedback_src')
 
@@ -2247,6 +2752,14 @@ def render_effects_tab(params: dict, ctx: UiContext) -> Tuple[Layer, Layer, Laye
     params['reverb_enabled'] = use_reverb
     reverb = Layer(enabled=use_reverb)
     if use_reverb:
+        reverb_type_label = st.selectbox(
+            "Tipo di riverbero", ["FDN + velvet noise (più denso e naturale)", "Schroeder a 4 comb (classico, come prima)"],
+            key='reverb_type',
+            help="L'FDN a 8 linee con diffusione a velvet noise è più denso e meno metallico del vecchio "
+                 "riverbero a 4 comb filter. Quest'ultimo resta disponibile per ritrovare il suono di prima."
+        )
+        params['reverb_type'] = reverb_type_label
+        reverb.opts['type'] = "schroeder" if reverb_type_label.startswith("Schroeder") else "fdn"
         reverb_decay_source = st.selectbox("Sorgente Tempo Decadimento (sec)", SRC_BASE, key='reverb_decay_src')
         reverb_mix_source = st.selectbox("Sorgente Mix (Wet/Dry)", SRC_BASE, key='reverb_mix_src')
 
@@ -2356,6 +2869,17 @@ def render_output_settings(params: dict, generative_mode: bool) -> dict:
     with col_audio:
         normalize_audio = st.checkbox("Normalizza Audio Finale", value=True)
         params['normalize_audio'] = normalize_audio
+        if normalize_audio:
+            loudness_target = st.selectbox(
+                "Livello finale", list(LOUDNESS_TARGETS.keys()),
+                help="Il picco a −1 dBTP evita gli sforamenti dopo la codifica AAC del video (normalizzare "
+                     "a 0 dBFS li provocava). I target in LUFS portano la traccia alla loudness percepita "
+                     "richiesta dalle piattaforme, con un limiter sul picco vero a −1 dBTP; un segnale mono "
+                     "è misurato come \"dual mono\", cioè come lo si ascolta su due altoparlanti."
+            )
+        else:
+            loudness_target = LOUDNESS_DEFAULT
+        params['loudness_target'] = loudness_target
         use_saturation = st.checkbox(
             "Saturazione Soft (Analogica)", value=True,
             help="Applica una leggera compressione morbida (tanh) prima della normalizzazione: "
@@ -2369,9 +2893,17 @@ def render_output_settings(params: dict, generative_mode: bool) -> dict:
                 help="Valori più alti = compressione più marcata dei picchi (più 'calda'/satura)."
             )
             params['saturation_drive'] = saturation_drive
+            saturation_adaa = st.checkbox(
+                "Anti-aliasing della saturazione (ADAA)", value=True,
+                help="La saturazione genera armoniche che, oltre la frequenza di Nyquist, si ripiegano come "
+                     "frequenze inarmoniche (aliasing). L'antiderivative antialiasing le riduce di circa "
+                     "5-10 dB alle frequenze medio-alte senza sovracampionare. Disattivalo per il suono di prima."
+            )
         else:
             saturation_drive = 1.0
+            saturation_adaa = False
             params['saturation_drive'] = 1.0
+        params['saturation_adaa'] = saturation_adaa
     with col_video:
         original_audio_mix_level = 0.0
         if not generative_mode:
@@ -2399,6 +2931,8 @@ def render_output_settings(params: dict, generative_mode: bool) -> dict:
         'normalize_audio': normalize_audio,
         'use_saturation': use_saturation,
         'saturation_drive': saturation_drive,
+        'saturation_adaa': saturation_adaa,
+        'loudness_target': loudness_target,
         'use_original_audio': use_original_audio,
         'original_audio_mix_level': original_audio_mix_level,
         'export_stems': export_stems,
@@ -2418,22 +2952,35 @@ def _generate_fm(ag: "AudioGenerator", L: Layer) -> np.ndarray:
     return ag.generate_fm_layer(L.curves['carrier'], L.curves['mod'], L.curves['mod_idx'], L.curves['amp'])
 
 
+def _onset_args(ag: "AudioGenerator", L: Layer) -> dict:
+    """Argomenti dei picchi di movimento per i generatori a note (vuoti = note casuali come prima)."""
+    onsets = L.opts.get('onsets')
+    if onsets is None:
+        return {}
+    times, strength = onsets
+    samples = np.minimum((np.asarray(times) * ag.sample_rate).astype(np.int64), ag.total_samples - 1)
+    return {'onset_samples': samples, 'onset_strength': np.asarray(strength, dtype=np.float64)}
+
+
 def _generate_epiano(ag: "AudioGenerator", L: Layer) -> np.ndarray:
     return ag.generate_fm_epiano_layer(
         L.curves['density'], L.curves['pitch'], L.curves['brightness'], L.curves['amp'],
-        note_duration=L.opts['note_duration'], mod_ratio=L.opts['mod_ratio']
+        note_duration=L.opts['note_duration'], mod_ratio=L.opts['mod_ratio'],
+        pitch_jitter_scale=L.opts.get('jitter_scale', 1.0), **_onset_args(ag, L)
     )
 
 
 def _generate_granular(ag: "AudioGenerator", L: Layer) -> np.ndarray:
-    return ag.generate_granular_layer(L.curves['density'], L.curves['duration'], L.curves['amp'], L.curves['pitch'])
+    return ag.generate_granular_layer(L.curves['density'], L.curves['duration'], L.curves['amp'], L.curves['pitch'],
+                                      pitch_jitter_scale=L.opts.get('jitter_scale', 1.0))
 
 
 def _generate_pluck(ag: "AudioGenerator", L: Layer) -> np.ndarray:
     return ag.generate_pluck_layer(
         L.curves['density'], L.curves['pitch'], L.curves['damping'], L.curves['amp'],
         max_pluck_duration=L.opts['duration'], hammer_hardness=L.opts['hardness'],
-        unison_voices=L.opts['unison_voices'], unison_detune_cents=L.opts['unison_detune']
+        unison_voices=L.opts['unison_voices'], unison_detune_cents=L.opts['unison_detune'],
+        pitch_jitter_scale=L.opts.get('jitter_scale', 1.0), **_onset_args(ag, L)
     )
 
 
@@ -2482,10 +3029,12 @@ def build_combined_audio(audio_generator: "AudioGenerator", layers: dict, output
         mixed_audio = audio_generator.apply_glitch_effect(mixed_audio, glitch.curves['factor'], glitch.curves['intensity'], glitch.opts['weights'])
 
     if delay.enabled:
-        mixed_audio = audio_generator.apply_delay_effect(mixed_audio, delay.curves['time'], delay.curves['feedback'])
+        mixed_audio = audio_generator.apply_delay_effect(mixed_audio, delay.curves['time'], delay.curves['feedback'],
+                                                         mode=delay.opts.get('mode', 'crossfade'))
 
     if reverb.enabled:
-        mixed_audio = audio_generator.apply_reverb_effect(mixed_audio, reverb.curves['decay'], reverb.curves['mix'])
+        mixed_audio = audio_generator.apply_reverb_effect(mixed_audio, reverb.curves['decay'], reverb.curves['mix'],
+                                                          reverb_type=reverb.opts.get('type', 'fdn'))
 
     if eq.enabled:
         mixed_audio = audio_generator.apply_eq_effect(mixed_audio, eq.curves['low'], eq.curves['mid'], eq.curves['high'])
@@ -2509,18 +3058,15 @@ def build_combined_audio(audio_generator: "AudioGenerator", layers: dict, output
         # compressione/calore) e, come effetto collaterale voluto, anche il volume
         # percepito dei passaggi più quieti (comportamento standard per un saturatore
         # in stile analogico/nastro).
-        mixed_audio = np.tanh(mixed_audio * output['saturation_drive'])
+        mixed_audio = apply_saturation(mixed_audio, output['saturation_drive'], output.get('saturation_adaa', False))
 
     if output['normalize_audio']:
-        # Prevenire divisione per zero se l'audio è silenzioso.
-        # Usiamo il picco GLOBALE (non per-canale) per non alterare il bilanciamento
-        # stereo introdotto dal panning: normalizzare i due canali in modo indipendente
-        # appiattirebbe la differenza di volume tra sinistra e destra.
-        peak = np.max(np.abs(mixed_audio))
-        if peak > 1e-6:
-            mixed_audio = mixed_audio / peak
-        else:
-            mixed_audio = np.zeros_like(mixed_audio)  # Mantieni a zero se già silenzioso
+        # Livello finale (vedi LOUDNESS_TARGETS). Il picco/la loudness sono misurati sul segnale
+        # completo e il guadagno è comune a tutti i canali, per non alterare il bilanciamento
+        # stereo introdotto dal panning (normalizzare i canali in modo indipendente
+        # appiattirebbe la differenza di volume tra sinistra e destra).
+        mixed_audio = apply_master_level(mixed_audio, audio_generator.sample_rate,
+                                         LOUDNESS_TARGETS[output.get('loudness_target', LOUDNESS_DEFAULT)])
 
     # Assicurati che l'audio sia nel range [-1, 1] per soundfile
     mixed_audio = np.clip(mixed_audio, -1.0, 1.0).astype(np.float32, copy=False)
@@ -2617,7 +3163,7 @@ def load_features(source: dict, session_id: str):
     video_input_path = None  # resta None in modalità generativa: nessun file video reale
 
     if generative_mode:
-        luminosity_data, detail_data, movement_data, variation_movement_data, horizontal_mass_center_data, vertical_mass_center_data, edge_density_data, color_variation_data, duration_seconds, fps = generate_synthetic_feature_curves(
+        luminosity_data, detail_data, movement_data, variation_movement_data, horizontal_mass_center_data, vertical_mass_center_data, edge_density_data, color_variation_data, duration_seconds, fps, visual_impact_data = generate_synthetic_feature_curves(
             float(generative_duration), fps=30.0, seed=generative_seed
         )
         base_name_output = generative_track_name.strip() or "traccia_generativa"
@@ -2648,7 +3194,7 @@ def load_features(source: dict, session_id: str):
         file_hash = hashlib.md5(uploaded_file.getbuffer()).hexdigest()
 
         try:
-            luminosity_data, detail_data, movement_data, variation_movement_data, horizontal_mass_center_data, vertical_mass_center_data, edge_density_data, color_variation_data, duration_seconds, fps = analyze_video_frames_cached(video_input_path, file_hash)
+            luminosity_data, detail_data, movement_data, variation_movement_data, horizontal_mass_center_data, vertical_mass_center_data, edge_density_data, color_variation_data, duration_seconds, fps, visual_impact_data = analyze_video_frames_cached(video_input_path, file_hash)
         except ValueError as analysis_error: # Video non apribile, corrotto, troppo corto/lungo
             st.error(str(analysis_error))
             if os.path.exists(video_input_path):
@@ -2664,7 +3210,7 @@ def load_features(source: dict, session_id: str):
         base_name_output = os.path.splitext(uploaded_file.name)[0]
     ctx = UiContext(luminosity_data, detail_data, movement_data, variation_movement_data,
                     horizontal_mass_center_data, vertical_mass_center_data, edge_density_data,
-                    color_variation_data)
+                    color_variation_data, visual_impact_data, duration_seconds)
     return ctx, duration_seconds, video_input_path, base_name_output
 
 
@@ -2718,15 +3264,19 @@ def build_report_text(params: dict, generative_info: dict = None) -> str:
         report_lines.append(field("audio originale", "original audio", f"mantenuto / kept (mix {params.get('original_audio_mix_level', 0):.2f})"))
     else:
         report_lines.append(field("audio originale", "original audio", "non mantenuto / not kept"))
-    report_lines.append(field("normalizzazione audio finale", "final audio normalization", "sì / yes" if params.get('normalize_audio') else "no / no"))
+    report_lines.append(field("normalizzazione audio finale", "final audio normalization", (f"sì / yes ({params.get('loudness_target', LOUDNESS_DEFAULT)})" if params.get('normalize_audio') else "no / no")))
     if params.get('use_saturation'):
-        report_lines.append(field("saturazione soft", "soft saturation", f"abilitata / enabled (drive {params.get('saturation_drive', 1.5):.1f})"))
+        report_lines.append(field("saturazione soft", "soft saturation", f"abilitata / enabled (drive {params.get('saturation_drive', 1.5):.1f}{', ADAA' if params.get('saturation_adaa') else ''})"))
     else:
         report_lines.append(field("saturazione soft", "soft saturation", "disabilitata / disabled"))
     if params.get('melody_enabled'):
         report_lines.append(field("melodia (quantizzazione a scala)", "melody (scale quantization)", f"{params.get('melody_scale', 'N/A')} (fondamentale {params.get('melody_root_note', 220.0):.0f} Hz)"))
     else:
         report_lines.append(field("melodia (quantizzazione a scala)", "melody (scale quantization)", "disabilitata / disabled (intonazione libera / free pitch)"))
+    beat_layers = [name for name, key in (("e-piano", 'epiano_trigger'), ("corde / strings", 'pluck_trigger')) if params.get(key) == TRIGGER_BEATS]
+    if beat_layers:
+        report_lines.append(field("ritmo dal video (note sui picchi di movimento)", "rhythm from video (notes on motion peaks)",
+                                  f"{', '.join(beat_layers)} — {params.get('beat_count', 0)} picchi / peaks (sensibilità / sensitivity {params.get('beat_sensitivity', 1.0):.2f}, distanza minima / min gap {params.get('beat_min_gap', 0.15):.2f} s)"))
 
     report_lines.append("")
     report_lines.append(":: --- layer audio / audio layers ---")
@@ -2895,7 +3445,10 @@ def render_description_expander(params: dict) -> None:
             st.write(f"- Audio Originale del Video: **Mantenuto** (Livello Mix: **{params['original_audio_mix_level']:.2f}**)")
         else:
             st.write("- Audio Originale del Video: **Non mantenuto**")
-        st.write(f"- Normalizzazione Audio Finale: **{'Sì' if params['normalize_audio'] else 'No'}**")
+        st.write(f"- Normalizzazione Audio Finale: **{'Sì (' + params.get('loudness_target', LOUDNESS_DEFAULT) + ')' if params['normalize_audio'] else 'No'}**")
+    beat_layers = [name for name, key in (("E-Piano", 'epiano_trigger'), ("Corde", 'pluck_trigger')) if params.get(key) == TRIGGER_BEATS]
+    if beat_layers:
+        st.write(f"- Ritmo dal video: note di **{', '.join(beat_layers)}** sui picchi di movimento ({params.get('beat_count', 0)} picchi rilevati)")
 
         st.markdown("#### Layer Audio:")
         if params['subtractive_enabled']:
@@ -2962,6 +3515,13 @@ def render_description_expander(params: dict) -> None:
 
 # ── Generazione, esportazione e render video ─────────────────────────────────
 
+def _levels_caption(levels) -> str:
+    lufs, tp = levels
+    if not np.isfinite(lufs) or not np.isfinite(tp):
+        return "Livello: traccia silenziosa o troppo corta per misurare la loudness."
+    return f"Livello misurato: **{lufs:.1f} LUFS** · picco vero **{tp:+.1f} dBTP**"
+
+
 def _as_text(value) -> str:
     """Stderr/stdout di un subprocess come testo, che sia bytes o str (dipende da text=True)."""
     if value is None:
@@ -2993,10 +3553,12 @@ def run_audio_preview(audio_generator, layers: dict, output: dict, session_id: s
     parametri ad orecchio, senza aspettare ogni volta il render+mux del video intero."""
     st.info("🎵 Generazione anteprima audio in corso...")
     preview_audio = build_combined_audio(audio_generator, layers, output)
+    levels = measure_levels(preview_audio, AUDIO_SAMPLE_RATE)
     preview_audio_path = f"preview_audio_{session_id}.wav"
     sf.write(preview_audio_path, preview_audio, AUDIO_SAMPLE_RATE)
     del preview_audio
     st.audio(preview_audio_path, format="audio/wav")
+    st.caption(_levels_caption(levels))
     gc.collect()
 
 
@@ -3149,6 +3711,7 @@ def run_audio_generation(audio_generator, layers: dict, output: dict, params: di
     status_text_audio.text("Generazione layer e applicazione effetti...")
 
     combined_audio, generated_stems = build_combined_audio(audio_generator, layers, output, return_stems=True)
+    levels = measure_levels(combined_audio, AUDIO_SAMPLE_RATE)
 
     progress_bar_audio.progress(90)
     status_text_audio.text("Scrittura file audio...")
@@ -3166,6 +3729,7 @@ def run_audio_generation(audio_generator, layers: dict, output: dict, params: di
     progress_bar_audio.progress(100)
     status_text_audio.text("Audio generato!")
     st.success("✅ Audio generato con successo!")
+    st.caption(_levels_caption(levels))
 
     gc.collect()  # Libera memoria
 
@@ -3246,6 +3810,7 @@ def main():
     audio_generator = get_audio_generator(AUDIO_SAMPLE_RATE, duration_seconds)
 
     render_melody_controls(params, ctx)
+    render_beat_controls(params, ctx)
 
     # Scheda per i parametri audio
     tab_sub, tab_fm, tab_epiano, tab_gran, tab_pluck, tab_noise, tab_fx, tab_eq, tab_pan = st.tabs([
