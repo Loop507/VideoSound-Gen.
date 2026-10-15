@@ -9,6 +9,8 @@ import shutil
 import zipfile
 import hashlib
 import uuid
+import copy
+import zlib
 from typing import Tuple
 from dataclasses import dataclass, field
 import soundfile as sf
@@ -913,7 +915,22 @@ class AudioGenerator:
         self.total_duration_seconds = total_duration_seconds
         self.total_samples = int(self.total_duration_seconds * self.sample_rate)
         self.time_array = np.linspace(0, self.total_duration_seconds, self.total_samples, endpoint=False)
+        # Sorgente di casualità dei layer. Di default è il modulo np.random (casualità libera, come prima);
+        # seeded() ne restituisce una copia con un generatore dedicato e ripetibile.
+        self.rng = np.random
 
+    def seeded(self, seed, stream: str) -> "AudioGenerator":
+        """Copia leggera di questo generatore (condivide gli array pesanti, nessuna RAM in più) con una
+        sorgente di casualità propria. Con seed=None la casualità resta libera. Con un seed, ogni
+        `stream` (nome del layer o dell'effetto) ha un flusso INDIPENDENTE e ripetibile: stesso seed e
+        stessi parametri = stessa traccia, e accendere o spegnere un layer non cambia il suono degli altri.
+        Non modifica l'istanza condivisa (st.cache_resource la riusa tra le sessioni), quindi due utenti
+        che generano insieme non si influenzano. Il flusso dipende solo da (seed, stream), non da
+        hash() di Python (che cambia a ogni avvio): crc32 è stabile."""
+        g = copy.copy(self)
+        g.rng = np.random if seed is None else np.random.RandomState(
+            (int(seed) * 1000003 + zlib.crc32(stream.encode("utf-8"))) % (2 ** 32))
+        return g
 
     def _interp_data_to_audio_length(self, data_per_frame: list) -> np.ndarray:
         """Interpola i dati per frame alla lunghezza dell'array audio."""
@@ -1102,7 +1119,7 @@ class AudioGenerator:
             current_amp = float(amp_at_window[i])
 
             if onset_samples is None:
-                start_notes = np.random.randint(start_w, end_w, size=num_notes)
+                start_notes = self.rng.randint(start_w, end_w, size=num_notes)
                 accents = np.ones(num_notes)
             else:  # note sui picchi di movimento che cadono in questa finestra (la densità fa da limite)
                 lo, hi = np.searchsorted(onset_samples, [start_w, end_w])
@@ -1111,7 +1128,7 @@ class AudioGenerator:
                 num_notes = len(start_notes)
                 if num_notes == 0:
                     continue
-            jitter = (np.random.rand(num_notes) - 0.5) * 0.02 * pitch_jitter_scale  # +/-1%: intonazione naturale, non stonata come le corde
+            jitter = (self.rng.rand(num_notes) - 0.5) * 0.02 * pitch_jitter_scale  # +/-1%: intonazione naturale, non stonata come le corde
 
             # Indice di modulazione iniziale: range ~0.5 (timbro morbido) - 6.0 (timbro brillante/metallico)
             mod_index0 = 0.5 + 5.5 * current_brightness
@@ -1159,7 +1176,7 @@ class AudioGenerator:
 
     def _ks_excitation(self, burst_len: int, hammer_hardness: float) -> np.ndarray:
         """Burst di eccitazione di una corda (rumore bianco, o rumore + sua derivata se hardness > 0)."""
-        noise_burst = np.random.uniform(-1.0, 1.0, burst_len)
+        noise_burst = self.rng.uniform(-1.0, 1.0, burst_len)
         if hammer_hardness > 0.0:
             hard_burst = np.diff(noise_burst, prepend=0.0)
             # np.diff raddoppia grosso modo l'ampiezza media (differenza di due valori indipendenti
@@ -1318,7 +1335,7 @@ class AudioGenerator:
             current_amp = float(amp_at_window[i])
 
             if onset_samples is None:
-                start_pluck_samples = np.random.randint(start_sample_window, end_sample_window, size=num_plucks_in_window)
+                start_pluck_samples = self.rng.randint(start_sample_window, end_sample_window, size=num_plucks_in_window)
                 accents = np.ones(num_plucks_in_window)
             else:  # pizzicate sui picchi di movimento che cadono in questa finestra (la densità fa da limite)
                 lo, hi = np.searchsorted(onset_samples, [start_sample_window, end_sample_window])
@@ -1327,7 +1344,7 @@ class AudioGenerator:
                 num_plucks_in_window = len(start_pluck_samples)
                 if num_plucks_in_window == 0:
                     continue
-            jitter = (np.random.rand(num_plucks_in_window) - 0.5) * 0.1 * pitch_jitter_scale  # +/-5% intonazione, meno del layer granulare (le corde restano più "accordate")
+            jitter = (self.rng.rand(num_plucks_in_window) - 0.5) * 0.1 * pitch_jitter_scale  # +/-5% intonazione, meno del layer granulare (le corde restano più "accordate")
 
             for p in range(num_plucks_in_window):
                 pluck_freq = max(20.0, current_pitch * (1.0 + jitter[p]))
@@ -1390,15 +1407,21 @@ class AudioGenerator:
             start_sample_segment = i * samples_per_virtual_frame
             end_sample_segment = min((i + 1) * samples_per_virtual_frame, self.total_samples)
 
-            if start_sample_segment >= end_sample_segment - grain_dur_samples:
-                continue
-
             # Genera in blocco i parametri casuali di tutti i grani del segmento (posizione
             # di partenza e jitter di intonazione) con un'unica chiamata numpy invece di una
             # per grano: piccola ottimizzazione aggiuntiva, non il costo principale.
             max_start = end_sample_segment - grain_dur_samples
-            start_grain_samples = np.random.randint(start_sample_segment, max_start, size=num_grains_in_segment)
-            jitter = (np.random.rand(num_grains_in_segment) - 0.5) * 0.2 * pitch_jitter_scale
+            if max_start > start_sample_segment:
+                # Il grano sta dentro al segmento (un frame video): come sempre.
+                start_grain_samples = self.rng.randint(start_sample_segment, max_start, size=num_grains_in_segment)
+            else:
+                # Grano più lungo del segmento (es. oltre 33 ms a 30 fps). Prima veniva SCARTATO in silenzio:
+                # per esempio il preset "Suoni dello Spazio" (grani da 50 a 100 ms) non produceva alcun suono
+                # dal layer granulare, e la parte alta dello slider "Durata Grani" non aveva effetto. Ora il
+                # grano parte comunque dentro il segmento e prosegue in quelli successivi (tagliato a fine traccia).
+                start_grain_samples = self.rng.randint(start_sample_segment, max(end_sample_segment, start_sample_segment + 1),
+                                                       size=num_grains_in_segment)
+            jitter = (self.rng.rand(num_grains_in_segment) - 0.5) * 0.2 * pitch_jitter_scale
             grain_freqs = np.maximum(20.0, current_pitch * (1.0 + jitter))
 
             grain_t = np.arange(grain_dur_samples) / self.sample_rate
@@ -1409,15 +1432,15 @@ class AudioGenerator:
                 grain_with_envelope = grain_waveform * hanning_window * current_amp * 0.1
 
                 start_grain_sample = start_grain_samples[g]
-                end_grain_sample = start_grain_sample + grain_dur_samples
-                audio[start_grain_sample:end_grain_sample] += grain_with_envelope
+                end_grain_sample = min(start_grain_sample + grain_dur_samples, self.total_samples)
+                audio[start_grain_sample:end_grain_sample] += grain_with_envelope[:end_grain_sample - start_grain_sample]
 
         return audio
 
     def add_noise_layer(self, noise_amp_data: list) -> np.ndarray:
         """Genera un layer di rumore modulato (da aggiungere una sola volta all'audio esistente)."""
         noise_amp_interp = self._interp_data_to_audio_length(noise_amp_data)
-        noise_layer = np.random.normal(0, 1, self.total_samples) * noise_amp_interp * 0.2
+        noise_layer = self.rng.normal(0, 1, self.total_samples) * noise_amp_interp * 0.2
         return noise_layer
 
     def apply_glitch_effect(self, audio_array: np.ndarray, glitch_factor_data: list, glitch_intensity_data: list,
@@ -1458,7 +1481,7 @@ class AudioGenerator:
             glitch_intensity_value = float(np.interp(current_time, glitch_intensity_time_points, glitch_intensity_data))
 
             # Applica il glitch solo se la probabilità è soddisfatta
-            if np.random.rand() < glitch_factor_value:
+            if self.rng.rand() < glitch_factor_value:
                 glitch_intensity = glitch_intensity_value
                 
                 # Durata del glitch basata sull'intensità (minimo 1 campione).
@@ -1488,7 +1511,7 @@ class AudioGenerator:
                         glitched_segment[:] = 0
                     else:
                         # Scegli il tipo di glitch (pesato da type_probs, uniforme se non specificato)
-                        glitch_type = np.random.choice(type_names, p=type_probs)
+                        glitch_type = self.rng.choice(type_names, p=type_probs)
 
                         if glitch_type == "repeat":
                             # Ripeti il segmento originale finché non raggiunge o supera la lunghezza target
@@ -1503,7 +1526,7 @@ class AudioGenerator:
 
                         elif glitch_type == "noise":
                             # Genera rumore con la forma e il tipo di dati esatti del target
-                            glitched_segment[:] = np.random.normal(0, glitch_intensity * 0.5, size=target_segment_shape).astype(glitched_audio.dtype)
+                            glitched_segment[:] = self.rng.normal(0, glitch_intensity * 0.5, size=target_segment_shape).astype(glitched_audio.dtype)
                         
                         elif glitch_type == "reverse":
                             # Inverti il segmento originale. La forma rimane la stessa.
@@ -2182,7 +2205,8 @@ def detect_visual_onsets(impact: list, duration_seconds: float, sensitivity: flo
     threshold = max(env.mean() + env.std() / max(sensitivity, 0.05), ONSET_MIN_STRENGTH)
     inner = np.arange(1, n - 1)
     candidates = inner[(env[inner] >= env[inner - 1]) & (env[inner] > env[inner + 1]) & (env[inner] > threshold)]
-    gap = max(1, int(round(min_gap_seconds * (n - 1) / max(duration_seconds, 1e-6))))
+    # Arrotondata per ECCESSO: la distanza minima richiesta non deve mai risultare più corta di così.
+    gap = max(1, int(np.ceil(min_gap_seconds * (n - 1) / max(duration_seconds, 1e-6) - 1e-9)))
     kept = []
     for i in candidates[np.argsort(-env[candidates])]:       # dal più forte al più debole
         if all(abs(i - j) >= gap for j in kept):
@@ -2853,7 +2877,7 @@ def render_spatial_tab(params: dict, ctx: UiContext) -> Tuple[Layer, Layer]:
     return pan, elevation
 
 
-def render_output_settings(params: dict, generative_mode: bool) -> dict:
+def render_output_settings(params: dict, generative_mode: bool, generative_seed=None) -> dict:
     """Formato video, normalizzazione, saturazione, audio originale, export stems."""
     if not generative_mode:
         st.subheader("Impostazioni Output Video")
@@ -2904,6 +2928,20 @@ def render_output_settings(params: dict, generative_mode: bool) -> dict:
             saturation_adaa = False
             params['saturation_drive'] = 1.0
         params['saturation_adaa'] = saturation_adaa
+        if generative_mode:
+            # In modalità generativa il seed della barra laterale governa sia le curve sia la casualità dei layer.
+            audio_seed = generative_seed
+            st.caption("🎲 Traccia ripetibile: stesso seed e stessi parametri = stessa traccia." if audio_seed is not None
+                       else "🎲 Casualità libera: ogni generazione è diversa (attiva «Seed fisso» nella barra laterale per ripeterla).")
+        else:
+            fixed_seed = st.checkbox(
+                "Casualità fissa (traccia ripetibile)", value=False, key='audio_seed_on',
+                help="Posizione e intonazione di note, grani, pizzicate, rumore e glitch sono in parte casuali. "
+                     "Con un seed fisso, gli stessi parametri e lo stesso video producono sempre la stessa traccia "
+                     "(anteprima e render finale compresi), e accendere o spegnere un layer non cambia il suono degli altri."
+            )
+            audio_seed = st.number_input("Seed audio", 0, 999999, 42, step=1, key='audio_seed') if fixed_seed else None
+        params['audio_seed'] = audio_seed
     with col_video:
         original_audio_mix_level = 0.0
         if not generative_mode:
@@ -2936,6 +2974,7 @@ def render_output_settings(params: dict, generative_mode: bool) -> dict:
         'use_original_audio': use_original_audio,
         'original_audio_mix_level': original_audio_mix_level,
         'export_stems': export_stems,
+        'audio_seed': audio_seed,
     }
 
 
@@ -3006,19 +3045,21 @@ def build_combined_audio(audio_generator: "AudioGenerator", layers: dict, output
 
     layers : dict chiave -> Layer (vedi SOUND_LAYERS per i layer sonori; 'glitch', 'delay',
              'reverb', 'eq', 'elev', 'pan' per gli effetti)
-    output : impostazioni di master (normalize_audio, use_saturation, saturation_drive)
+    output : impostazioni di master (normalize_audio, use_saturation, saturation_drive, ...) e 'audio_seed'
+             (int: traccia ripetibile; None: casualità libera)
 
     Se return_stems=True, restituisce anche un dizionario con l'audio 'dry' di ogni singolo
     layer (già pesato dal proprio Volume Layer, ma prima di effetti/mix/master), utile per un
     export stems separato da remixare in un DAW."""
     mixed_audio = np.zeros(audio_generator.total_samples, dtype=np.float32)
     stems = {}
+    audio_seed = output.get('audio_seed')  # None = casualità libera
 
     for key, stem_name, generate in SOUND_LAYERS:
         layer = layers[key]
         if not layer.enabled:
             continue
-        layer_audio = generate(audio_generator, layer) * layer.gain
+        layer_audio = generate(audio_generator.seeded(audio_seed, key), layer) * layer.gain
         mixed_audio += layer_audio
         if return_stems:
             stems[stem_name] = layer_audio.astype(np.float32)
@@ -3026,7 +3067,7 @@ def build_combined_audio(audio_generator: "AudioGenerator", layers: dict, output
 
     glitch, delay, reverb, eq = layers['glitch'], layers['delay'], layers['reverb'], layers['eq']
     if glitch.enabled:
-        mixed_audio = audio_generator.apply_glitch_effect(mixed_audio, glitch.curves['factor'], glitch.curves['intensity'], glitch.opts['weights'])
+        mixed_audio = audio_generator.seeded(audio_seed, 'glitch').apply_glitch_effect(mixed_audio, glitch.curves['factor'], glitch.curves['intensity'], glitch.opts['weights'])
 
     if delay.enabled:
         mixed_audio = audio_generator.apply_delay_effect(mixed_audio, delay.curves['time'], delay.curves['feedback'],
@@ -3107,8 +3148,9 @@ def render_source_sidebar() -> dict:
         generative_track_name = st.sidebar.text_input("Nome Traccia", value="traccia_generativa", key='generative_track_name')
         generative_seed_enabled = st.sidebar.checkbox(
             "Seed fisso (riproducibile)", value=False, key='generative_seed_on',
-            help="Se disattivo, ogni rigenerazione produce curve leggermente diverse. Se attivo, "
-                 "la stessa curva si ripete finché non cambi il seed."
+            help="Se disattivo, ogni rigenerazione produce curve e dettagli diversi. Se attivo, "
+                 "la stessa traccia (curve, note, grani, rumore, glitch) si ripete finché non cambi il seed "
+                 "o i parametri."
         )
         generative_seed = st.sidebar.number_input("Seed", 0, 999999, 42, key='generative_seed') if generative_seed_enabled else None
     else:
@@ -3273,6 +3315,8 @@ def build_report_text(params: dict, generative_info: dict = None) -> str:
         report_lines.append(field("melodia (quantizzazione a scala)", "melody (scale quantization)", f"{params.get('melody_scale', 'N/A')} (fondamentale {params.get('melody_root_note', 220.0):.0f} Hz)"))
     else:
         report_lines.append(field("melodia (quantizzazione a scala)", "melody (scale quantization)", "disabilitata / disabled (intonazione libera / free pitch)"))
+    report_lines.append(field("seed audio (casualità di note, grani, rumore, glitch)", "audio seed (randomness of notes, grains, noise, glitch)",
+                              str(params['audio_seed']) if params.get('audio_seed') is not None else "non fissato / not fixed"))
     beat_layers = [name for name, key in (("e-piano", 'epiano_trigger'), ("corde / strings", 'pluck_trigger')) if params.get(key) == TRIGGER_BEATS]
     if beat_layers:
         report_lines.append(field("ritmo dal video (note sui picchi di movimento)", "rhythm from video (notes on motion peaks)",
@@ -3446,6 +3490,7 @@ def render_description_expander(params: dict) -> None:
         else:
             st.write("- Audio Originale del Video: **Non mantenuto**")
         st.write(f"- Normalizzazione Audio Finale: **{'Sì (' + params.get('loudness_target', LOUDNESS_DEFAULT) + ')' if params['normalize_audio'] else 'No'}**")
+    st.write(f"- Seed audio: **{params['audio_seed'] if params.get('audio_seed') is not None else 'non fissato'}**")
     beat_layers = [name for name, key in (("E-Piano", 'epiano_trigger'), ("Corde", 'pluck_trigger')) if params.get(key) == TRIGGER_BEATS]
     if beat_layers:
         st.write(f"- Ritmo dal video: note di **{', '.join(beat_layers)}** sui picchi di movimento ({params.get('beat_count', 0)} picchi rilevati)")
@@ -3836,7 +3881,7 @@ def main():
     with tab_pan:
         layers['pan'], layers['elev'] = render_spatial_tab(params, ctx)
 
-    output = render_output_settings(params, generative_mode)
+    output = render_output_settings(params, generative_mode, source['generative_seed'])
 
     generative_info = ({'duration': source['generative_duration'], 'seed': source['generative_seed']}
                        if generative_mode else None)
