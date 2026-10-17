@@ -23,6 +23,19 @@ MIN_DURATION = 1.0  # Durata minima del video in secondi
 MAX_FILE_SIZE = 50 * 1024 * 1024  # Dimensione massima del file (50 MB)
 AUDIO_SAMPLE_RATE = 44100 # Frequenza di campionamento per l'audio generato
 ANALYSIS_MAX_WIDTH = 0    # Larghezza massima dei frame usati SOLO per l'analisi (0 = fedele alla risoluzione originale; es. 480 = più veloce ma sposta un po' i valori di movimento/contorni)
+# Precisione dell'analisi scelta dall'utente (barra laterale). "Veloce" riduce i frame a 480 px prima di calcolare le
+# feature. Misurato su un filmato reale (768x576, 795 frame): luminosità, dettaglio, variazione colore e picchi di
+# movimento restano uguali; il movimento medio scende a ~0.9x e la densità dei contorni sale (da ~1.1x su un video 768 px
+# a ~2x su un 1080p: il gradiente per pixel dipende dalla risoluzione). I preset sono tarati sulla modalità Piena.
+# Bande nere (letterbox/pillarbox): un video verticale dentro una cornice 16:9, o un 2.39:1 in un 16:9, ha bande
+# nere fisse che diluiscono tutte le feature (luminosità, movimento, centro di massa...). Si ritaglia l'area attiva
+# solo per l'analisi, se le bande sono davvero nere in tutti i frame campionati e tolgono almeno l'8% della dimensione.
+BAR_SAMPLES = 16               # frame campionati lungo il video per cercare le bande
+BAR_BLACK_THRESHOLD = 40       # un pixel sopra questo valore (0-255) in una colonna/riga la rende "attiva"
+BAR_MIN_REMOVED_FRACTION = 0.08  # le bande devono togliere almeno questa frazione della larghezza/altezza
+BAR_MIN_ACTIVE_FRACTION = 0.25   # ... lasciando almeno questa frazione come area attiva
+ANALYSIS_QUALITY_FULL = "Piena (come prima)"
+ANALYSIS_QUALITY_OPTIONS = {ANALYSIS_QUALITY_FULL: 0, "Veloce (frame a 480 px)": 480}
 
 # Definizioni delle risoluzioni per i formati
 FORMAT_RESOLUTIONS = {
@@ -374,7 +387,45 @@ def validate_video_file(uploaded_file) -> bool:
         return False
     return True
 
-def analyze_video_frames(video_path: str) -> Tuple[list, list, list, list, list, list, list, list, float, float, list]:
+def detect_content_box(video_path: str) -> Tuple[int, int, int, int]:
+    """Area attiva (x0, y0, x1, y1) del video, escluse le bande nere fisse ai lati o sopra/sotto.
+
+    Campiona BAR_SAMPLES frame e tiene, per ogni colonna e riga, il valore massimo visto: una banda vera resta
+    nera in TUTTI i frame, mentre una vignettatura scura o una dissolvenza no. Ogni asse si ritaglia solo se le
+    bande tolgono almeno BAR_MIN_REMOVED_FRACTION e resta almeno BAR_MIN_ACTIVE_FRACTION di area attiva; un video
+    tutto nero non viene toccato. Senza bande restituisce l'intero frame (analisi identica a prima)."""
+    cap = cv2.VideoCapture(video_path)
+    try:
+        n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        col_max, row_max, got = np.zeros(w), np.zeros(h), 0
+        for idx in np.linspace(0, max(n - 1, 0), BAR_SAMPLES).astype(int):
+            cap.set(cv2.CAP_PROP_POS_FRAMES, int(idx))
+            ok, frame = cap.read()
+            if not ok:
+                continue
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            col_max, row_max, got = np.maximum(col_max, gray.max(axis=0)), np.maximum(row_max, gray.max(axis=1)), got + 1
+    finally:
+        cap.release()
+    if got == 0:
+        return 0, 0, w, h
+    cols, rows = np.flatnonzero(col_max > BAR_BLACK_THRESHOLD), np.flatnonzero(row_max > BAR_BLACK_THRESHOLD)
+    if len(cols) == 0 or len(rows) == 0:
+        return 0, 0, w, h
+
+    def axis(lo, hi, size):
+        removed_fraction = (lo + size - hi) / size
+        if removed_fraction < BAR_MIN_REMOVED_FRACTION or (hi - lo) < BAR_MIN_ACTIVE_FRACTION * size:
+            return 0, size
+        return int(lo), int(hi)
+    x0, x1 = axis(cols[0], cols[-1] + 1, w)
+    y0, y1 = axis(rows[0], rows[-1] + 1, h)
+    return x0, y0, x1, y1
+
+
+def analyze_video_frames(video_path: str, max_width: int = None, crop_bars: bool = True) -> Tuple[list, list, list, list, list, list, list, list, float, float, list]:
     """
     Analizza i frame di un video per estrarre dati visivi.
 
@@ -383,7 +434,7 @@ def analyze_video_frames(video_path: str) -> Tuple[list, list, list, list, list,
     In caso di errore solleva ValueError con il messaggio da mostrare all'utente; il chiamante
     si occupa di visualizzarlo.
 
-    Per velocità i frame più larghi di ANALYSIS_MAX_WIDTH vengono ridimensionati prima di
+    Per velocità i frame più larghi di max_width (default ANALYSIS_MAX_WIDTH; 0 = nessun ridimensionamento) vengono ridimensionati prima di
     calcolare le feature (le feature sono tutte normalizzate 0-1, quindi non dipendono dalla
     risoluzione assoluta, salvo piccole differenze su dettaglio e densità contorni).
 
@@ -392,6 +443,9 @@ def analyze_video_frames(video_path: str) -> Tuple[list, list, list, list, list,
         orizzontale, centro di massa verticale, densità contorni, variazione colore (liste),
         durata effettiva in secondi e FPS.
     """
+    if max_width is None:
+        max_width = ANALYSIS_MAX_WIDTH
+    box = detect_content_box(video_path) if crop_bars else None
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise ValueError(f"❌ Impossibile aprire il video: {video_path}")
@@ -432,11 +486,14 @@ def analyze_video_frames(video_path: str) -> Tuple[list, list, list, list, list,
         if not ret:
             break
 
+        if box is not None and box != (0, 0, frame.shape[1], frame.shape[0]):
+            frame = frame[box[1]:box[3], box[0]:box[2]]   # solo l'area attiva (vedi detect_content_box)
+
         # Ridimensiona (solo per l'analisi) se il frame è più largo del limite
         h, w = frame.shape[:2]
-        if ANALYSIS_MAX_WIDTH and w > ANALYSIS_MAX_WIDTH:
-            new_h = max(1, int(round(h * ANALYSIS_MAX_WIDTH / w)))
-            frame = cv2.resize(frame, (ANALYSIS_MAX_WIDTH, new_h), interpolation=cv2.INTER_AREA)
+        if max_width and w > max_width:
+            new_h = max(1, int(round(h * max_width / w)))
+            frame = cv2.resize(frame, (max_width, new_h), interpolation=cv2.INTER_AREA)
             h, w = frame.shape[:2]
 
         gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -469,7 +526,7 @@ def analyze_video_frames(video_path: str) -> Tuple[list, list, list, list, list,
         current_movement = 0.0
         if prev_gray_frame is not None:
             diff = cv2.absdiff(gray_frame, prev_gray_frame)
-            current_movement = float(np.mean(diff)) / 255.0 # Normalizzato tra 0 e 1
+            current_movement = cv2.mean(diff)[0] / 255.0 # Normalizzato tra 0 e 1 (cv2.mean: stessa media di np.mean, ~4x più veloce)
         movement_data.append(current_movement)
 
         # Variazione del movimento (differenza tra movimento corrente e precedente)
@@ -490,12 +547,16 @@ def analyze_video_frames(video_path: str) -> Tuple[list, list, list, list, list,
         sobel_x = cv2.Sobel(gray_frame, cv2.CV_32F, 1, 0, ksize=3)
         sobel_y = cv2.Sobel(gray_frame, cv2.CV_32F, 0, 1, ksize=3)
         edge_magnitude = cv2.magnitude(sobel_x, sobel_y)
-        edge_density = float(np.mean(edge_magnitude)) / 255.0 # Normalizzato approssimativamente tra 0 e 1
+        # cv2.mean somma in doppia precisione ed è deterministico; np.mean su float32 accumulava in singola
+        # precisione e dava scarti di ~1e-8 anche fra due esecuzioni identiche sullo stesso video.
+        edge_density = cv2.mean(edge_magnitude)[0] / 255.0 # Normalizzato approssimativamente tra 0 e 1
         edge_density_data.append(min(edge_density, 1.0))
 
         # Variazione colore (deviazione standard della tonalità/Hue) - utile per varietà cromatica
         hsv_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        color_variation = float(np.std(hsv_frame[:, :, 0])) / 180.0 # Hue in OpenCV va da 0 a 179
+        # Deviazione standard della tinta (Hue 0-179 in OpenCV): meanStdDev dà lo stesso valore di np.std a ~1e-14
+        # ma evita la copia in float64 di un canale non contiguo (a 1080p: ~10 ms contro ~3 ms per frame).
+        color_variation = float(cv2.meanStdDev(hsv_frame)[1][0][0]) / 180.0
         color_variation_data.append(min(color_variation, 1.0))
 
         prev_gray_frame = gray_frame
@@ -524,7 +585,7 @@ def analyze_video_frames(video_path: str) -> Tuple[list, list, list, list, list,
 
 
 @st.cache_data(show_spinner="🎞️ Analisi del video in corso...")
-def analyze_video_frames_cached(video_path: str, file_hash: str) -> Tuple[list, list, list, list, list, list, list, list, float, float, list]:
+def analyze_video_frames_cached(video_path: str, file_hash: str, max_width: int = 0, crop_bars: bool = True) -> Tuple[list, list, list, list, list, list, list, list, float, float, list]:
     """Wrapper cache di analyze_video_frames. Senza questa cache, Streamlit riesegue l'intero
     script (e quindi anche l'analisi frame-per-frame del video, che decodifica ogni singolo
     fotogramma con OpenCV) ad OGNI interazione con qualsiasi controllo dell'interfaccia — non solo
@@ -536,7 +597,17 @@ def analyze_video_frames_cached(video_path: str, file_hash: str) -> Tuple[list, 
     dal CONTENUTO del file, non solo dal suo path: il path include il nome del file originale, quindi
     se un utente carica due video diversi con lo stesso nome nella stessa sessione, senza l'hash la
     cache riuserebbe erroneamente l'analisi del primo video anche per il secondo."""
-    return analyze_video_frames(video_path)
+    return analyze_video_frames(video_path, max_width, crop_bars)
+
+
+@st.cache_data(show_spinner=False)
+def detect_content_box_cached(video_path: str, file_hash: str) -> Tuple[Tuple[int, int, int, int], Tuple[int, int]]:
+    """Wrapper in cache di detect_content_box (stessa logica di file_hash di analyze_video_frames_cached).
+    Restituisce (area attiva, (larghezza, altezza) del frame) per poter dire se è stato ritagliato qualcosa."""
+    cap = cv2.VideoCapture(video_path)
+    size = (int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)))
+    cap.release()
+    return detect_content_box(video_path), size
 
 
 def generate_synthetic_feature_curves(duration_seconds: float, fps: float = 30.0, seed: int = None
@@ -2120,6 +2191,39 @@ def measure_levels(x: np.ndarray, fs: float):
     return integrated_loudness(x, fs), (20.0 * np.log10(tp) if tp > 0 else float('-inf'))
 
 
+def _to_channels(x: np.ndarray, channels: int) -> np.ndarray:
+    """Porta un audio (n, c) a `channels` canali: i canali in più si scartano, un mono si duplica."""
+    if x.shape[1] == channels:
+        return x
+    if x.shape[1] > channels:
+        return x[:, :channels]
+    return np.repeat(x, channels, axis=1)
+
+
+def mix_original_audio(generated_path: str, original_path: str, mix_level: float, output: dict, out_path: str) -> None:
+    """Mixa l'audio generato con quello originale del video e scrive il risultato in un WAV.
+
+    Prima il mix lo faceva ffmpeg (filtro amix) dopo che l'audio originale era già stato ricodificato in AAC:
+    due generazioni di AAC, uscita sempre MONO (anche con originale stereo) e livello dimezzato da amix, fuori
+    dal «Livello finale» scelto (su 8 clip reali: picco finale a -7 dBFS invece di -1 dBTP). Ora l'originale
+    arriva in WAV senza perdite, si mixa qui (generato + livello * originale: stesso rapporto di prima),
+    l'immagine stereo dell'originale si conserva e il «Livello finale» si applica al risultato.
+    Con la normalizzazione spenta il mix è dimezzato come faceva amix, per non sforare."""
+    generated, sample_rate = sf.read(generated_path, dtype='float32', always_2d=True)
+    original, original_rate = sf.read(original_path, dtype='float32', always_2d=True)
+    if original_rate != sample_rate:
+        raise ValueError(f"frequenza di campionamento diversa ({original_rate} contro {sample_rate})")
+    n = generated.shape[0]
+    original = original[:n] if original.shape[0] >= n else np.pad(original, ((0, n - original.shape[0]), (0, 0)))
+    channels = max(min(generated.shape[1], 2), min(original.shape[1], 2))
+    mixed = _to_channels(generated, channels) + mix_level * _to_channels(original, channels)
+    if output.get('normalize_audio', True):
+        mixed = apply_master_level(mixed, sample_rate, LOUDNESS_TARGETS[output.get('loudness_target', LOUDNESS_DEFAULT)])
+    else:
+        mixed = mixed * 0.5
+    sf.write(out_path, np.clip(mixed, -1.0, 1.0).astype(np.float32), sample_rate)
+
+
 def _log_cosh(u: np.ndarray) -> np.ndarray:
     a = np.abs(u)
     return a + np.log1p(np.exp(-2.0 * a)) - np.log(2.0)
@@ -3126,6 +3230,8 @@ def render_source_sidebar() -> dict:
     generative_duration = None
     generative_track_name = None
     generative_seed = None
+    analysis_quality = ANALYSIS_QUALITY_FULL
+    crop_bars = True
     st.sidebar.header("Sorgente")
     input_mode = st.sidebar.radio(
         "Modalità", ["🎬 Da Video", "🎲 Generativa (senza video)", "🎧 Granulare da Audio"], key='input_mode',
@@ -3156,6 +3262,20 @@ def render_source_sidebar() -> dict:
     else:
         st.sidebar.header("Carica Video")
         uploaded_file = st.sidebar.file_uploader("Scegli un file video (MP4, MOV, AVI, ecc.)", type=["mp4", "mov", "avi", "mkv"])
+        analysis_quality = st.sidebar.selectbox(
+            "Precisione dell'analisi", list(ANALYSIS_QUALITY_OPTIONS), key='analysis_quality',
+            help="L'analisi decodifica ogni fotogramma: per video lunghi o ad alta risoluzione può richiedere minuti. "
+                 "«Veloce» riduce i frame a 480 px prima di calcolare le feature (circa 2.5 volte più veloce a 1080p). Nelle prove "
+                 "luminosità, dettaglio, colore e picchi di movimento restano uguali, il movimento medio scende a circa 0.9x e la "
+                 "densità dei contorni SALE (da circa 1.1x a 2x, tanto più quanto è alta la risoluzione del video). "
+                 "I preset sono tarati sulla modalità Piena."
+        )
+        crop_bars = st.sidebar.checkbox(
+            "Ignora le bande nere (letterbox/pillarbox)", value=True, key='crop_bars',
+            help="Se il video ha bande nere fisse (per esempio un video verticale dentro una cornice 16:9), le feature "
+                 "(luminosità, movimento, centro di massa...) vengono calcolate solo sull'area attiva: altrimenti le bande "
+                 "le schiacciano. Il video prodotto resta intero. Senza bande non cambia nulla."
+        )
     return {
         'input_mode': input_mode,
         'generative_mode': generative_mode,
@@ -3164,6 +3284,8 @@ def render_source_sidebar() -> dict:
         'generative_duration': generative_duration,
         'generative_track_name': generative_track_name,
         'generative_seed': generative_seed,
+        'analysis_quality': analysis_quality,
+        'crop_bars': crop_bars,
     }
 
 
@@ -3234,9 +3356,14 @@ def load_features(source: dict, session_id: str):
         # analyze_video_frames_cached) per evitare che un video diverso con lo stesso nome file
         # riusi per errore l'analisi di un video precedente nella stessa sessione.
         file_hash = hashlib.md5(uploaded_file.getbuffer()).hexdigest()
+        if source['crop_bars']:
+            content_box, (frame_w, frame_h) = detect_content_box_cached(video_input_path, file_hash)
+            if content_box != (0, 0, frame_w, frame_h):
+                st.sidebar.info(f"⬛ Bande nere rilevate: le feature usano solo l'area attiva "
+                                f"({content_box[2] - content_box[0]}×{content_box[3] - content_box[1]} px su {frame_w}×{frame_h}).")
 
         try:
-            luminosity_data, detail_data, movement_data, variation_movement_data, horizontal_mass_center_data, vertical_mass_center_data, edge_density_data, color_variation_data, duration_seconds, fps, visual_impact_data = analyze_video_frames_cached(video_input_path, file_hash)
+            luminosity_data, detail_data, movement_data, variation_movement_data, horizontal_mass_center_data, vertical_mass_center_data, edge_density_data, color_variation_data, duration_seconds, fps, visual_impact_data = analyze_video_frames_cached(video_input_path, file_hash, ANALYSIS_QUALITY_OPTIONS[source['analysis_quality']], source['crop_bars'])
         except ValueError as analysis_error: # Video non apribile, corrotto, troppo corto/lungo
             st.error(str(analysis_error))
             if os.path.exists(video_input_path):
@@ -3315,6 +3442,9 @@ def build_report_text(params: dict, generative_info: dict = None) -> str:
         report_lines.append(field("melodia (quantizzazione a scala)", "melody (scale quantization)", f"{params.get('melody_scale', 'N/A')} (fondamentale {params.get('melody_root_note', 220.0):.0f} Hz)"))
     else:
         report_lines.append(field("melodia (quantizzazione a scala)", "melody (scale quantization)", "disabilitata / disabled (intonazione libera / free pitch)"))
+    if params.get('analysis_quality'):
+        report_lines.append(field("precisione dell'analisi video", "video analysis precision", params['analysis_quality']))
+        report_lines.append(field("bande nere ignorate nell'analisi", "black bars ignored in analysis", "sì / yes" if params.get('crop_bars') else "no / no"))
     report_lines.append(field("seed audio (casualità di note, grani, rumore, glitch)", "audio seed (randomness of notes, grains, noise, glitch)",
                               str(params['audio_seed']) if params.get('audio_seed') is not None else "non fissato / not fixed"))
     beat_layers = [name for name, key in (("e-piano", 'epiano_trigger'), ("corde / strings", 'pluck_trigger')) if params.get(key) == TRIGGER_BEATS]
@@ -3623,15 +3753,15 @@ def render_final_video(params: dict, output: dict, session_id: str, base_name_ou
     ffmpeg_command = ["ffmpeg", "-y"]
 
     temp_original_audio_path = None
+    mixed_audio_path = None
     if use_original_audio:
-        # Estrai audio originale. Il video caricato potrebbe non avere una
-        # traccia audio (es. screen recording muto) o avere un codec che
-        # ffmpeg non riesce a rimappare in AAC: in quel caso non crashare,
-        # avvisa l'utente e prosegui usando solo l'audio generato.
-        temp_original_audio_path = f"temp_original_audio_{session_id}.aac"
+        # Estrai audio originale (WAV senza perdite, alla stessa frequenza dell'audio generato). Il video caricato
+        # potrebbe non avere una traccia audio (es. screen recording muto) o avere un codec che ffmpeg non
+        # riesce a leggere: in quel caso non crashare, avvisa l'utente e prosegui usando solo l'audio generato.
+        temp_original_audio_path = f"temp_original_audio_{session_id}.wav"
         try:
             subprocess.run([
-                "ffmpeg", "-y", "-i", video_input_path, "-vn", "-acodec", "aac", temp_original_audio_path
+                "ffmpeg", "-y", "-i", video_input_path, "-vn", "-acodec", "pcm_s16le", "-ar", str(AUDIO_SAMPLE_RATE), temp_original_audio_path
             ], check=True, capture_output=True)
         except subprocess.CalledProcessError:
             st.warning("⚠️ Impossibile estrarre l'audio originale dal video (potrebbe non avere una traccia audio). Procedo usando solo l'audio generato.")
@@ -3641,36 +3771,33 @@ def render_final_video(params: dict, output: dict, session_id: str, base_name_ou
                 os.remove(temp_original_audio_path)
             temp_original_audio_path = None
 
+    audio_for_mux = audio_output_path
     if use_original_audio:
-        # Mix e ricodifica
-        ffmpeg_command.extend([
-            "-i", video_input_path,
-            "-i", audio_output_path,
-            "-i", temp_original_audio_path,
-            "-filter_complex",
-            f"[1:a]volume=1.0[generated_audio];" # volume fisso per audio generato
-            f"[2:a]volume={original_audio_mix_level}[original_audio];" # volume per audio originale
-            f"[generated_audio][original_audio]amix=inputs=2:duration=longest[aout]", # mix
-            "-map", "0:v",
-            "-map", "[aout]",
-            "-c:v", "libx264",
-            "-preset", "medium",
-            "-crf", "23",
-            "-c:a", "aac",
-            "-b:a", "192k",
-        ])
-    else:
-        ffmpeg_command.extend([
-            "-i", video_input_path,
-            "-i", audio_output_path,
-            "-map", "0:v",
-            "-map", "1:a",
-            "-c:v", "libx264",
-            "-preset", "medium",
-            "-crf", "23",
-            "-c:a", "aac",
-            "-b:a", "192k",
-        ])
+        # Mix in Python (vedi mix_original_audio), poi un solo ingresso audio e una sola codifica AAC.
+        mixed_audio_path = f"temp_mixed_audio_{session_id}.wav"
+        try:
+            mix_original_audio(audio_output_path, temp_original_audio_path, original_audio_mix_level, output, mixed_audio_path)
+            audio_for_mux = mixed_audio_path
+        except Exception as mix_error:  # WAV illeggibile, frequenze diverse...: non crashare, usa il solo audio generato
+            st.warning(f"⚠️ Impossibile mixare l'audio originale ({mix_error}). Procedo usando solo l'audio generato.")
+            use_original_audio = False
+            params['use_original_audio'] = False
+            for leftover in (temp_original_audio_path, mixed_audio_path):
+                if leftover and os.path.exists(leftover):
+                    os.remove(leftover)
+            temp_original_audio_path = mixed_audio_path = None
+
+    ffmpeg_command.extend([
+        "-i", video_input_path,
+        "-i", audio_for_mux,
+        "-map", "0:v",
+        "-map", "1:a",
+        "-c:v", "libx264",
+        "-preset", "medium",
+        "-crf", "23",
+        "-c:a", "aac",
+        "-b:a", "192k",
+    ])
 
     if output_resolution_choice != "Originale":
         width, height = FORMAT_RESOLUTIONS[output_resolution_choice]
@@ -3720,7 +3847,7 @@ def render_final_video(params: dict, output: dict, session_id: str, base_name_ou
         st.session_state['report_text'] = build_report_text(params)
 
         # Pulisci i file temporanei
-        for temp_f in [video_input_path, audio_output_path, temp_original_audio_path if use_original_audio else None, final_video_path]:
+        for temp_f in [video_input_path, audio_output_path, temp_original_audio_path if use_original_audio else None, mixed_audio_path, final_video_path]:
             if temp_f and os.path.exists(temp_f):
                 os.remove(temp_f)
         st.info("🗑️ File temporanei puliti.")
@@ -3729,14 +3856,14 @@ def render_final_video(params: dict, output: dict, session_id: str, base_name_ou
         st.error(f"❌ Errore FFmpeg durante l'unione/ricodifica: {_as_text(e.stderr)}")
         st.code(_as_text(e.stdout) + _as_text(e.stderr))
         # Pulisci i file temporanei anche in caso di errore FFmpeg
-        for temp_f in [video_input_path, audio_output_path, temp_original_audio_path if use_original_audio else None]:
+        for temp_f in [video_input_path, audio_output_path, temp_original_audio_path if use_original_audio else None, mixed_audio_path]:
             if temp_f and os.path.exists(temp_f):
                 os.remove(temp_f)
         st.info("🗑️ File temporanei puliti.")
     except Exception as e:
         st.error(f"❌ Errore generico durante l'unione/ricodifica: {str(e)}")
         # Pulisci i file temporanei anche in caso di errore generico
-        for temp_f in [video_input_path, audio_output_path, temp_original_audio_path if use_original_audio else None]:
+        for temp_f in [video_input_path, audio_output_path, temp_original_audio_path if use_original_audio else None, mixed_audio_path]:
             if temp_f and os.path.exists(temp_f):
                 os.remove(temp_f)
         st.info("🗑️ File temporanei puliti.")
@@ -3833,6 +3960,9 @@ def main():
 
     # Parametri scelti dall'utente, raccolti dalle schede per report e descrizione finale
     params = {}
+    if not generative_mode:
+        params['analysis_quality'] = source['analysis_quality']
+        params['crop_bars'] = source['crop_bars']
 
     # ID univoco per sessione (nomi dei file temporanei) + valori di session_state dei download
     session_id = init_session_state()
